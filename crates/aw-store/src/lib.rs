@@ -210,7 +210,8 @@ pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
-    EffectiveSourceBinding, InspectedSandboxCreate, PreparedSandboxCreate, PreparedSandboxEffect,
+    EffectiveSourceBinding, InspectedSandboxAttachment, InspectedSandboxCreate,
+    PreparedSandboxAttachment, PreparedSandboxCreate, PreparedSandboxEffect, SandboxAttachment,
     SandboxCreateFrom, SandboxCreateSources, SandboxEffectAuthority, SandboxEffectLaunch,
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
     SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,

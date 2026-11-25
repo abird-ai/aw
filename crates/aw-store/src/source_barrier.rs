@@ -49,6 +49,27 @@ impl SourceMutationSet {
         )
     }
 
+    pub(crate) fn with_incoming_anchor<'a>(
+        bindings: impl ExactSizeIterator<Item = &'a SourceBinding> + Clone,
+        anchor: &'a SourceAnchor,
+    ) -> Result<Self> {
+        let count = bindings.len() + 1;
+        validate_source_set_hard_limit(count)?;
+        anchor.validate()?;
+        for binding in bindings.clone() {
+            binding.validate()?;
+        }
+        Self::from_identities(
+            count,
+            bindings
+                .map(|b| (&b.driver, b.source_ref.as_str()))
+                .chain(std::iter::once((
+                    &anchor.driver,
+                    anchor.source_ref.as_str(),
+                ))),
+        )
+    }
+
     fn from_identities<'a>(
         count: usize,
         identities: impl Iterator<Item = (&'a DriverKey, &'a str)>,

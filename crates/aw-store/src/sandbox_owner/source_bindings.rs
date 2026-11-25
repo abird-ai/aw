@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub(crate) const RETENTION_CLEANUP_PREFIX: &str = "sandbox-retention:";
+mod attachment;
+pub(crate) use attachment::AttachmentBoundary;
+pub use attachment::{InspectedSandboxAttachment, PreparedSandboxAttachment, SandboxAttachment};
 mod release;
 pub use release::SandboxSourceRelease;
 pub(crate) use release::SOURCE_RELEASE_PREFIX;
@@ -310,13 +313,22 @@ fn remove_binding_in(
 
 // One binding mutation linearization point and changed fact. A proven
 // physical release additionally names its original descriptor's fact ID.
+enum SourceChange<'a> {
+    Metadata,
+    Released(&'a str),
+    Attached {
+        event_id: &'a str,
+        prepare_id: &'a str,
+    },
+}
+
 fn publish_source_change_in(
     tx: &rusqlite::Transaction<'_>,
     actor: &PrincipalId,
     sandbox: &str,
     name: &SourceName,
     expected_rev: u64,
-    release_event: Option<&str>,
+    change: SourceChange<'_>,
 ) -> Result<()> {
     let next_rev = next_source_rev(expected_rev)?;
     if db(tx.execute(
@@ -333,8 +345,21 @@ fn publish_source_change_in(
         "sync_scope":"local","aspect":"sources","source_name":name.as_str(),"rev":next_rev,
     });
     let transaction = durability::tx_id()?;
-    if let Some(event_id) = release_event {
-        payload["released"] = true.into();
+    let event_id = match change {
+        SourceChange::Metadata => None,
+        SourceChange::Released(event_id) => {
+            payload["released"] = true.into();
+            Some(event_id)
+        }
+        SourceChange::Attached {
+            event_id,
+            prepare_id,
+        } => {
+            payload["materialization_prepare_id"] = prepare_id.into();
+            Some(event_id)
+        }
+    };
+    if let Some(event_id) = event_id {
         durability::commit_event_position_with_id(
             tx,
             event_id,
@@ -560,7 +585,14 @@ impl SessionStore {
         if let Some(binding) = binding {
             insert_at_revision(&tx, &sandbox, std::slice::from_ref(binding), next_rev)?;
         }
-        publish_source_change_in(&tx, actor, &sandbox, name, expected_rev, None)?;
+        publish_source_change_in(
+            &tx,
+            actor,
+            &sandbox,
+            name,
+            expected_rev,
+            SourceChange::Metadata,
+        )?;
         let result = super::snapshot_with_sources(&tx, &sandbox)?;
         db(tx.commit())?;
         drop(final_fence);
@@ -674,6 +706,28 @@ impl SessionStore {
         actor: &PrincipalId,
         sandbox_ref: &str,
     ) -> Result<aw_agent_core::PreparedSourceSet> {
+        let sources = self.sandbox_materialization_preparations(actor, sandbox_ref)?;
+        let first = sources
+            .first()
+            .ok_or(Error::Conflict("no retained materializations"))?;
+        let prepared = aw_agent_core::PreparedSourceSet {
+            prepare_id: first.prepared.descriptor.prepare_id.clone(),
+            operation: first.prepared.operation,
+            sources,
+        };
+        // A heterogeneous retained layout has no single PreparedSourceSet.
+        // Existing callers can use the per-binding descriptor view below.
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
+    /// Exact owner-private descriptor per retained binding, in name order.
+    /// Attachment and initial construction can have distinct origins.
+    pub fn sandbox_materialization_preparations(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+    ) -> Result<Vec<aw_agent_core::NamedPreparedSource>> {
         let key = super::parse_sandbox_ref(sandbox_ref)?;
         let sandbox = key.canonical();
         let mut connection = self.connection()?;
@@ -687,9 +741,9 @@ impl SessionStore {
             ));
         }
         let (_, bindings) = closed_retained_in(&tx, &sandbox)?;
-        let sources = release::retained_preparation_in(&tx, &sandbox, &bindings)?;
+        let sources = release::retained_preparations_in(&tx, &sandbox, &bindings)?;
         let registry = self.inner.source_drivers.reader()?;
-        for source in &sources.sources {
+        for source in &sources {
             registry.resolve(&source.prepared.descriptor.pin()?)?;
         }
         db(tx.commit())?;

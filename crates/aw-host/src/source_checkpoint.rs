@@ -2,15 +2,16 @@
 //! recovery, history and final publication; the host owns physical authority.
 //! Blocking trusted-host operations, not an Actor/model/RPC admission route.
 use aw_agent_core::{
-    Error, ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId,
-    RecoveryInspection, Result, SourceBinding, SourceDriverHandle, SourceName, SourceOperationKind,
-    SourcePublicationFence, SourcePublicationProof, SourceSet,
+    Error, ExternalEvidence, NamedPreparedSource, PreparedSourceOperation, PreparedSourceSet,
+    PrincipalId, RecoveryInspection, Result, SourceAnchor, SourceBinding, SourceDriverHandle,
+    SourceName, SourceOperationKind, SourcePublicationFence, SourcePublicationProof, SourceSet,
 };
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
-    InspectedCheckpointRestore, InspectedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
-    SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
+    InspectedCheckpointRestore, InspectedSandboxAttachment, InspectedSandboxCreate,
+    SandboxAttachment, SandboxCreateFrom, SandboxCreateSources, SandboxSnapshot,
+    SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -170,26 +171,26 @@ fn verify_managed_materializations<'a>(
     driver: &GitSourceDriver,
     snapshot: &'a SandboxSnapshot,
     bindings: &[VersionedSourceBinding],
-    prepared: &PreparedSourceSet,
+    prepared: &[NamedPreparedSource],
     fence: &impl GitRestoreFence,
 ) -> Result<ManagedGitLayout<'a>> {
     let locations = fence.locations();
-    if prepared.sources.len() != bindings.len()
+    if prepared.len() != bindings.len()
         || bindings.len() != locations.len()
-        || bindings.iter().zip(&prepared.sources).zip(locations).any(
-            |((binding, source), location)| {
-                binding.binding_rev != 1
-                    || binding.binding.name != source.name
-                    || source.name != location.name
-            },
-        )
+        || bindings
+            .iter()
+            .zip(prepared)
+            .zip(locations)
+            .any(|((binding, source), location)| {
+                binding.binding.name != source.name || source.name != location.name
+            })
     {
         return Err(Error::Conflict(
             "retained Git bindings differ from the original restore",
         ));
     }
     require_disjoint_locations(locations)?;
-    for ((binding, source), location) in bindings.iter().zip(&prepared.sources).zip(locations) {
+    for ((binding, source), location) in bindings.iter().zip(prepared).zip(locations) {
         driver.verify_restored_materialization_location(
             location,
             &source.prepared,
@@ -209,19 +210,95 @@ fn verify_remaining_sources(
     for (index, (binding, location)) in release.bindings().iter().zip(fence.locations()).enumerate()
     {
         if index != release.selected() {
-            let original = &binding.binding;
-            if driver.binding(
-                &location.target,
-                original.name.clone(),
-                original.access,
-                original.checkpoint_policy,
-            )? != *original
-            {
-                return Err(Error::Conflict("retained Git sibling changed identity"));
-            }
+            verify_retained_checkout(driver, &binding.binding, location)?;
         }
     }
     Ok(())
+}
+
+fn verify_retained_checkout(
+    driver: &GitSourceDriver,
+    original: &SourceBinding,
+    location: &GitRestoreLocation,
+) -> Result<()> {
+    if driver.binding(
+        &location.target,
+        original.name.clone(),
+        original.access,
+        original.checkpoint_policy,
+    )? != *original
+    {
+        return Err(Error::Conflict("retained Git sibling changed identity"));
+    }
+    Ok(())
+}
+
+// Every retained root and incoming target is independently approved.
+// Sibling content need not remain at its original captured version.
+fn attachment_location<'a>(
+    driver: &GitSourceDriver,
+    attachment: &SandboxAttachment,
+    fence: &'a impl GitRestoreFence,
+) -> Result<&'a GitRestoreLocation> {
+    let snapshot = attachment.snapshot();
+    let locations = fence.locations();
+    if locations.len() != attachment.bindings().len() + 1
+        || snapshot.working_directory != snapshot.tool_root
+        || locations
+            .windows(2)
+            .any(|pair| pair[0].name.as_str() >= pair[1].name.as_str())
+        || locations
+            .iter()
+            .any(|location| location.target != snapshot.tool_root.join(location.name.as_str()))
+    {
+        return Err(Error::Denied(
+            "attachment requires exact private named-child layout",
+        ));
+    }
+    require_disjoint_locations(locations)?;
+    if !matches!(
+        ManagedGitLayout::check(snapshot, locations)?,
+        ManagedGitLayout::Directory(_)
+    ) {
+        return Err(Error::Denied(
+            "attachment cannot reinterpret a whole-root layout",
+        ));
+    }
+    let mut existing = attachment.bindings().iter().zip(attachment.preparations());
+    let mut incoming = None;
+    for location in locations {
+        if location.name == attachment.anchor().name {
+            incoming = Some(location);
+        } else {
+            let (binding, source) = existing
+                .next()
+                .ok_or(Error::Conflict("attachment source set changed"))?;
+            if source.name != location.name || binding.binding.name != location.name {
+                return Err(Error::Conflict("attachment source set changed"));
+            }
+            driver.verify_restored_materialization_location(
+                location,
+                &source.prepared,
+                &binding.binding,
+            )?;
+            verify_retained_checkout(driver, &binding.binding, location)?;
+        }
+    }
+    if existing.next().is_some() {
+        return Err(Error::Conflict("attachment source set is incomplete"));
+    }
+    incoming.ok_or(Error::Denied("incoming attachment is not approved"))
+}
+
+fn verify_attachment(
+    driver: &GitSourceDriver,
+    attachment: &SandboxAttachment,
+    prepared: &PreparedSourceOperation,
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    let location = attachment_location(driver, attachment, fence)?;
+    let anchor = GitSourceAnchor::try_from(attachment.anchor())?;
+    driver.verify_restore_location(location, &anchor, prepared)
 }
 
 fn approved_parent(
@@ -831,6 +908,128 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         )
     }
 
+    /// Attach one independently retained version to an unused managed
+    /// Sandbox. The complete old+incoming layout is protected by one
+    /// live fence, and its exact original restore is Prepared before use.
+    pub fn attach_sandbox_source<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        anchor: SourceAnchor,
+        authorize: impl FnOnce(&SandboxAttachment) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        if let Some(result) = self.store.sandbox_replay_attachment(
+            actor,
+            sandbox,
+            expected_rev,
+            request_id,
+            &anchor,
+        )? {
+            return Ok(result);
+        }
+        let driver = self.store.source_driver(self.driver)?;
+        let mut fence = None;
+        let prepared = self.store.sandbox_prepare_attachment(
+            actor,
+            sandbox,
+            expected_rev,
+            request_id,
+            anchor,
+            |attachment, prepare_id| {
+                let approval = authorize(attachment)?;
+                let location = attachment_location(&driver, attachment, &approval)?;
+                let anchor = GitSourceAnchor::try_from(attachment.anchor())?;
+                let prepared = driver.plan_restore_approved(location, &anchor, prepare_id)?;
+                fence = Some(approval);
+                Ok(prepared)
+            },
+        )?;
+        let fence = fence.expect("successful attachment called planner");
+        let result = (|| {
+            prepared.revalidate()?;
+            verify_attachment(&driver, prepared.observation(), prepared.source(), &fence)?;
+            driver.execute_restore(prepared.source())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            prepared.mark_unknown()?;
+            return Err(error);
+        }
+        let inspected = prepared.inspect(|registry, attachment, prepared| {
+            let driver = registry.get(self.driver)?;
+            verify_attachment(&driver, attachment, prepared, &fence)?;
+            driver.inspect_restore(prepared)
+        })?;
+        self.publish_attachment(inspected, &fence)
+    }
+
+    pub fn resume_sandbox_attachment<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let mut fence = None;
+        let inspected = self.store.sandbox_inspect_attachment(
+            actor,
+            sandbox,
+            request_id,
+            |registry, attachment, prepared| {
+                let approval = authorize(attachment, prepared)?;
+                let driver = registry.get(self.driver)?;
+                verify_attachment(&driver, attachment, prepared, &approval)?;
+                let result = driver.inspect_restore(prepared)?;
+                fence = Some(approval);
+                Ok(result)
+            },
+        )?;
+        self.publish_attachment(
+            inspected,
+            &fence.expect("successful attachment inspection called inspector"),
+        )
+    }
+
+    fn publish_attachment<F: GitRestoreFence>(
+        &self,
+        inspected: InspectedSandboxAttachment<'_>,
+        fence: &F,
+    ) -> Result<SandboxSnapshot> {
+        inspected.publish(|registry, attachment, prepared, binding, evidence| {
+            let driver = registry.get(self.driver)?;
+            verify_attachment(&driver, attachment, prepared, fence)?;
+            driver.revalidate_restore(prepared, binding)?;
+            Ok(SourcePublicationProof::Held(Publication {
+                _fence: fence,
+                evidence: evidence.clone(),
+            }))
+        })
+    }
+
+    pub fn abandon_sandbox_attachment<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<()> {
+        self.store.sandbox_abandon_attachment(
+            actor,
+            sandbox,
+            request_id,
+            |registry, attachment, prepared| {
+                let fence = authorize(attachment, prepared)?;
+                let driver = registry.get(self.driver)?;
+                verify_attachment(&driver, attachment, prepared, &fence)?;
+                driver.release_prepared_restore(prepared)?;
+                attachment_location(&driver, attachment, &fence)?;
+                Ok(fence)
+            },
+        )
+    }
+
     /// Remove one original managed source from an unused open Sandbox.
     /// The independently protected named parent remains the same layout
     /// after removal, including final-source removal. The fence covers
@@ -856,7 +1055,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
                     &driver,
                     snapshot,
                     release.bindings(),
-                    release.preparation(),
+                    release.preparations(),
                     &fence,
                 )?;
                 if !matches!(layout, ManagedGitLayout::Directory(_))
@@ -875,7 +1074,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             |release, fence| {
                 let index = release.selected();
                 driver.release_restored_materialization(
-                    &release.preparation().sources[index].prepared,
+                    &release.preparations()[index].prepared,
                     &release.bindings()[index].binding,
                 )?;
                 let layout = ManagedGitLayout::check(release.snapshot(), fence.locations())?;
@@ -901,20 +1100,20 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         authorize: impl FnOnce(
             &SandboxSnapshot,
             &[VersionedSourceBinding],
-            &PreparedSourceSet,
+            &[NamedPreparedSource],
         ) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
         self.store
             .sandbox_reconcile_closed_sources(actor, sandbox, |snapshot, bindings| {
                 let prepared = self
                     .store
-                    .sandbox_restore_preparation(actor, &snapshot.canonical_ref)?;
+                    .sandbox_materialization_preparations(actor, &snapshot.canonical_ref)?;
                 let fence = authorize(snapshot, bindings, &prepared)?;
                 let driver = self.store.source_driver(self.driver)?;
                 let layout = verify_managed_materializations(
                     &driver, snapshot, bindings, &prepared, &fence,
                 )?;
-                for (binding, source) in bindings.iter().zip(&prepared.sources) {
+                for (binding, source) in bindings.iter().zip(&prepared) {
                     driver.release_restored_materialization(&source.prepared, &binding.binding)?;
                 }
                 layout.require_released()?;
@@ -2062,7 +2261,12 @@ mod tests {
                 |release| {
                     assert_eq!(release.snapshot(), &child);
                     assert_eq!(release.bindings().len(), 2);
-                    assert_eq!(release.preparation().operation, SourceOperationKind::Derive);
+                    assert_eq!(
+                        release.preparations()[release.selected()]
+                            .prepared
+                            .operation,
+                        SourceOperationKind::Derive
+                    );
                     Ok(fence(child_locations(&child_root), 4))
                 },
             )
@@ -2134,9 +2338,168 @@ mod tests {
                 .unwrap(),
             reduced
         );
-        // Retire the remaining source through its original descriptor.
+        // Reattach the released name from an independently retained
+        // version. Its descriptor must not follow the old derived name.
+        let attachment_anchor = baseline.anchors[0].clone();
+        let attachment_locations = || {
+            locations(&child_root)
+                .into_iter()
+                .take(1)
+                .chain(child_locations(&child_root).into_iter().skip(1))
+                .collect::<Vec<_>>()
+        };
+        let attachment_request = "fixture:source-attachment";
+        assert!(host
+            .attach_sandbox_source::<Fence<'_>>(
+                &actor,
+                &reduced.canonical_ref,
+                reduced.rev,
+                attachment_request,
+                baseline.anchors[1].clone(),
+                |_| panic!("occupied source name must not plan"),
+            )
+            .is_err());
+
+        // An unpublished candidate can be abandoned independently of
+        // both the original derived source and the retained sibling.
+        let approval = fence(attachment_locations(), 4);
+        let prepared = store
+            .sandbox_prepare_attachment(
+                &actor,
+                &reduced.canonical_ref,
+                reduced.rev,
+                "fixture:abandoned-attachment",
+                attachment_anchor.clone(),
+                |attachment, prepare_id| {
+                    let implementation = store.source_driver(&driver)?;
+                    let location = attachment_location(&implementation, attachment, &approval)?;
+                    implementation.plan_restore_approved(
+                        location,
+                        &GitSourceAnchor::try_from(attachment.anchor())?,
+                        prepare_id,
+                    )
+                },
+            )
+            .unwrap();
+        implementation.execute_restore(prepared.source()).unwrap();
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        host.abandon_sandbox_attachment(
+            &actor,
+            &reduced.canonical_ref,
+            "fixture:abandoned-attachment",
+            |_, _| Ok(fence(attachment_locations(), 4)),
+        )
+        .unwrap();
+        host.abandon_sandbox_attachment::<Fence<'_>>(
+            &actor,
+            &reduced.canonical_ref,
+            "fixture:abandoned-attachment",
+            |_, _| panic!("Rejected attachment must not inspect again"),
+        )
+        .unwrap();
+        assert!(!child_root.join("code").exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_attachment BEFORE UPDATE OF rev ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture attachment publication failure'); END;",
+            )
+            .unwrap();
+        assert!(host
+            .attach_sandbox_source(
+                &actor,
+                &reduced.canonical_ref,
+                reduced.rev,
+                attachment_request,
+                attachment_anchor.clone(),
+                |attachment| {
+                    assert_eq!(attachment.snapshot(), &reduced);
+                    assert_eq!(attachment.bindings().len(), 1);
+                    Ok(fence(attachment_locations(), 4))
+                },
+            )
+            .is_err());
+        assert_eq!(fs::read(child_root.join("code/tracked")).unwrap(), b"code");
+        assert_eq!(
+            store.sandbox_get(&actor, &reduced.canonical_ref).unwrap(),
+            reduced
+        );
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        assert!(store
+            .sandbox_close(&actor, &reduced.canonical_ref, Some(reduced.rev))
+            .is_err());
+        assert!(host
+            .attach_sandbox_source::<Fence<'_>>(
+                &actor,
+                &reduced.canonical_ref,
+                reduced.rev,
+                attachment_request,
+                attachment_anchor.clone(),
+                |_| panic!("unresolved attachment cannot plan again"),
+            )
+            .is_err());
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_attachment;")
+            .unwrap();
+        let missing = SessionStore::open(&state).unwrap();
+        assert!(GitCheckpointRestoreHost::new(&missing, &driver)
+            .resume_sandbox_attachment::<Fence<'_>>(
+                &actor,
+                &reduced.canonical_ref,
+                attachment_request,
+                |_, _| panic!("missing driver must not inspect attachment"),
+            )
+            .is_err());
+        drop(missing);
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let child = host
+            .resume_sandbox_attachment(
+                &actor,
+                &reduced.canonical_ref,
+                attachment_request,
+                |attachment, prepared| {
+                    assert_eq!(attachment.anchor(), &attachment_anchor);
+                    assert_eq!(prepared.operation, SourceOperationKind::Restore);
+                    Ok(fence(attachment_locations(), 4))
+                },
+            )
+            .unwrap();
+        assert_eq!(child.rev, reduced.rev + 1);
+        assert_eq!(child.sources.len(), 2);
+        assert_eq!(child.sources[0].binding_rev, child.rev);
+        assert_eq!(child.sources[1], reduced.sources[0]);
+        assert_eq!(child.layout_digest, reduced.layout_digest);
+        assert_eq!(
+            host.attach_sandbox_source::<Fence<'_>>(
+                &actor,
+                &child.canonical_ref,
+                reduced.rev,
+                attachment_request,
+                attachment_anchor.clone(),
+                |_| panic!("Applied attachment must not authorize materialization again"),
+            )
+            .unwrap(),
+            child
+        );
+        assert!(store
+            .sandbox_sources_set(
+                &actor,
+                &child.canonical_ref,
+                &attachment_anchor.name,
+                None,
+                child.rev
+            )
+            .is_err());
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        // Retire independently prepared bindings through their actual
+        // descriptors, not by assuming all came from the initial create.
         fs::write(&sibling, b"data").unwrap();
-        let child = reduced;
         let closed = store
             .sandbox_close(&actor, parent_ref, Some(standalone.rev))
             .unwrap();
@@ -2153,13 +2516,16 @@ mod tests {
         assert!(parent_cleanup().is_err());
         let retired = host
             .reconcile_closed_sandbox(&actor, &child.canonical_ref, |_, bindings, prepared| {
-                assert_eq!(prepared.operation, SourceOperationKind::Derive);
-                assert_eq!(bindings.len(), 1);
-                assert_eq!(prepared.sources[0].name.as_str(), "data");
-                Ok(fence(
-                    child_locations(&child_root).into_iter().skip(1).collect(),
-                    4,
-                ))
+                assert_eq!(bindings.len(), 2);
+                assert_eq!(prepared[0].name.as_str(), "code");
+                assert_eq!(prepared[0].prepared.operation, SourceOperationKind::Restore);
+                assert_eq!(prepared[1].name.as_str(), "data");
+                assert_eq!(prepared[1].prepared.operation, SourceOperationKind::Derive);
+                assert_ne!(
+                    prepared[0].prepared.descriptor.prepare_id,
+                    prepared[1].prepared.descriptor.prepare_id
+                );
+                Ok(fence(attachment_locations(), 4))
             })
             .unwrap();
         assert!(retired.sources.is_empty());
@@ -2182,7 +2548,7 @@ mod tests {
                 |_, bindings, prepared| {
                     assert_eq!(bindings.len(), 2);
                     assert_eq!(
-                        prepared.prepare_id,
+                        prepared[0].prepared.descriptor.prepare_id,
                         standalone.canonical_ref.rsplit_once("/s:").unwrap().1
                     );
                     Ok(fence(locations(&standalone_root), 4))

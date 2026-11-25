@@ -1137,13 +1137,35 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Checkpoint 4/4, source barrier 1/1, Host 16/16; strict affected Clippy,
       workspace all-target/all-feature check and scoped fmt/diff passed.
       Earlier broad Store 239/244 not rerun. Schema v60 unchanged.
+      **Versioned managed-source attachment landed:** original Project-scoped
+      Prepared receipt with private attachment candidate, exact old Sandbox
+      CAS/writer/layout/bindings and incoming retained anchor; one Restore
+      descriptor + complete old/incoming mutation claim before external effect.
+      Resume inspects and abandon reconciles the exact original candidate.
+      Atomic source.changed publication + Applied receipt + claim settlement;
+      new binding rev equals next Sandbox rev. Exact per-binding materialization
+      provenance via original construction or attachment changed fact + existing
+      Prepared index. Reattach requires proven prior release; heterogeneous
+      release/retirement uses actual original descriptor per binding. Existing
+      homogeneous view remains compatible. Shared managed observation and
+      mutation CAS; no schema, driver operation or parallel ledger. Concrete
+      Git path: nonempty already-managed unused named-child layout, cwd=root,
+      fresh independently authorized incoming retained version and full-set
+      physical fence. Grouped Host lifecycle covers abandoned candidate,
+      failed publication/restart, missing driver, exact replay, dirty sibling,
+      reattached name/new rev and mixed-origin retirement. Replacement,
+      empty-layout attachment and bound-Agent mutation remain held. Final
+      construction 1/1, Sandbox 4/4, Checkpoint 4/4, source barrier 1/1,
+      Host 16/16; strict affected Clippy, workspace all-target/all-feature
+      check and scoped fmt/diff passed. Earlier broad Store 239/244 not rerun.
+      Schema v60 unchanged.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      effectful attachment/replacement and other structural removal cases, remaining Vault broker/socket/file/other env,
+      effectful replacement/empty-layout attachment and other structural removal cases, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

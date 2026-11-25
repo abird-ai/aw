@@ -33,6 +33,7 @@ pub(crate) enum ConstructionOperation {
     CheckpointCreate,
     CheckpointRestore,
     SandboxCreate,
+    SandboxSourceAttach,
 }
 
 impl ConstructionOperation {
@@ -42,6 +43,7 @@ impl ConstructionOperation {
             Self::CheckpointCreate => "checkpoint_create",
             Self::CheckpointRestore => "checkpoint_restore",
             Self::SandboxCreate => "sandbox_create",
+            Self::SandboxSourceAttach => "sandbox_source_attach",
         }
     }
 
@@ -164,6 +166,12 @@ pub(crate) enum ConstructionCandidate {
     Sandbox {
         sandbox: String,
     },
+    // A private materialization candidate for an existing logical Sandbox.
+    SandboxAttachment {
+        sandbox: String,
+        prepare_id: String,
+        boundary: Box<crate::sandbox_owner::source_bindings::AttachmentBoundary>,
+    },
 }
 
 impl ConstructionCandidate {
@@ -189,6 +197,7 @@ impl ConstructionCandidate {
         match self {
             Self::Agent { session, .. } => session,
             Self::Checkpoint { checkpoint } => checkpoint,
+            Self::SandboxAttachment { prepare_id, .. } => prepare_id,
             Self::Sandbox { sandbox } => sandbox
                 .rsplit_once("/s:")
                 .map_or(sandbox, |(_, handle)| handle),
@@ -222,6 +231,11 @@ impl ConstructionCandidate {
                 [sandbox],
                 |row| row.get(0),
             ))?,
+            Self::SandboxAttachment {
+                sandbox, boundary, ..
+            } => {
+                return boundary.require_unpublished_in(connection, sandbox);
+            }
         };
         if exists {
             return Err(Error::Conflict("construction candidate already exists"));
@@ -246,6 +260,14 @@ impl ConstructionCandidate {
             }
             Self::Checkpoint { checkpoint } => label(checkpoint, 128)?,
             Self::Sandbox { sandbox } => label(sandbox, 2048)?,
+            Self::SandboxAttachment {
+                sandbox,
+                prepare_id,
+                ..
+            } => {
+                label(sandbox, 2048)?;
+                label(prepare_id, 128)?;
+            }
         }
         Ok(())
     }
@@ -308,8 +330,34 @@ impl ConstructionPreparation {
             .ok_or(Error::Storage("construction receipt has no initial task"))
     }
 
+    fn project_origin(&self) -> Option<&str> {
+        if let ConstructionCandidate::SandboxAttachment { boundary, .. } = &self.candidate {
+            return Some(&boundary.project_ref);
+        }
+        self.sandbox_boundary
+            .as_ref()
+            .map(|boundary| boundary.project_ref.as_str())
+    }
+
     fn validate(&self) -> Result<()> {
-        let expected_scope = if self.operation == ConstructionOperation::SandboxCreate {
+        let expected_scope = if self.operation == ConstructionOperation::SandboxSourceAttach {
+            if !self.parent_session_id.is_empty()
+                || !self.parent_branch_id.is_empty()
+                || self.sandbox_boundary.is_some()
+            {
+                return Err(Error::Storage(
+                    "source attachment requires its original Project origin",
+                ));
+            }
+            let ConstructionCandidate::SandboxAttachment {
+                sandbox, boundary, ..
+            } = &self.candidate
+            else {
+                return Err(Error::Storage("source attachment candidate missing"));
+            };
+            boundary.validate(sandbox, self.sources.as_ref())?;
+            self.creator.clone()
+        } else if self.operation == ConstructionOperation::SandboxCreate {
             if !self.parent_session_id.is_empty() || !self.parent_branch_id.is_empty() {
                 return Err(Error::Storage(
                     "Sandbox construction must not borrow an Agent origin",
@@ -357,6 +405,9 @@ impl ConstructionPreparation {
             ) | (
                 ConstructionOperation::SandboxCreate,
                 ConstructionCandidate::Sandbox { .. }
+            ) | (
+                ConstructionOperation::SandboxSourceAttach,
+                ConstructionCandidate::SandboxAttachment { .. }
             )
         );
         if !candidate_matches
@@ -561,10 +612,8 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
         return Err(Error::Storage("invalid construction receipt action"));
     };
     receipt.validate()?;
-    let matches_origin = match &receipt.sandbox_boundary {
-        Some(boundary) => {
-            session.is_none() && project.as_deref() == Some(boundary.project_ref.as_str())
-        }
+    let matches_origin = match receipt.project_origin() {
+        Some(origin) => session.is_none() && project.as_deref() == Some(origin),
         None => project.is_none() && session.as_deref() == Some(receipt.parent_session_id.as_str()),
     };
     if !matches_origin {
@@ -609,8 +658,8 @@ fn append_in(
         .map_err(|_| Error::Storage("cannot encode construction receipt"))?;
     // Recovery locators remain in the owner-private receipt, not security audit
     // presentation metadata. No model/tool result contains this receipt.
-    let origin = match &receipt.sandbox_boundary {
-        Some(boundary) => AuditOrigin::Project(&boundary.project_ref),
+    let origin = match receipt.project_origin() {
+        Some(project) => AuditOrigin::Project(project),
         None => AuditOrigin::Session(&receipt.parent_session_id),
     };
     append_audit(
@@ -664,7 +713,13 @@ pub(crate) fn claim_in(
             return Err(Error::Conflict("checkpoint request already published"));
         }
     }
-    if let Some(boundary) = &receipt.sandbox_boundary {
+    if let ConstructionCandidate::SandboxAttachment {
+        sandbox, boundary, ..
+    } = &receipt.candidate
+    {
+        boundary.authorize(tx, actor, sandbox)?;
+        boundary.require_compatible(&registry.reader()?)?;
+    } else if let Some(boundary) = &receipt.sandbox_boundary {
         boundary.authorize(tx, actor, true)?;
         boundary.require_compatible(&registry.reader()?)?;
     } else {
@@ -828,19 +883,7 @@ fn require_original_source_claim_in(
     connection: &Connection,
     receipt: &ConstructionPreparation,
 ) -> Result<()> {
-    let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
-         WHERE action='construction.preparation'
-           AND json_extract(data_json,'$.state')='prepared'
-           AND json_type(data_json,'$.sources')='object'
-           AND json_extract(data_json,'$.sources.prepare_id')=?1",
-    ))?;
-    let mut rows = db(query.query([receipt.candidate.prepare_id()]))?;
-    let claim = decode_receipt(
-        connection,
-        db(rows.next())?.ok_or(Error::Storage("original source claim unavailable"))?,
-    )?;
-    if db(rows.next())?.is_some() || current_claim_in(connection, &claim)? != *receipt {
+    if source_claim_by_id_in(connection, receipt.candidate.prepare_id())? != *receipt {
         return Err(Error::Storage("original source claim changed"));
     }
     Ok(())
@@ -1009,6 +1052,14 @@ fn require_published_candidate_in(
                     "prepared Sandbox candidate was not published",
                 ));
             }
+            sandbox.clone()
+        }
+        ConstructionCandidate::SandboxAttachment {
+            sandbox,
+            prepare_id,
+            boundary,
+        } => {
+            boundary.require_published_in(tx, sandbox, prepare_id)?;
             sandbox.clone()
         }
     };
@@ -1231,6 +1282,30 @@ fn current_claim_in(
     Ok(receipt)
 }
 
+/// Lookup one exact immutable Prepared fact by the existing unique
+/// preparation index. Its current receipt must retain the same custody.
+pub(crate) fn source_claim_by_id_in(
+    connection: &Connection,
+    prepare_id: &str,
+) -> Result<ConstructionPreparation> {
+    let mut query = db(connection.prepare_cached(
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
+         WHERE action='construction.preparation'
+           AND json_extract(data_json,'$.state')='prepared'
+           AND json_type(data_json,'$.sources')='object'
+           AND json_extract(data_json,'$.sources.prepare_id')=?1",
+    ))?;
+    let mut rows = db(query.query([prepare_id]))?;
+    let claim = decode_receipt(
+        connection,
+        db(rows.next())?.ok_or(Error::Storage("original materialization claim unavailable"))?,
+    )?;
+    if db(rows.next())?.is_some() {
+        return Err(Error::Storage("ambiguous materialization claim"));
+    }
+    current_claim_in(connection, &claim)
+}
+
 /// Exact original materialization provenance of a published Sandbox.
 /// Both Agent restore and standalone Project construction retain the
 /// original Prepared identity; sharing Agents cannot substitute it.
@@ -1379,6 +1454,10 @@ pub(crate) fn visit_unresolved_sources(
                 Some(set.anchors[index].pin()?)
             } else if let Some(boundary) = &receipt.sandbox_boundary {
                 Some(boundary.source_pin(index)?)
+            } else if let ConstructionCandidate::SandboxAttachment { boundary, .. } =
+                &receipt.candidate
+            {
+                Some(boundary.anchor().pin()?)
             } else {
                 None
             };

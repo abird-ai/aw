@@ -3,13 +3,13 @@
 //! source-coordination claim fences its exact CAS until publication.
 use super::{
     next_source_rev, publish_source_change_in, remove_binding_in,
-    require_unshared_materializations_in, retained_in, VersionedSourceBinding,
+    require_unshared_materializations_in, retained_in, SourceChange, VersionedSourceBinding,
 };
 use crate::{
     db, sandbox_owner, tool_root_key, Error, PrincipalId, Result, SandboxLifecycle,
     SandboxSnapshot, SessionStore, SourceMutationOutcome, SourceMutationSet, StoreMode,
 };
-use aw_agent_core::{NamedPreparedSource, PreparedSourceSet, SourceName};
+use aw_agent_core::{NamedPreparedSource, SourceName};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -49,69 +49,81 @@ fn released_in(c: &Connection, sandbox: &str, source: &NamedPreparedSource) -> R
 
 /// Only exact retained original descriptors. Missing names need a factual
 /// release event; an old metadata-only edit is not proof of deletion.
-pub(super) fn retained_preparation_in(
+pub(super) fn retained_preparations_in(
     c: &Connection,
     sandbox: &str,
     bindings: &[VersionedSourceBinding],
-) -> Result<PreparedSourceSet> {
+) -> Result<Vec<NamedPreparedSource>> {
     let mut original = crate::construction_receipt::restored_sources_for_sandbox_in(c, sandbox)?;
     original
         .sources
         .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-    let mut retained = Vec::with_capacity(bindings.len());
     let mut current = bindings.iter().peekable();
-    for source in original.sources.drain(..) {
-        let released = released_in(c, sandbox, &source)?;
-        if current
+    for source in &original.sources {
+        while current
             .peek()
-            .is_some_and(|binding| binding.binding.name == source.name)
+            .is_some_and(|binding| binding.binding.name.as_str() < source.name.as_str())
         {
-            let binding = current.next().expect("matching retained source");
-            if released
-                || binding.binding_rev != 1
-                || binding.binding.driver != source.prepared.descriptor.driver
-            {
-                return Err(Error::Conflict(
-                    "retained source differs from original materialization",
-                ));
-            }
-            retained.push(source);
-        } else if !released {
+            current.next();
+        }
+        let retained = current
+            .peek()
+            .is_some_and(|binding| binding.binding.name == source.name && binding.binding_rev == 1);
+        if retained == released_in(c, sandbox, source)? {
             return Err(Error::Conflict(
-                "original materialization lacks exact release evidence",
+                "original materialization release evidence differs from retention",
             ));
         }
     }
-    if current.next().is_some() {
-        return Err(Error::Conflict(
-            "Sandbox contains non-original materializations",
-        ));
+    let mut retained = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let source = if binding.binding_rev == 1 {
+            let index = original
+                .sources
+                .binary_search_by(|s| s.name.as_str().cmp(binding.binding.name.as_str()))
+                .map_err(|_| Error::Conflict("original materialization unavailable"))?;
+            original.sources[index].clone()
+        } else {
+            super::attachment::attached_preparation_in(c, sandbox, binding)?
+        };
+        if binding.binding.name != source.name
+            || binding.binding.driver != source.prepared.descriptor.driver
+            || released_in(c, sandbox, &source)?
+        {
+            return Err(Error::Conflict(
+                "retained source differs from original materialization",
+            ));
+        }
+        retained.push(source);
     }
-    original.sources = retained;
-    original.validate()?;
-    Ok(original)
+    Ok(retained)
 }
 
 /// Trusted observation, not authority. Includes the whole retained layout
 /// and the exact original descriptor at the selected index.
 #[derive(PartialEq, Eq)]
+pub(super) struct ManagedMutation {
+    pub(super) snapshot: SandboxSnapshot,
+    pub(super) bindings: Vec<VersionedSourceBinding>,
+    pub(super) preparations: Vec<NamedPreparedSource>,
+    pub(super) writer_epoch: u64,
+}
+
+#[derive(PartialEq, Eq)]
 pub struct SandboxSourceRelease {
-    snapshot: SandboxSnapshot,
-    bindings: Vec<VersionedSourceBinding>,
-    preparation: PreparedSourceSet,
+    layout: ManagedMutation,
     selected: usize,
-    writer_epoch: u64,
 }
 
 impl SandboxSourceRelease {
     pub fn snapshot(&self) -> &SandboxSnapshot {
-        &self.snapshot
+        &self.layout.snapshot
     }
     pub fn bindings(&self) -> &[VersionedSourceBinding] {
-        &self.bindings
+        &self.layout.bindings
     }
-    pub fn preparation(&self) -> &PreparedSourceSet {
-        &self.preparation
+    pub fn preparations(&self) -> &[NamedPreparedSource] {
+        &self.layout.preparations
     }
     pub fn selected(&self) -> usize {
         self.selected
@@ -119,8 +131,8 @@ impl SandboxSourceRelease {
 
     fn event_id(&self) -> Result<String> {
         release_event_id(
-            &self.snapshot.canonical_ref,
-            &self.preparation.sources[self.selected],
+            &self.layout.snapshot.canonical_ref,
+            &self.layout.preparations[self.selected],
         )
     }
 
@@ -129,19 +141,18 @@ impl SandboxSourceRelease {
         Ok(format!(
             "{SOURCE_RELEASE_PREFIX}{}:{}",
             self.event_id()?,
-            self.snapshot.rev
+            self.layout.snapshot.rev
         ))
     }
 }
 
-fn observe_in(
+pub(super) fn observe_managed_in(
     store: &SessionStore,
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     sandbox: &str,
-    name: &SourceName,
     rev: u64,
-) -> Result<SandboxSourceRelease> {
+) -> Result<ManagedMutation> {
     let key = sandbox_owner::parse_sandbox_ref(sandbox)?;
     sandbox_owner::authorize_project(tx, actor, &key.project, true)?;
     let (snapshot, bindings) = retained_in(tx, sandbox)?;
@@ -149,10 +160,11 @@ fn observe_in(
         return Err(Error::Conflict("Sandbox revision or lifecycle changed"));
     }
     next_source_rev(rev)?;
-    let selected = bindings
-        .iter()
-        .position(|binding| &binding.binding.name == name)
-        .ok_or(Error::Conflict("original source is not retained"))?;
+    if bindings.is_empty() {
+        return Err(Error::Conflict(
+            "managed mutation requires retained sources",
+        ));
+    }
     require_unshared_materializations_in(tx, &snapshot)?;
     let root = snapshot
         .tool_root
@@ -163,8 +175,7 @@ fn observe_in(
         .to_str()
         .ok_or(Error::Storage("invalid Sandbox working directory"))?;
     sandbox_owner::require_no_retained_layout_in(tx, root, cwd)?;
-    // Initial physical removal is restricted to unused layouts. In
-    // particular the last removal cannot activate a legacy ambient Agent.
+    // Initial structural realization requires an unused isolated layout.
     let used: bool = db(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_state_current WHERE sandbox_id=?1)
          OR EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id<>?1 AND lifecycle='open'
@@ -174,7 +185,7 @@ fn observe_in(
     ))?;
     if used {
         return Err(Error::Conflict(
-            "source release requires an unused isolated Sandbox",
+            "managed mutation requires an unused isolated Sandbox",
         ));
     }
     sandbox_owner::require_layout_quiescent_in(tx, sandbox, &tool_root_key(&snapshot.tool_root)?)?;
@@ -185,20 +196,36 @@ fn observe_in(
             &tool_root_key(&snapshot.working_directory)?,
         )?;
     }
-    let preparation = retained_preparation_in(tx, sandbox, &bindings)?;
+    let preparation = retained_preparations_in(tx, sandbox, &bindings)?;
     let registry = store.inner.source_drivers.reader()?;
-    for (binding, source) in bindings.iter().zip(&preparation.sources) {
+    for (binding, source) in bindings.iter().zip(&preparation) {
         registry.resolve(&binding.binding.pin()?)?;
         registry.resolve(&source.prepared.descriptor.pin()?)?;
     }
     let writer_epoch = crate::workspace_writer::writer_row(tx, &key.project.project)?.writer_epoch;
-    Ok(SandboxSourceRelease {
+    Ok(ManagedMutation {
         snapshot,
         bindings,
-        preparation,
-        selected,
+        preparations: preparation,
         writer_epoch,
     })
+}
+
+fn observe_in(
+    store: &SessionStore,
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    sandbox: &str,
+    name: &SourceName,
+    rev: u64,
+) -> Result<SandboxSourceRelease> {
+    let layout = observe_managed_in(store, tx, actor, sandbox, rev)?;
+    let selected = layout
+        .bindings
+        .iter()
+        .position(|binding| &binding.binding.name == name)
+        .ok_or(Error::Conflict("original source is not retained"))?;
+    Ok(SandboxSourceRelease { layout, selected })
 }
 
 impl SessionStore {
@@ -247,7 +274,11 @@ impl SessionStore {
                 ));
             }
             let set = SourceMutationSet::from_binding_refs(
-                original.bindings.iter().map(|binding| &binding.binding),
+                original
+                    .layout
+                    .bindings
+                    .iter()
+                    .map(|binding| &binding.binding),
             )?;
             let barrier = self.reconcile_retained_sources_in(&tx, &set, &prepare_id)?;
             db(tx.commit())?;
@@ -263,7 +294,7 @@ impl SessionStore {
                     "Sandbox source release changed before publication",
                 ));
             }
-            let binding = &original.bindings[original.selected];
+            let binding = &original.layout.bindings[original.selected];
             remove_binding_in(&tx, &sandbox, name, binding.binding_rev)?;
             publish_source_change_in(
                 &tx,
@@ -271,7 +302,7 @@ impl SessionStore {
                 &sandbox,
                 name,
                 expected_rev,
-                Some(&original.event_id()?),
+                SourceChange::Released(&original.event_id()?),
             )?;
             barrier.settle_in(&tx, SourceMutationOutcome::Settled)?;
             let result = sandbox_owner::snapshot_with_sources(&tx, &sandbox)?;
