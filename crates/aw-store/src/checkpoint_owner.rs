@@ -22,6 +22,7 @@ pub use restore::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
     InspectedCheckpointRestore, PreparedCheckpointRestore,
 };
+pub use retirement::CheckpointDeleteOutcome;
 pub(crate) use retirement::RETENTION_CLEANUP_PREFIX;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -698,6 +699,7 @@ mod tests {
             .unwrap();
         let key = AgentKey::new(&session.id, &branch.id);
         let reference = agent_owner::canonical_ref(&store.connection().unwrap(), key).unwrap();
+        let project = reference.rsplit_once("/a:").unwrap().0;
         drop(store);
 
         // A real v55 disk reopen, with an existing Agent and history.
@@ -828,6 +830,9 @@ mod tests {
         assert_eq!(during.history_head, settled.history_head);
         assert_eq!(during.source_coverage, SourceCoverage::None);
         assert!(store.checkpoint_delete(&viewer, &settled.id).is_err());
+        assert!(store
+            .checkpoint_delete_host(&viewer, project, &settled.id, "host:denied")
+            .is_err());
         assert_eq!(
             store
                 .checkpoint_list_metadata(&viewer, &reference, None, 1)
@@ -864,9 +869,44 @@ mod tests {
             .agent_public_revision(&actor, &session.id, &branch.id)
             .unwrap();
         store
+            .agent_access_set(
+                &actor,
+                &session.id,
+                &branch.id,
+                &viewer_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    manage: true,
+                    ..Default::default()
+                }),
+                rev,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .checkpoint_delete_host(&viewer, project, &during.id, "host:managed-delete")
+                .unwrap(),
+            CheckpointDeleteOutcome::Retired
+        );
+        let rev = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        store
             .agent_access_set(&actor, &session.id, &branch.id, &viewer_ref, None, rev)
             .unwrap();
         assert!(store.checkpoint_get_metadata(&viewer, &during.id).is_err());
+        assert_eq!(
+            store
+                .checkpoint_delete_host(&viewer, project, &during.id, "host:managed-delete")
+                .unwrap(),
+            CheckpointDeleteOutcome::PriorInvocation
+        );
+        assert!(store
+            .checkpoint_delete_host(&viewer, project, &settled.id, "host:managed-delete")
+            .is_err());
+        assert!(store
+            .checkpoint_delete_host(&viewer, project, &during.id, "host:new-denied")
+            .is_err());
         assert!(store
             .checkpoint_create_history_only(&viewer, &reference, Some("during turn"), "host:during")
             .is_err());
@@ -1099,7 +1139,26 @@ mod tests {
             ))
             .is_err());
         let before = store.agent_get(&actor, &reference).unwrap();
-        store.checkpoint_delete(&actor, first).unwrap();
+        assert_eq!(
+            store
+                .checkpoint_delete_host(&actor, project, first, "host:retire-sources")
+                .unwrap(),
+            CheckpointDeleteOutcome::Retired
+        );
+        assert_eq!(
+            store
+                .checkpoint_delete_host(&actor, project, first, "host:retire-sources")
+                .unwrap(),
+            CheckpointDeleteOutcome::Retired
+        );
+        {
+            let conn = store.connection().unwrap();
+            assert_eq!(
+                sources_in(&conn, first, cleanup_set.coverage).unwrap().0,
+                cleanup_set
+            );
+            assert_eq!(conn.query_row("SELECT count(*) FROM commit_log WHERE kind='checkpoint.retired' AND entity_type='checkpoint' AND entity_id=?1", [first], |r| r.get::<_, u64>(0)).unwrap(), 1);
+        }
         assert!(store
             .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
                 "shared live retention must remain pinned"
@@ -1145,6 +1204,15 @@ mod tests {
         drop(store);
 
         let missing = SessionStore::open(&temp.0).unwrap();
+        assert_eq!(
+            missing
+                .checkpoint_delete_host(&actor, project, first, "host:retire-sources")
+                .unwrap(),
+            CheckpointDeleteOutcome::Retired
+        );
+        assert!(missing
+            .checkpoint_delete_host(&actor, project, second, "host:retire-sources")
+            .is_err());
         assert!(missing
             .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
                 "missing driver cannot inspect retained source"

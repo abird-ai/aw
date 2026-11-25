@@ -886,6 +886,10 @@ struct RpcCommandCliArgs {
     /// aliases to this layout.
     #[arg(long = "checkpoint-restore-root", requires = "rpc_actor_owner")]
     rpc_checkpoint_restore_root: Option<PathBuf>,
+    /// Enable logical checkpoint retirement for the authenticated local Actor
+    /// owner. Never authorizes physical source retention cleanup.
+    #[arg(long = "checkpoint-delete", requires = "rpc_actor_owner")]
+    rpc_checkpoint_delete: bool,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
     #[cfg(all(feature = "net", target_os = "linux"))]
     #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
@@ -973,6 +977,7 @@ pub(crate) struct RunArgs {
     rpc_actor_owner: bool,
     rpc_checkpoint_create: bool,
     rpc_checkpoint_restore_root: Option<PathBuf>,
+    rpc_checkpoint_delete: bool,
     #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
@@ -1108,6 +1113,7 @@ impl RunArgs {
             rpc_actor_owner: false,
             rpc_checkpoint_create: false,
             rpc_checkpoint_restore_root: None,
+            rpc_checkpoint_delete: false,
             #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
@@ -1551,6 +1557,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_actor_owner = args.rpc_actor_owner || remote;
             run.rpc_checkpoint_create = args.rpc_checkpoint_create;
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
+            run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
             #[cfg(all(feature = "net", target_os = "linux"))]
             if let Some(peer) = args.rpc_actor_peer {
                 let room = args.rpc_actor_room.ok_or(Error::Denied(
@@ -3070,6 +3077,7 @@ fn run_agent_with_shell_containment(
             host.attach_rpc_actor_owner()?;
             host.checkpoint_create_enabled = args.rpc_checkpoint_create;
             host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
+            host.checkpoint_delete_enabled = args.rpc_checkpoint_delete;
         }
         return aw::headless::serve_stdio(
             &mut host,
@@ -3416,6 +3424,7 @@ struct Host {
     agent_state_port: Option<std::sync::Arc<StdioAgentStatePort>>,
     checkpoint_create_enabled: bool,
     checkpoint_restore_root: Option<PathBuf>,
+    checkpoint_delete_enabled: bool,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -4007,6 +4016,22 @@ impl aw::headless::CheckpointCreatePort for StdioAgentStatePort {
             coverage,
         )?;
         bounded_source_metadata(checkpoint_snapshot_value(&snapshot))
+    }
+}
+
+impl aw::headless::CheckpointDeletePort for StdioAgentStatePort {
+    fn delete(&self, request_id: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let checkpoint = params
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(Error::Protocol("checkpoint_delete id must be a string"))?;
+        let status = self.store.checkpoint_delete_host(
+            &self.caller,
+            &self.current_project_ref,
+            checkpoint,
+            &format!("rpc:stdio:checkpoint-delete:{request_id}"),
+        )?;
+        Ok(serde_json::json!({"status": status}))
     }
 }
 
@@ -4865,6 +4890,7 @@ impl Host {
             agent_state_port: None,
             checkpoint_create_enabled: false,
             checkpoint_restore_root: None,
+            checkpoint_delete_enabled: false,
             agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
@@ -6525,6 +6551,16 @@ impl aw::headless::Driver for Host {
             ),
         }))
     }
+    fn checkpoint_delete_port(
+        &self,
+    ) -> Option<std::sync::Arc<dyn aw::headless::CheckpointDeletePort>> {
+        if !self.checkpoint_delete_enabled {
+            return None;
+        }
+        self.agent_state_port
+            .as_ref()
+            .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointDeletePort>)
+    }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()
@@ -7736,7 +7772,8 @@ mod phase54_cli_tests {
     #[test]
     fn stdio_source_metadata_uses_current_store_authority_without_private_locators() {
         use aw::headless::{
-            CheckpointCreatePort, CheckpointReadPort, CheckpointRestorePort, SandboxPort,
+            CheckpointCreatePort, CheckpointDeletePort, CheckpointReadPort, CheckpointRestorePort,
+            SandboxPort,
         };
         use aw_agent_core::{
             CheckpointPolicy, DriverKey, SchemaSupport, SourceAccess, SourceBinding,
@@ -7904,9 +7941,39 @@ mod phase54_cli_tests {
             json!({"id":first.id})
         )
         .is_err());
-        // Logical retirement is done only by the Store owner here; the read
-        // port still exposes the replay tombstone, not released source data.
-        store.checkpoint_delete(&actor, &second.id).unwrap();
+        // Current Project and Manage authority are required for a new request.
+        let delete = json!({"id":second.id});
+        assert!(denied.delete("denied-delete", delete.clone()).is_err());
+        assert!(foreign_project
+            .delete("foreign-delete", delete.clone())
+            .is_err());
+        let before = store.agent_get(&actor, &port.current_agent_ref).unwrap();
+        assert_eq!(
+            port.delete("retire-second", delete.clone()).unwrap(),
+            json!({"status":"retired"})
+        );
+        assert_eq!(
+            port.delete("retire-second", delete.clone()).unwrap(),
+            json!({"status":"retired"})
+        );
+        assert_eq!(
+            foreign_project
+                .delete("retire-second", delete.clone())
+                .unwrap(),
+            json!({"status":"prior_invocation"})
+        );
+        assert!(port
+            .delete("retire-second", json!({"id":first.id}))
+            .is_err());
+        assert_eq!(
+            port.delete("retire-again", delete).unwrap(),
+            json!({"status":"retired"})
+        );
+        assert!(port.delete("retire-again", json!({"id":first.id})).is_err());
+        assert_eq!(
+            store.agent_get(&actor, &port.current_agent_ref).unwrap(),
+            before
+        );
         assert_eq!(
             CheckpointReadPort::apply(&port, "checkpoint_get", json!({"id":second.id})).unwrap()
                 ["lifecycle"],
@@ -8049,6 +8116,15 @@ mod phase54_cli_tests {
             current_agent_ref: other_ref,
             current_project_ref: project.clone(),
         };
+        assert_eq!(
+            rebound
+                .delete("retire-second", json!({"id":second.id}))
+                .unwrap(),
+            json!({"status":"retired"})
+        );
+        assert!(rebound
+            .delete("retire-second", json!({"id":first.id}))
+            .is_err());
         assert_eq!(
             rebound.create("history-create", request.clone()).unwrap(),
             created

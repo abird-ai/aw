@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: replay-safe empty-baseline checkpoint restore at `ffa8fc940fd82468925be3505adf7aa6082399b4` (signed; parent `077ac07803d9fa19db9743393cc4e68f2a6f4676`), followed by this comprehensive documentation refresh. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: replay-safe logical checkpoint retirement (this checkpoint; parent `94838c0caf1da105a7cf001892d630eaf66c99ec`, signed comprehensive refresh following implementation `ffa8fc940fd82468925be3505adf7aa6082399b4`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1355,6 +1355,19 @@ Current implementation: replay-safe empty-baseline checkpoint restore at `ffa8fc
       Clippy, durable/minimal checks, full binary build + opt-in smoke and
       scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix/platform qualification
       not rerun). No schema/admission/frozen Sandbox change.
+      **Replay-safe logical checkpoint retirement landed:** explicit local
+      Actor-owner stdio `--agent-checkpoint-delete`, default off, `id` only,
+      ordinary RPC gate; current Project/Manage in the original retirement
+      transaction, unresolved restore refusal and unchanged history/Agent
+      rev. Existing indexed immutable commit-log identity retains caller +
+      request semantics, including new idempotent acknowledgements on
+      retired rows. Exact replay appends nothing; mismatch denied, current
+      disclosure loss returns opaque `prior_invocation`. No new ledger,
+      schema, physical effect or release authority. Original retained anchors
+      and independent cleanup owner unchanged. Checkpoint owner 4/4, headless
+      8/8, Store-backed port 1/1, strict Store/CLI all-target/all-feature Clippy,
+      durable/minimal checks, full binary build/opt-in smoke and scoped fmt/diff
+      passed (L5 Rust 1.95.0; pinned Nix/platform qualification not rerun).
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1364,12 +1377,13 @@ Current implementation: replay-safe empty-baseline checkpoint restore at `ffa8fc
       non-exact partial checkout cleanup, physical authority/production cleanup, bound-Agent mutation
       and other structural removal cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
-      empty-baseline task-less restore are landed; do not repeat. Remaining Vault broker/socket/file/
-      env and product activation, independent protected metadata disclosure, checkpoint retirement/
+      empty-baseline task-less restore and logical checkpoint retirement are landed; do not repeat.
+      Remaining Vault broker/socket/file/env and product activation, independent protected metadata
+      disclosure, physical checkpoint retention cleanup/Project retention-admin authorization,
       task-bearing/captured-source capture and restore and remaining Sandbox/Vault host RPCs held.
       See current comprehensive handoff §5 for next cuts, limitations and acceptance. Schema v60.
-      AW remote main last verified at 4ddeed8; 19 subsequent first-parent commits at implementation
-      tip are local, plus documentation refresh. No new remote verification or publication.
+      AW remote main last verified at 4ddeed8; subsequent implementation and documentation
+      checkpoints remain local. No new remote verification or publication.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;

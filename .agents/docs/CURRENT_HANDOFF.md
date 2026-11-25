@@ -1,10 +1,10 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 Previous Phase-3, Phase-1 and R6 comprehensive handoffs remain historical design/implementation provenance:
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md)
@@ -19,7 +19,70 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: replay-safe empty-baseline checkpoint restore
+## Latest local implementation delta — 2026-11-25: replay-safe logical checkpoint retirement
+
+Parent: `94838c0caf1da105a7cf001892d630eaf66c99ec` (comprehensive handoff
+refresh; preceding implementation `ffa8fc940fd82468925be3505adf7aa6082399b4`).
+Both signatures verified. Original Agent, Actor/Turn journal and resource CLI
+owners still concurrently occupied; this independent resource slice leaves
+source-bearing admission held. L5 only.
+
+- New optional `CheckpointDeletePort` on the existing authenticated
+  `StdioAgentStatePort`. Explicit local Actor-owner stdio
+  `--agent-checkpoint-delete`, independent of create, read and restore.
+  The existing exact durable Session/tools-off restrictions remain.
+  Request `checkpoint_delete` accepts only `id`; ordinary connection
+  duplicate-ID/budget/parameter gate precedes dispatch. No client-supplied
+  cleanup flag, authority, source selector or driver/provider locator.
+- `SessionStore::checkpoint_delete_host` composes the original retirement
+  owner (`retire_in` also used by `checkpoint_delete`). One immediate Store
+  transaction checks current source Agent Manage and exact Project scope,
+  rejects unresolved restores, and retires the row without rewriting
+  history, advancing Agent rev or touching retained anchors. No implicit
+  Project-admin capability or physical deletion.
+- Existing immutable indexed `commit_log.event_id` owns replay, derived
+  from active user + namespaced request ID (`rpc:stdio:checkpoint-delete:{id}`
+  on stdio); exact checkpoint ID in the event entity is the complete request
+  semantics. Replay precedes fresh admission; differing target denied.
+  `checkpoint.retired` is the one actual transition. A new authorized
+  request on an already-retired row receives its own local-only
+  `checkpoint.retirement.acknowledged` fact so that its ID cannot later be
+  reused for another target. Exact replay appends no event and returns
+  `retired`, or opaque `prior_invocation` after loss of current Manage or
+  Project scope. No checkpoint metadata in either response. No new ledger,
+  schema, event delivery route or driver owner.
+- Retired anchor rows remain the existing cleanup intent; physical release
+  requires separately authorized exact external/provider fences and the
+  original retained-source reconciler. The RPC never invokes cleanup,
+  probes drivers, materializes sources or implies GC safety. Complete
+  physical retirement/recovery integration and Project retention/admin
+  authorization remain held.
+
+Validation on L5 (Rust 1.95.0): checkpoint owner group **4/4** (capture,
+restore, original retention and host retirement; retained anchors, single
+actual retirement, current Manage loss, replay with missing driver), headless
+protocol **8/8**, actual Store-backed metadata/construct/restore/delete
+port **1/1** (wrong caller/Project, exact vs mismatched replay, new no-op
+request identity, opaque prior invocation, reopen/rebind, unchanged Agent
+rev). Strict Store/CLI all-feature/all-target Clippy, durable-only lib and
+minimal all-target checks, full CLI build, real flag help and required Actor
+owner rejection smoke, scoped fmt/diff passed. Initial command used the
+binary name rather than Cargo package `aw-cli`; corrected and reran the
+remaining gates successfully. Existing durable/minimal dead-code warnings
+remain. CLI smoke tests opt-in parsing, not a live provider Session. Shared
+builds include concurrently owned dependencies; commit contains only owned
+paths. Pinned Nix 1.98.1, native platform/Bubblewrap and unrelated broad
+qualification not rerun. Store v60, Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal,
+context and queue owners are free. Otherwise take the next independent
+production authority/containment or physical recovery integration from the
+comprehensive handoff. Configured Git/signing approval activation and
+remaining source-bearing capture/restore, task-bearing restore, protected
+metadata disclosure, physical retention and other Sandbox/Vault authority
+remain held. Do not repeat the completed logical checkpoint RPC slice.
+
+## Previous local implementation delta — 2026-11-25: replay-safe empty-baseline checkpoint restore
 
 Parent: `077ac07803d9fa19db9743393cc4e68f2a6f4676` (replay-safe history
 checkpoint construction). Parent signature verified. Original Agent/Turn

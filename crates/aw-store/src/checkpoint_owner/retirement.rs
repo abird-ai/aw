@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
-    construction_receipt, db, durability, label, Error, Result, SessionStore,
+    construction_receipt, db, durability, label, user_for_principal, Error, Result, SessionStore,
     SourceMutationOutcome, SourceMutationSet, StoreMode,
 };
 use aw_agent_core::{PrincipalId, SourceSet};
@@ -91,6 +91,55 @@ fn cleanup_id(checkpoint: &str) -> String {
     )
 }
 
+/// A host deletion returns no protected checkpoint metadata. If the original
+/// caller no longer has current authority, expose only an opaque receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointDeleteOutcome {
+    Retired,
+    PriorInvocation,
+}
+
+fn require_project(row: &CheckpointRow, project: &str) -> Result<()> {
+    if row
+        .snapshot
+        .source_agent_ref
+        .rsplit_once("/a:")
+        .map(|(p, _)| p)
+        != Some(project)
+    {
+        return Err(Error::Denied("cross-Project checkpoint access unavailable"));
+    }
+    Ok(())
+}
+
+fn retire_in(c: &Connection, store: &SessionStore, row: &CheckpointRow) -> Result<bool> {
+    if row.snapshot.lifecycle == CheckpointLifecycle::Retired {
+        return Ok(false);
+    }
+    let checkpoint = &row.snapshot.id;
+    require_no_restore(c, store, checkpoint)?;
+    if db(c.execute(
+        "UPDATE checkpoints SET lifecycle='retired' WHERE checkpoint_id=?1 AND lifecycle='live'",
+        [checkpoint],
+    ))? != 1
+    {
+        return Err(Error::Conflict("checkpoint retirement changed"));
+    }
+    Ok(true)
+}
+
+// The existing immutable commit-log identity is the indexed receipt. The
+// complete request semantics are the exact checkpoint ID in its entity_id.
+// Never derive this identity from the target: reuse for another target must
+// conflict, including after retirement or a reconnect.
+fn delete_event_id(user: &str, request_id: &str) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-checkpoint-delete-v1\0");
+    hash.update(crate::json(&(user, request_id))?.as_bytes());
+    Ok(format!("cp-delete:{:x}", hash.finalize()))
+}
+
 impl SessionStore {
     /// Bounded live checkpoint metadata in creation order. Cursor is the
     /// exact immutable checkpoint ID (including a since-retired cursor).
@@ -159,15 +208,8 @@ impl SessionStore {
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let row = require_manager(&tx, actor, checkpoint)?;
-        if row.snapshot.lifecycle == CheckpointLifecycle::Retired {
+        if !retire_in(&tx, self, &row)? {
             return Ok(());
-        }
-        require_no_restore(&tx, self, checkpoint)?;
-        if db(tx.execute(
-            "UPDATE checkpoints SET lifecycle='retired' WHERE checkpoint_id=?1 AND lifecycle='live'",
-            [checkpoint],
-        ))? != 1 {
-            return Err(Error::Conflict("checkpoint retirement changed"));
         }
         durability::commit_event(
             &tx,
@@ -179,6 +221,86 @@ impl SessionStore {
             serde_json::json!({"sync_scope":"local","checkpoint_id":checkpoint}),
         )?;
         db(tx.commit())
+    }
+
+    /// Authenticated host deletion. Scope and current Manage are checked in
+    /// the retirement transaction; replay uses the original immutable fact.
+    /// No retention release, source probe or external effect is authorized.
+    pub fn checkpoint_delete_host(
+        &self,
+        actor: &PrincipalId,
+        project: &str,
+        checkpoint: &str,
+        request_id: &str,
+    ) -> Result<CheckpointDeleteOutcome> {
+        label(checkpoint, 128)?;
+        label(request_id, 256)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let user = user_for_principal(&tx, actor)?
+            .ok_or(Error::Denied("checkpoint caller is inactive or unknown"))?;
+        let event_id = delete_event_id(&user, request_id)?;
+        let prior: Option<(String, String, String)> = db(tx
+            .query_row(
+                "SELECT kind,entity_type,entity_id FROM commit_log WHERE event_id=?1",
+                [&event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional())?;
+        if let Some((kind, entity, target)) = prior {
+            if entity != "checkpoint"
+                || !matches!(
+                    kind.as_str(),
+                    "checkpoint.retired" | "checkpoint.retirement.acknowledged"
+                )
+            {
+                return Err(Error::Storage(
+                    "checkpoint retirement receipt identity changed",
+                ));
+            }
+            if target != checkpoint {
+                return Err(Error::Denied(
+                    "checkpoint request identity reused with different semantics",
+                ));
+            }
+            // Current authority controls disclosure, not whether the original
+            // factual mutation may be replayed. Never perform another effect.
+            let row = match require_manager(&tx, actor, checkpoint) {
+                Ok(row) => row,
+                Err(Error::Denied(_)) => return Ok(CheckpointDeleteOutcome::PriorInvocation),
+                Err(error) => return Err(error),
+            };
+            if require_project(&row, project).is_err() {
+                return Ok(CheckpointDeleteOutcome::PriorInvocation);
+            }
+            if row.snapshot.lifecycle != CheckpointLifecycle::Retired {
+                return Err(Error::Storage(
+                    "checkpoint retirement receipt has no tombstone",
+                ));
+            }
+            return Ok(CheckpointDeleteOutcome::Retired);
+        }
+        let row = require_manager(&tx, actor, checkpoint)?;
+        require_project(&row, project)?;
+        let changed = retire_in(&tx, self, &row)?;
+        // A new request against an existing tombstone records its own
+        // acknowledgement, not a second retirement transition.
+        durability::commit_event_position_with_id(
+            &tx,
+            &event_id,
+            &durability::tx_id()?,
+            if changed {
+                "checkpoint.retired"
+            } else {
+                "checkpoint.retirement.acknowledged"
+            },
+            "checkpoint",
+            checkpoint,
+            Some(actor),
+            serde_json::json!({"sync_scope":"local","checkpoint_id":checkpoint}),
+        )?;
+        db(tx.commit())?;
+        Ok(CheckpointDeleteOutcome::Retired)
     }
 
     /// Trusted retained-source reconciliation. The caller independently
