@@ -270,37 +270,83 @@ impl<'a> GitCheckpointCaptureHost<'a> {
         checkpoint: &str,
         authorize: impl FnOnce(&SourceSet) -> Result<F>,
     ) -> Result<()> {
-        let mut fence = None;
-        let result = self
-            .store
-            .checkpoint_reconcile_retired_sources(actor, checkpoint, |set| {
-                fence = Some(authorize(set)?);
-                let locations = fence.as_ref().expect("approved").locations();
-                if locations.len() != set.anchors.len()
-                    || locations
-                        .iter()
-                        .zip(&set.anchors)
-                        .any(|(location, anchor)| location.name != anchor.name)
-                {
-                    return Err(Error::Denied(
-                        "Git retention approval must cover every retired anchor",
-                    ));
-                }
-                let driver = self.store.source_driver(self.driver)?;
-                let anchors = set
-                    .anchors
-                    .iter()
-                    .map(GitSourceAnchor::try_from)
-                    .collect::<Result<Vec<_>>>()?;
-                for (anchor, location) in anchors.iter().zip(locations) {
-                    driver.verify_anchor_location(location, anchor)?;
-                }
-                for (anchor, location) in anchors.iter().zip(locations) {
-                    driver.release_retired_anchor(&location.repository, anchor)?;
-                }
-                Ok(())
-            });
-        drop(fence);
-        result
+        reconcile_retired_with(
+            self.store,
+            actor,
+            checkpoint,
+            || self.store.source_driver(self.driver),
+            authorize,
+        )
     }
+}
+
+/// Trusted maintenance without activating the source Agent. Resolve the
+/// installed Git definition only if the original retained set still exists.
+/// The authority callback is never run for an already settled retirement.
+pub fn reconcile_retired_git<F: GitSourceFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    checkpoint: &str,
+    authorize: impl FnOnce(&SourceSet) -> Result<F>,
+) -> Result<()> {
+    reconcile_retired_with(
+        store,
+        actor,
+        checkpoint,
+        || {
+            let handle = store.source_driver_handle::<GitSourceDriver>(
+                &aw_agent_core::DriverKey::builtin("git")?,
+            )?;
+            store.source_driver(&handle)
+        },
+        authorize,
+    )
+}
+
+fn reconcile_retired_with<F: GitSourceFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    checkpoint: &str,
+    resolve: impl FnOnce() -> Result<std::sync::Arc<GitSourceDriver>>,
+    authorize: impl FnOnce(&SourceSet) -> Result<F>,
+) -> Result<()> {
+    store.checkpoint_reconcile_retired_sources_fenced(
+        actor,
+        checkpoint,
+        |set| {
+            let fence = authorize(set)?;
+            let locations = fence.locations();
+            if locations.len() != set.anchors.len()
+                || locations
+                    .iter()
+                    .zip(&set.anchors)
+                    .any(|(location, anchor)| location.name != anchor.name)
+            {
+                return Err(Error::Denied(
+                    "Git retention approval must cover every retired anchor",
+                ));
+            }
+            let driver = resolve()?;
+            let anchors = set
+                .anchors
+                .iter()
+                .map(GitSourceAnchor::try_from)
+                .collect::<Result<Vec<_>>>()?;
+            // Pin every exact authorized backing before claiming cleanup.
+            // The returned fence owns the independent physical policy;
+            // these Repository pins are only observations.
+            let repos = anchors
+                .iter()
+                .zip(locations)
+                .map(|(anchor, location)| driver.pin_anchor_location(location, anchor))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((fence, driver, anchors, repos))
+        },
+        |_, (_fence, driver, anchors, repos)| {
+            for (anchor, repo) in anchors.iter().zip(repos) {
+                driver.release_retired_anchor_pinned(repo, anchor)?;
+            }
+            Ok(())
+        },
+    )
 }

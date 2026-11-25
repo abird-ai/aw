@@ -2,6 +2,8 @@
 mod attach;
 #[cfg(feature = "net")]
 mod awnet;
+#[cfg(feature = "workspace")]
+mod checkpoint_retention;
 #[cfg(all(feature = "device", target_os = "linux"))]
 mod device;
 mod resource_cli_args;
@@ -106,6 +108,13 @@ enum TopCommand {
     Skill {
         #[command(subcommand)]
         command: resources_cli::SkillCommand,
+    },
+    /// Offline Git retention reconciliation for one retired checkpoint.
+    #[cfg(feature = "workspace")]
+    CheckpointRetention {
+        /// Existing private host approval file; the operator must independently
+        /// exclude all external Git writers, aliases and other retention users.
+        approval: PathBuf,
     },
     /// Inspect and navigate durable Sessions.
     Session {
@@ -1654,6 +1663,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             json,
         } => extension_cli::inspect(options, action, json),
         TopCommand::Skill { command } => resources_cli::skill(command),
+        #[cfg(feature = "workspace")]
+        TopCommand::CheckpointRetention { approval } => checkpoint_retention::run(&approval),
         TopCommand::Session { command } => match command {
             resources_cli::SessionCommand::Open { session, run } => {
                 let mut run = run.into_run(None);

@@ -20,7 +20,7 @@ use std::{
 };
 
 mod capture;
-pub use capture::{GitCheckpointCaptureHost, GitSourceFence};
+pub use capture::{reconcile_retired_git, GitCheckpointCaptureHost, GitSourceFence};
 
 /// Live, independently authorized, whole-layout physical/provider fence.
 ///

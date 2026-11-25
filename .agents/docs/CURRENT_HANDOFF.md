@@ -19,7 +19,77 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: configured signing Vault activation and binding RPCs
+## Latest local implementation delta — 2026-11-25: offline Git checkpoint retention reconciliation
+
+Parent: `0e68089d9f5983b27325548fb667aa1940e45bb1` (configured signing
+Vault activation), signature verified. Agent/Turn journal and resource CLI
+owners still occupied; independent maintenance slice, L5 only.
+
+- The original retained-source reconciler now has a fenced variant. Read
+  the exact retired SourceSet under current Manage, unresolved restore and
+  shared retention checks; acquire independent read-only approval outside
+  SQLite; recheck the same set and authority under the immediate transaction
+  before the existing cleanup claim. A denied preflight creates no new
+  Unknown custody. The original compatibility method delegates to it.
+  The live guard survives exact external effects and factual settlement;
+  failure after claiming retains the original set and Unknown hazard.
+- Git capture/retirement host and offline registered-driver path share one
+  implementation. Verify and retain the original Repository objects for
+  the complete selected set, then reuse exact no-deref expected-OID release
+  on those objects. No rediscovery from stored locators after authorization.
+  No new replay ledger, schema or driver registry. Already-cleaned retirement
+  skips authority callback and Git lookup, even if the original root or driver
+  has disappeared.
+- Production workspace-feature CLI: `aw checkpoint-retention <absolute-private-approval.json>`.
+  Explicit trusted local maintenance, **not** an Agent/model RPC, and never
+  automatic. Requires an already existing private Store, exclusive owner,
+  current source-Agent Manage, and an exact independent administrative
+  approval. Reuses `sessions::open_sqlite_owner` and the installed Git driver
+  (`AW_GIT` / build-pinned Git). The operation only releases exact retired
+  Git refs and reconciles the existing Store; no live-checkpoint retirement,
+  branch/index/HEAD/worktree deletion, GC, activation or inference.
+- Approval format v1 (strict bounded JSON, max 1 MiB), in an existing
+  owner-private canonical directory outside the Store and checkout roots:
+  `version`, `store_directory`, `store_id`, `store_generation`, `manager`
+  (authenticated OS PrincipalId), `checkpoint`, `repositories` (each
+  `{name, repository, repository_identity:[volume, object]}`). Complete
+  selected set in canonical name order; original anchor must belong to
+  that checkpoint. The host chooses identities independently, never from
+  a persisted grant or client path. Private ordinary checkout roots only;
+  linked-worktree pointers/separate common-directory mappings unsupported.
+  A host approval file is read under a real exclusive advisory lease held
+  through settlement. Cooperating host writers must lock the same inode
+  before editing/withdrawing; no replacement while live. The operator MUST
+  independently protect the Store, approval, Git administration, objects,
+  ref namespace, ancestors and aliases and exclude external writers/other
+  retention users throughout. Directory pins and the lease alone are not
+  kernel containment or cross-Store physical proof. No automatic general
+  Git-native approval activation or broad cleanup permission.
+
+Validation (L5, Rust 1.95.0): Store checkpoint suite 4/4; real Git
+repository suite 33/33; Host source-checkpoint lifecycle 1/1; new offline
+reconciliation 1/1 (live/incorrect approval denial, no preflight hazard,
+changed-ref Unknown, exact restart cleanup, unchanged HEAD/index/worktree,
+terminal replay without checkout/driver). Strict all-feature/all-target
+Clippy for Store/Git/Host/CLI, durable lib and minimal all-target checks,
+full binary build and actual required-approval CLI smoke all passed.
+Initial empty Git filter corrected with the real repository suite; initial
+fixture compile error (missing SessionBackend import) corrected. Existing
+durable/minimal dead-code warnings remain. Pre-existing CLI inventory
+fixed flag count differs from the preceding built binary; broad CLI
+inventory suite and pinned Nix/native cross-platform qualification not
+rerun. No deployment or publication.
+
+Next: exact live source-aware Actor/Turn admission if the original owners
+are free. Otherwise configured Git native authority activation, or the next
+independent substantive source/Sandbox/Vault authority path. Offline Git
+checkpoint retention now has a real narrow host consumer; general physical
+containment, cross-Store/provider exclusion and Project retention-admin
+capability remain outstanding. Source-bearing execution, capture/restore
+RPCs and other projections remain held. Do not treat logical retirement or
+this exact maintenance approval as wider execution or materialization access.
+
+## Previous local implementation delta — 2026-11-25: configured signing Vault activation and binding RPCs
 
 Parent: `78a4c54c1bd33e93b395550df7c61433d4c3edf1` (replay-safe logical
 checkpoint retirement), signature verified. Original Agent/Actor/Turn

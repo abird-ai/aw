@@ -84,6 +84,25 @@ fn require_unshared_in(c: &Connection, checkpoint: &str) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_inputs_in(
+    c: &Connection,
+    store: &SessionStore,
+    actor: &PrincipalId,
+    checkpoint: &str,
+) -> Result<Option<SourceSet>> {
+    let row = require_manager(c, actor, checkpoint)?;
+    let Some(set) = retained_in(c, &row)? else {
+        return Ok(None);
+    };
+    require_no_restore(c, store, checkpoint)?;
+    require_unshared_in(c, checkpoint)?;
+    let registry = store.inner.source_drivers.reader()?;
+    for anchor in &set.anchors {
+        registry.resolve(&anchor.pin()?)?;
+    }
+    Ok(Some(set))
+}
+
 fn cleanup_id(checkpoint: &str) -> String {
     format!(
         "{RETENTION_CLEANUP_PREFIX}{:x}",
@@ -316,32 +335,60 @@ impl SessionStore {
         checkpoint: &str,
         reconcile: impl FnOnce(&SourceSet) -> Result<()>,
     ) -> Result<()> {
+        self.checkpoint_reconcile_retired_sources_fenced(
+            actor,
+            checkpoint,
+            |_| Ok(()),
+            |set, _| reconcile(set),
+        )
+    }
+
+    /// Acquire independent read-only authority before claiming physical
+    /// cleanup. A refused authorization must not create an Unknown effect.
+    /// Recheck the complete original set and current Store authority before
+    /// claiming it, then hold the returned fence through factual settlement.
+    /// No provider calls while a Store transaction is held.
+    pub fn checkpoint_reconcile_retired_sources_fenced<F>(
+        &self,
+        actor: &PrincipalId,
+        checkpoint: &str,
+        authorize: impl FnOnce(&SourceSet) -> Result<F>,
+        reconcile: impl FnOnce(&SourceSet, &F) -> Result<()>,
+    ) -> Result<()> {
         label(checkpoint, 128)?;
         if self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "retention cleanup requires the exclusive Store owner",
             ));
         }
-        let prepare_id = cleanup_id(checkpoint);
-        let (set, barrier) = {
+        let set = {
             let mut connection = self.connection()?;
-            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            let row = require_manager(&tx, actor, checkpoint)?;
-            let Some(set) = retained_in(&tx, &row)? else {
+            let tx = db(connection.transaction())?;
+            let Some(set) = cleanup_inputs_in(&tx, self, actor, checkpoint)? else {
                 return Ok(());
             };
-            require_no_restore(&tx, self, checkpoint)?;
-            require_unshared_in(&tx, checkpoint)?;
-            let registry = self.inner.source_drivers.reader()?;
-            for anchor in &set.anchors {
-                registry.resolve(&anchor.pin()?)?;
+            db(tx.commit())?;
+            set
+        };
+        let fence = authorize(&set)?;
+        let prepare_id = cleanup_id(checkpoint);
+        let barrier = {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let Some(current) = cleanup_inputs_in(&tx, self, actor, checkpoint)? else {
+                return Ok(());
+            };
+            if current != set {
+                return Err(Error::Conflict(
+                    "retained checkpoint anchors changed before cleanup",
+                ));
             }
             let mutations = SourceMutationSet::from_anchors(&set.anchors)?;
             let barrier = self.reconcile_retained_sources_in(&tx, &mutations, &prepare_id)?;
             db(tx.commit())?;
-            (set, barrier)
+            barrier
         };
-        if let Err(error) = reconcile(&set) {
+        if let Err(error) = reconcile(&set, &fence) {
             barrier.settle(SourceMutationOutcome::Unknown)?;
             return Err(error);
         }

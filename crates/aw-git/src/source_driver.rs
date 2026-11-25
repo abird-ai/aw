@@ -799,7 +799,8 @@ fn binding_for_repo(
 
 /// Exact independently authorized checkout location. A physical identity
 /// observes a directory, but grants no access to it or its Git backing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitSourceLocation {
     pub name: SourceName,
     pub repository: PathBuf,
@@ -1215,12 +1216,22 @@ impl GitSourceDriver {
         repository: &Path,
         anchor: &GitSourceAnchor,
     ) -> Result<()> {
+        self.release_retired_anchor_pinned(&self.repository(repository)?, anchor)
+    }
+
+    /// Use the original checked repository object rather than rediscovering
+    /// a path after whole-set authorization. Physical/provider exclusion
+    /// remains the caller's live fence, not the directory observations.
+    pub fn release_retired_anchor_pinned(
+        &self,
+        repo: &Repository,
+        anchor: &GitSourceAnchor,
+    ) -> Result<()> {
         anchor.validate()?;
-        let repo = self.repository(repository)?;
-        if repository_stamps(&repo)?.0 != anchor.source_ref {
+        if repo.git() != self.git || repository_stamps(repo)?.0 != anchor.source_ref {
             return Err(Error::Conflict("retired Git anchor repository changed"));
         }
-        release_exact_retention(&repo, anchor)
+        release_exact_retention(repo, anchor)
     }
 
     /// Check the exact approved repository against a retained anchor's
@@ -1231,6 +1242,14 @@ impl GitSourceDriver {
         location: &GitSourceLocation,
         anchor: &GitSourceAnchor,
     ) -> Result<()> {
+        self.pin_anchor_location(location, anchor).map(|_| ())
+    }
+
+    pub fn pin_anchor_location(
+        &self,
+        location: &GitSourceLocation,
+        anchor: &GitSourceAnchor,
+    ) -> Result<Repository> {
         anchor.validate()?;
         if location.name != anchor.name {
             return Err(Error::Denied("Git retention approval names another source"));
@@ -1246,7 +1265,7 @@ impl GitSourceDriver {
                 "Git retention approval differs from original source",
             ));
         }
-        Ok(())
+        Ok(repo)
     }
 
     /// Read-only retention validation independent of the current HEAD. A
