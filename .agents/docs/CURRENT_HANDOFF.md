@@ -19,7 +19,89 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: exact closed Git Sandbox retention reconciliation
+## Latest local implementation delta — 2026-11-25: explicitly selected live signing broker
+
+Parent: `29e4d4d9c60ac8d762607305a68f5968d62b3e4e` (closed Git Sandbox
+retention), signature verified. Original Agent/Turn journal and resource CLI
+owners still occupied; independent provider-specific broker consumer, L5 only.
+
+- The already configured signing Vault now has a real synchronous production
+  broker consumer for the authenticated local stdio Actor host. Explicit
+  startup selection `--agent-signing-broker-entry <entry>` requires the
+  existing `--agent-signing-vault-root`, exact SQLite Session/Actor-owner
+  and tools-off constraints. The Vault binding/metadata port alone does
+  not enable the service. No new provider, key configuration, model tool,
+  generic Vault invoke, remote transport or Agent activation.
+- The reusable `aw_store::SigningBroker<S>` pins the exact selected provider
+  registration and policy identity (entry, name, scope, actor, Agent,
+  authority generation, Store scope) and owning writer epoch. The cloned
+  registry is the same original owner; each synchronous operation creates
+  its own non-Sync reader, without an extra registry or mutex. Selection
+  checks the actual configured provider, exact actor/Agent, open admission,
+  Submit, Store scope, local Session owner/writer epoch and current key
+  version, but issues no grant. Every operation reacquires the actual
+  provider guard, rejects any different decision, and calls the existing
+  shared HMAC broker with the same immediate Store transaction fencing
+  Agent admission, current exact grant revision/access generation, actor,
+  Store scope and original writer epoch through key use and settlement.
+  The original generic SDK method still delegates to that same operation
+  with its existing current-writer semantics. Replacement of the selected
+  provider policy requires explicit reselection, not just attaching a new
+  grant. Provider restart invalidates prior grants; no automatic regrant.
+- The stdio hello advertises `signing_broker_sign` only when explicitly
+  selected. After the original request ID/budget and strict parameter gate,
+  the service accepts only `{grant_rev, message}` (positive exact revision,
+  1..65536 bytes of non-NUL UTF-8 text) and returns `{"tag":"<64 lowercase
+  hex characters>"}`. The bound host rechecks its original Actor state
+  and Agent binding before invoking the selected broker; scope, entry,
+  key/provider identity, target, paths and projection cannot be supplied
+  by the client. No key bytes, protected locators, generic decrypt or
+  arbitrary output destination. HMAC encoding is unchanged:
+  `aw-vault-signing-broker-v1\0 || len(scope)_BE64 || scope ||
+  len(message)_BE64 || message`. This is a pure synchronous computation,
+  not a durable external mutation, so no new receipt/replay owner. Same
+  connection duplicate IDs remain rejected; a fresh request revalidates
+  live authority every time, including after loss. The host independently
+  authorizes disclosure of the derived tag to its local stdio consumer;
+  relying-service freshness/replay and post-disclosure revocation remain
+  outside this cut.
+- No source-bearing Actor or Process admission change, additional
+  schema, credential inheritance or model registry expansion. The original
+  configured provider root and ancestor/alias/writer exclusion contract
+  still applies. The source Process proof projection remains a lower host
+  primitive; no claim that a source-bearing runtime now dispatches it.
+
+Validation (L5, Rust 1.95.0): configured real local Host/stdio Vault
+broker lifecycle 1/1, Store Vault signing 2/2, headless protocol 8/8,
+Host source-Process 2/2. The existing grouped fixture now exercises the
+actual opt-in broker and verifies no implicit grant, wrong selected entry
+and writer epoch refusal, exact HMAC equality with the original SDK,
+strict client params/size, duplicate IDs, held admission, withdrawal,
+fresh provider restart requiring regrant, removal, and no Agent revision/
+queue/model tool changes from signing. Strict all-feature/all-target
+Store/Host/CLI Clippy, durable lib, minimal all-target checks, full CLI
+build, actual broker startup flag dependency smoke and scoped fmt/diff
+passed. Initial compile rejected retaining the non-Sync registry reader;
+corrected to share the registry owner and acquire a reader per call.
+Corrected fixture admission argument order and feature-specific trait
+import. Additional durable-only all-target check exposed an existing
+non-workspace `src/subagents.rs:2744` reference to absent
+`Inner.state_dir` (same source on parent; parent build not rerun);
+this independent owner was not modified. Durable library/minimal/full
+supported gates passed; durable-only binary gate remains unqualified.
+Existing feature-specific warnings remain. Pinned Nix/native-platform
+qualification and broad CLI inventory discrepancy not rerun. No real
+user key or provider service invoked; only fixture-owned keys used.
+
+Next: exact live source-aware Actor/Turn admission if original journal
+owners are free. Otherwise prioritize independent production Process
+projection authority/containment or protected source metadata. The narrow
+configured signing broker is now reachable through the trusted local
+stdio host; do not duplicate its dispatch or conflate it with model or
+Process authority. Socket/file projections, production Env/Process
+dispatch, broader physical containment and remaining Phase-3 gates held.
+
+## Previous local implementation delta — 2026-11-25: exact closed Git Sandbox retention reconciliation
 
 Parent: `2291ac301201c00d09852ff3edf4637cfdcb8eff` (offline original
 capture/restore abandonment), signature verified. Original Agent/Turn journal

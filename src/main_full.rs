@@ -931,6 +931,10 @@ struct RpcCommandCliArgs {
     /// exclude Agent access and other writers to the provider directory.
     #[arg(long = "signing-vault-root", requires = "rpc_actor_owner")]
     rpc_signing_vault_root: Option<PathBuf>,
+    /// Separately enable the signing broker for one exact configured entry
+    /// of the current local Actor. No client-selected entry or scope.
+    #[arg(long = "signing-broker-entry", requires = "rpc_signing_vault_root")]
+    rpc_signing_broker_entry: Option<String>,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
     #[cfg(all(feature = "net", target_os = "linux"))]
     #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
@@ -1020,6 +1024,7 @@ pub(crate) struct RunArgs {
     rpc_checkpoint_restore_root: Option<PathBuf>,
     rpc_checkpoint_delete: bool,
     rpc_signing_vault_root: Option<PathBuf>,
+    rpc_signing_broker_entry: Option<String>,
     #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
@@ -1157,6 +1162,7 @@ impl RunArgs {
             rpc_checkpoint_restore_root: None,
             rpc_checkpoint_delete: false,
             rpc_signing_vault_root: None,
+            rpc_signing_broker_entry: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
@@ -1602,6 +1608,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
             run.rpc_signing_vault_root = args.rpc_signing_vault_root;
+            run.rpc_signing_broker_entry = args.rpc_signing_broker_entry;
             #[cfg(all(feature = "net", target_os = "linux"))]
             if let Some(peer) = args.rpc_actor_peer {
                 let room = args.rpc_actor_room.ok_or(Error::Denied(
@@ -3131,7 +3138,7 @@ fn run_agent_with_shell_containment(
             host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             host.checkpoint_delete_enabled = args.rpc_checkpoint_delete;
             if let Some(root) = args.rpc_signing_vault_root {
-                host.attach_rpc_signing_vault(&root)?;
+                host.attach_rpc_signing_vault(&root, args.rpc_signing_broker_entry.as_deref())?;
             }
         }
         return aw::headless::serve_stdio(
@@ -3536,6 +3543,7 @@ struct StdioVaultPort {
     state: std::sync::Arc<StdioAgentStatePort>,
     registry: aw_agent_core::VaultProviderRegistry,
     handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider>,
+    broker: Option<aw_store::SigningBroker>,
 }
 
 impl StdioVaultPort {
@@ -3543,6 +3551,7 @@ impl StdioVaultPort {
         state: std::sync::Arc<StdioAgentStatePort>,
         binding: &aw_store::SessionBinding,
         root: &std::path::Path,
+        broker_entry: Option<(&str, u64)>,
     ) -> Result<Self> {
         if !root.is_absolute() || root.canonicalize()? != root {
             return Err(Error::Denied(
@@ -3570,10 +3579,24 @@ impl StdioVaultPort {
         let registry = aw_agent_core::VaultProviderRegistry::new();
         let handle = aw_store::SigningVaultProvider::open_configured(&state.store, root)?
             .register(&registry)?;
+        let broker = broker_entry
+            .map(|(entry, writer_epoch)| {
+                aw_store::SigningBroker::select(
+                    state.store.clone(),
+                    registry.clone(),
+                    handle.clone(),
+                    &state.caller,
+                    &state.current_agent_ref,
+                    entry,
+                    writer_epoch,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             state,
             registry,
             handle,
+            broker,
         })
     }
 }
@@ -4772,12 +4795,20 @@ impl Host {
         Ok(())
     }
 
-    fn attach_rpc_signing_vault(&mut self, root: &std::path::Path) -> Result<()> {
-        if self.actor_owner.is_none() || self.agent_vault_port.is_some() {
-            return Err(Error::Denied(
-                "Vault requires a newly selected local Actor owner",
-            ));
+    fn attach_rpc_signing_vault(
+        &mut self,
+        root: &std::path::Path,
+        broker_entry: Option<&str>,
+    ) -> Result<()> {
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Vault requires the local Actor owner"))?;
+        if self.agent_vault_port.is_some() {
+            return Err(Error::Denied("Vault already activated"));
         }
+        owner.verify_rpc_state()?;
+        let writer_epoch = owner.bound_peer_scope().4;
         let state = self.agent_state_port.as_ref().ok_or(Error::Denied(
             "Vault requires the exact local Agent state owner",
         ))?;
@@ -4789,6 +4820,7 @@ impl Host {
             state.clone(),
             &creator.binding,
             root,
+            broker_entry.map(|entry| (entry, writer_epoch)),
         )?));
         Ok(())
     }
@@ -6758,6 +6790,31 @@ impl aw::headless::Driver for Host {
             .as_ref()
             .map(|port| port.clone() as std::sync::Arc<dyn aw::headless::AgentVaultPort>)
     }
+    fn can_signing_broker(&self) -> bool {
+        self.agent_vault_port
+            .as_ref()
+            .is_some_and(|port| port.broker.is_some())
+    }
+    fn signing_broker_sign(&self, grant_rev: u64, message: &[u8]) -> Result<[u8; 32]> {
+        let port = self
+            .agent_vault_port
+            .as_ref()
+            .ok_or(Error::Denied("signing broker unavailable"))?;
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("signing broker requires the bound Actor"))?;
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or(Error::Denied("signing broker requires the original Agent"))?;
+        owner.verify_rpc_state()?;
+        owner.verify_rpc_agent(agent)?;
+        port.broker
+            .as_ref()
+            .ok_or(Error::Denied("signing broker not selected"))?
+            .sign(grant_rev, message)
+    }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()
@@ -7951,6 +8008,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod phase54_cli_tests {
     use super::*;
+    use aw_store_api::SessionBackend;
 
     fn parse(args: &[&str]) -> Cli {
         let owned = args
@@ -8022,14 +8080,20 @@ mod phase54_cli_tests {
             })
         };
         let open = |store: &SessionStore, target: &str| {
-            StdioVaultPort::open_configured(state_port(store, &actor, target), &binding, &root)
+            StdioVaultPort::open_configured(
+                state_port(store, &actor, target),
+                &binding,
+                &root,
+                None,
+            )
         };
         assert!(open(&store, &reference).is_err());
         assert!(!root.join("secrets").exists());
         assert!(StdioVaultPort::open_configured(
             state_port(&store, &actor, &reference),
             &binding,
-            &workspace
+            &workspace,
+            None
         )
         .is_err());
         let keys = LocalSecretStore::open(&root).unwrap();
@@ -8087,11 +8151,20 @@ mod phase54_cli_tests {
         );
         host.ensure(false, "Vault RPC fixture").unwrap();
         assert!(host.agent.as_ref().unwrap().tool_specs().is_empty());
-        assert!(host.attach_rpc_signing_vault(&root).is_err());
+        assert!(host.attach_rpc_signing_vault(&root, Some(entry)).is_err());
         host.attach_rpc_actor_owner().unwrap();
         assert!(aw::headless::Driver::agent_vault_port(&host).is_none());
-        host.attach_rpc_signing_vault(&root).unwrap();
+        assert!(!aw::headless::Driver::can_signing_broker(&host));
+        assert!(host
+            .attach_rpc_signing_vault(&root, Some("missing-entry"))
+            .is_err());
+        host.attach_rpc_signing_vault(&root, Some(entry)).unwrap();
         let port = host.agent_vault_port.as_ref().unwrap().clone();
+        let epoch = host.actor_owner.as_ref().unwrap().bound_peer_scope().4;
+        assert!(aw::headless::Driver::can_signing_broker(&host));
+        let binding_only = open(&store, &reference).unwrap();
+        assert!(binding_only.broker.is_none());
+        drop(binding_only);
         let before = store.agent_get(&actor, &reference).unwrap().rev;
         let list =
             |port: &StdioVaultPort| port.apply("list", "agent_vault_list", json!({})).unwrap();
@@ -8112,6 +8185,17 @@ mod phase54_cli_tests {
         };
         assert_eq!(list(&port)["items"], json!([]));
         assert!(sign(&port, before).is_err());
+        assert!(aw::headless::Driver::signing_broker_sign(&host, before, b"challenge").is_err());
+        assert!(aw_store::SigningBroker::select(
+            store.clone(),
+            port.registry.clone(),
+            port.handle.clone(),
+            &actor,
+            &reference,
+            entry,
+            epoch + 1
+        )
+        .is_err());
         let request = json!({"name":name,"binding":{"entry":{"provider":provider,"entry":entry},"projection":"broker"},"rev":before});
         let mut wrong = request.clone();
         wrong["binding"]["projection"] = json!("env");
@@ -8138,17 +8222,28 @@ mod phase54_cli_tests {
             ),
             &binding,
             &root,
+            None,
         )
         .unwrap();
         assert!(denied.apply("list", "agent_vault_list", json!({})).is_err());
         assert!(set(&denied, "attach", request.clone()).is_err());
         drop(denied);
         // Exercise the actual configured Host, not just a port mock.
-        let requests = format!(
-            "{}\n{}\n",
+        let rev = before + 1;
+        let request_tag = json!({"v":1,"id":"sign","method":"signing_broker_sign","params":{"grant_rev":rev,"message":"challenge"}});
+        let mut target_override = request_tag.clone();
+        target_override["id"] = json!("override");
+        target_override["params"]["entry"] = json!("other");
+        let requests = [
             json!({"v":1,"id":"list","method":"agent_vault_list","params":{}}),
-            json!({"v":1,"id":"attach","method":"agent_vault_set","params":request})
-        );
+            json!({"v":1,"id":"early","method":"signing_broker_sign","params":{"grant_rev":rev,"message":"challenge"}}),
+            json!({"v":1,"id":"attach","method":"agent_vault_set","params":request}),
+            target_override,
+            request_tag.clone(),
+            request_tag,
+            json!({"v":1,"id":"stale","method":"signing_broker_sign","params":{"grant_rev":before,"message":"challenge"}}),
+            json!({"v":1,"id":"oversize","method":"signing_broker_sign","params":{"grant_rev":rev,"message":"x".repeat(65537)}}),
+        ].into_iter().map(|request| request.to_string()+"\n").collect::<String>();
         let mut output = Vec::new();
         aw::headless::serve_stdio(
             &mut host,
@@ -8163,11 +8258,37 @@ mod phase54_cli_tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_set"], true);
-        assert_eq!(frames[1]["data"]["items"], json!([]));
-        let attached = frames[2]["data"].clone();
-        let rev = before + 1;
+        assert_eq!(
+            frames[0]["data"]["capabilities"]["signing_broker_sign"],
+            true
+        );
+        let frame = |id: &str| frames.iter().find(|frame| frame["id"] == id).unwrap();
+        assert_eq!(frame("list")["data"]["items"], json!([]));
+        assert_eq!(frame("early")["type"], "error");
+        assert_eq!(frame("override")["data"]["code"], "invalid_parameters");
+        assert_eq!(frame("stale")["type"], "error");
+        assert_eq!(frame("oversize")["type"], "error");
+        let attached = frame("attach")["data"].clone();
         assert_eq!(attached, json!({"status":"applied","rev":rev}));
         let proof = sign(&port, rev).unwrap();
+        let expected_tag = proof
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(frame("sign")["data"], json!({"tag":expected_tag}));
+        assert!(frames
+            .iter()
+            .any(|frame| frame["id"] == "sign" && frame["data"]["code"] == "duplicate_request_id"));
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev);
+        assert_eq!(host.agent.as_ref().unwrap().tool_specs().len(), 0);
+        assert!(store
+            .actor_queue_list(&actor, &session.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            aw::headless::Driver::signing_broker_sign(&host, rev, b"challenge").unwrap(),
+            proof
+        );
         assert_eq!(set(&port, "attach", request.clone()).unwrap(), attached);
         let mut mismatch = request.clone();
         mismatch["ref"] = json!(reference);
@@ -8188,6 +8309,7 @@ mod phase54_cli_tests {
             .revoke(entry)
             .unwrap();
         assert!(sign(&port, rev).is_err());
+        assert!(aw::headless::Driver::signing_broker_sign(&host, rev, b"challenge").is_err());
         assert_eq!(set(&port, "attach", request.clone()).unwrap(), attached);
         let mut fresh = request.clone();
         fresh["rev"] = json!(rev);
@@ -8208,32 +8330,71 @@ mod phase54_cli_tests {
             json!({"status":"prior_invocation"})
         );
         assert_eq!(list(&rebound)["items"], json!([]));
-        let restarted = open(&store, &reference).unwrap();
+        assert!(StdioVaultPort::open_configured(
+            state_port(&store, &actor, &other_ref),
+            &binding,
+            &root,
+            Some((entry, epoch))
+        )
+        .is_err());
+        let restarted = StdioVaultPort::open_configured(
+            state_port(&store, &actor, &reference),
+            &binding,
+            &root,
+            Some((entry, epoch)),
+        )
+        .unwrap();
+        let broker = restarted.broker.as_ref().unwrap();
         assert_eq!(
             set(&restarted, "attach", request.clone()).unwrap(),
             attached
         );
         assert!(sign(&restarted, rev).is_err());
+        assert!(broker.sign(rev, b"challenge").is_err());
         let reattached = set(&restarted, "regrant", fresh).unwrap();
         assert_eq!(reattached, json!({"status":"applied","rev":rev+1}));
         assert_eq!(sign(&restarted, rev + 1).unwrap(), proof);
-        let remove = json!({"name":name,"binding":null,"rev":rev+1});
+        assert_eq!(broker.sign(rev + 1, b"challenge").unwrap(), proof);
+        let held = store
+            .agent_admission(
+                &actor,
+                &reference,
+                aw_store::AgentAdmission::Held,
+                Some(rev + 1),
+            )
+            .unwrap();
+        assert!(broker.sign(rev + 1, b"challenge").is_err());
+        let reopened = store
+            .agent_admission(
+                &actor,
+                &reference,
+                aw_store::AgentAdmission::Open,
+                Some(held.rev),
+            )
+            .unwrap();
+        assert_eq!(broker.sign(rev + 1, b"challenge").unwrap(), proof);
+        let remove = json!({"name":name,"binding":null,"rev":reopened.rev});
         let removed = set(&restarted, "remove", remove.clone()).unwrap();
-        assert_eq!(removed, json!({"status":"applied","rev":rev+2}));
+        let removed_rev = reopened.rev + 1;
+        assert_eq!(removed, json!({"status":"applied","rev":removed_rev}));
         assert_eq!(set(&restarted, "remove", remove).unwrap(), removed);
         assert!(sign(&restarted, rev + 1).is_err());
+        assert!(broker.sign(rev + 1, b"challenge").is_err());
         assert_eq!(list(&restarted)["items"], json!([]));
         assert_eq!(keys.get(&key_ref).unwrap().as_slice(), &[67u8; 32]);
-        let noop = json!({"name":name,"binding":null,"rev":rev+2});
+        let noop = json!({"name":name,"binding":null,"rev":removed_rev});
         assert_eq!(set(&restarted, "noop", noop.clone()).unwrap(), removed);
         assert_eq!(set(&restarted, "noop", noop).unwrap(), removed);
         assert!(set(
             &restarted,
             "noop",
-            json!({"name":"other","binding":null,"rev":rev+2})
+            json!({"name":"other","binding":null,"rev":removed_rev})
         )
         .is_err());
-        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev + 2);
+        assert_eq!(
+            store.agent_get(&actor, &reference).unwrap().rev,
+            removed_rev
+        );
     }
 
     #[test]

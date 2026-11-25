@@ -386,6 +386,135 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     }
 }
 
+/// A host-selected provider-specific signing endpoint, not a Vault grant.
+/// It pins one exact registered provider decision, never a key or a cached
+/// permission. Every invocation reacquires the actual provider guard and
+/// validates the current original Agent grant, actor and Store writer.
+/// Replacing the selected provider decision requires explicit reselection.
+pub struct SigningBroker<S = LocalSecretStore> {
+    store: SessionStore,
+    registry: VaultProviderRegistry,
+    handle: VaultProviderHandle<SigningVaultProvider<S>>,
+    selected: VaultGrantPolicy,
+    writer_epoch: u64,
+}
+
+impl<S: SecretStore + 'static> SigningBroker<S> {
+    /// Trusted host selection of one exact entry for the authenticated
+    /// current Agent. No grant is minted here; selection may precede attach.
+    pub fn select(
+        store: SessionStore,
+        registry: VaultProviderRegistry,
+        handle: VaultProviderHandle<SigningVaultProvider<S>>,
+        actor: &PrincipalId,
+        reference: &str,
+        entry: &str,
+        writer_epoch: u64,
+    ) -> Result<Self> {
+        let provider = registry.reader()?.get(&handle)?;
+        let selected = provider.with_entry(entry, |authority| {
+            let policy = authority.policy();
+            let target = &policy.target;
+            if &target.actor != actor
+                || target.agent_ref != reference
+                || target.projection != VaultProjection::Broker
+            {
+                return Err(Error::Denied(
+                    "signing broker requires the exact configured Agent and actor",
+                ));
+            }
+            let agent = store.agent_get(actor, reference)?;
+            if !agent.caller_permissions.submit
+                || agent.lifecycle != crate::AgentLifecycle::Open
+                || agent.admission != crate::AgentAdmission::Open
+                || store.vault_policy(
+                    target.clone(),
+                    policy.authority_ref.clone(),
+                    policy.authority_generation,
+                )? != *policy
+            {
+                return Err(Error::Denied(
+                    "signing broker subject or Store scope changed",
+                ));
+            }
+            let binding = store.agent_execution_binding(actor, reference)?;
+            store.actor_input_writer_fence(actor, binding.session_id(), writer_epoch)?;
+            provider.signing_key(authority.entry)?;
+            Ok(policy.clone())
+        })?;
+        Ok(Self {
+            store,
+            registry,
+            handle,
+            selected,
+            writer_epoch,
+        })
+    }
+
+    /// Only this selected service's domain-separated tag, never raw key
+    /// bytes. A failed or repeated invocation still requires live authority.
+    pub fn sign(&self, grant_rev: u64, message: &[u8]) -> Result<[u8; 32]> {
+        require_signing_message(message)?;
+        let registry = self.registry.reader()?;
+        let provider = registry.get(&self.handle)?;
+        provider.with_entry(&self.selected.target.entry.entry, |authority| {
+            if authority.policy() != &self.selected {
+                return Err(Error::Denied("selected signing broker authority changed"));
+            }
+            provider.sign_broker(
+                &self.store,
+                &registry,
+                &authority,
+                grant_rev,
+                Some(self.writer_epoch),
+                message,
+            )
+        })
+    }
+}
+
+fn require_signing_message(message: &[u8]) -> Result<()> {
+    if message.len() > 64 * 1024 {
+        return Err(Error::Limit("Vault signing message exceeds 64 KiB"));
+    }
+    Ok(())
+}
+
+impl<S: SecretStore + 'static> SigningVaultProvider<S> {
+    fn sign_broker(
+        &self,
+        store: &SessionStore,
+        registry: &VaultProviderRegistryReader,
+        authority: &Authority<'_>,
+        grant_rev: u64,
+        writer_epoch: Option<u64>,
+        message: &[u8],
+    ) -> Result<[u8; 32]> {
+        let target = &authority.policy().target;
+        store.with_vault_broker_at_epoch(
+            &target.actor,
+            registry,
+            authority,
+            grant_rev,
+            writer_epoch,
+            || {
+                let signing_key = self.signing_key(authority.entry)?;
+                let mut mac = hmac::Context::with_key(&signing_key);
+                mac.update(b"aw-vault-signing-broker-v1\0");
+                mac.update(&(target.scope.len() as u64).to_be_bytes());
+                mac.update(target.scope.as_bytes());
+                mac.update(&(message.len() as u64).to_be_bytes());
+                mac.update(message);
+                Ok(mac
+                    .sign()
+                    .as_ref()
+                    .try_into()
+                    .expect("HMAC-SHA256 tag length"))
+            },
+        )
+    }
+}
+
 impl SessionStore {
     /// Trusted host composition, not an RPC. The actual registered provider
     /// supplies its independent exact attachment decision.
@@ -474,9 +603,7 @@ impl SessionStore {
         entry: &str,
         message: &[u8],
     ) -> Result<[u8; 32]> {
-        if message.len() > 64 * 1024 {
-            return Err(Error::Limit("Vault signing message exceeds 64 KiB"));
-        }
+        require_signing_message(message)?;
         let provider = registry.get(handle)?;
         provider.with_entry(entry, |authority| {
             let target = &authority.policy().target;
@@ -487,20 +614,14 @@ impl SessionStore {
             {
                 return Err(Error::Denied("Vault signing scope or subject changed"));
             }
-            self.with_vault_broker(actor, registry, &authority, expected_grant_rev, || {
-                let signing_key = provider.signing_key(authority.entry)?;
-                let mut mac = hmac::Context::with_key(&signing_key);
-                mac.update(b"aw-vault-signing-broker-v1\0");
-                mac.update(&(scope.len() as u64).to_be_bytes());
-                mac.update(scope.as_bytes());
-                mac.update(&(message.len() as u64).to_be_bytes());
-                mac.update(message);
-                Ok(mac
-                    .sign()
-                    .as_ref()
-                    .try_into()
-                    .expect("HMAC-SHA256 tag length"))
-            })
+            provider.sign_broker(
+                self,
+                registry,
+                &authority,
+                expected_grant_rev,
+                None,
+                message,
+            )
         })
     }
 }

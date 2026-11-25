@@ -669,6 +669,27 @@ impl SessionStore {
         expected_grant_rev: u64,
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
+        self.with_vault_broker_at_epoch(
+            actor,
+            registry,
+            authority,
+            expected_grant_rev,
+            None,
+            operation,
+        )
+    }
+
+    /// Host-selected broker also pins the original owning writer epoch.
+    /// Check it in the same transaction as the actual provider operation.
+    pub(crate) fn with_vault_broker_at_epoch<R>(
+        &self,
+        actor: &PrincipalId,
+        registry: &VaultProviderRegistryReader,
+        authority: &impl VaultGrantAuthority,
+        expected_grant_rev: u64,
+        writer_epoch: Option<u64>,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         if self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "Vault broker requires the exclusive Store owner",
@@ -686,7 +707,11 @@ impl SessionStore {
         let (session, branch) = exact_key(&tx, &target.agent_ref)?;
         let key = AgentKey::new(&session, &branch);
         agent_owner::require_future_admission(&tx, key)?;
-        workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
+        if let Some(epoch) = writer_epoch {
+            workspace_writer::verify_writer_epoch_for_session(&tx, &session, epoch)?;
+        } else {
+            workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
+        }
         require_projection_in(
             &tx,
             registry,

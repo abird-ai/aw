@@ -247,7 +247,9 @@ pub use vault_grants::{
     VaultBindingSelection, VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus,
     VaultGrantSummary, VaultGrantTarget, VaultSetOutcome, VaultSetRequest,
 };
-pub use vault_signing::{SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV};
+pub use vault_signing::{
+    SigningBroker, SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV,
+};
 pub use workspace_replica::*;
 pub use workspace_writer::{WorkspaceWriterEventInfo, WorkspaceWriterInfo};
 

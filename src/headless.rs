@@ -193,6 +193,14 @@ pub trait Driver {
     fn agent_vault_port(&self) -> Option<Arc<dyn AgentVaultPort>> {
         None
     }
+    /// Separately enabled provider-specific service, not an Agent/model
+    /// tool or part of Vault binding management. No client target selector.
+    fn can_signing_broker(&self) -> bool {
+        false
+    }
+    fn signing_broker_sign(&self, _grant_rev: u64, _message: &[u8]) -> Result<[u8; 32]> {
+        Err(Error::Denied("signing broker unavailable"))
+    }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
         Err(Error::Denied(
             "RPC has no current authenticated Actor owner",
@@ -429,6 +437,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "checkpoint_delete" => Some(&["id"]),
         "agent_vault_list" => Some(&["ref"]),
         "agent_vault_set" => Some(&["ref", "name", "binding", "rev"]),
+        "signing_broker_sign" => Some(&["grant_rev", "message"]),
         "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -777,6 +786,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let agent_vault = driver.agent_vault_port();
     capabilities["agent_vault_list"] = json!(agent_vault.is_some());
     capabilities["agent_vault_set"] = json!(agent_vault.is_some());
+    capabilities["signing_broker_sign"] = json!(driver.can_signing_broker());
     out.emit("hello",None,json!({
         "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
         "capabilities":capabilities,
@@ -884,6 +894,29 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
                 match port.apply(id, &request.method, request.params) {
                     Ok(value) => out.emit("response", Some(id), value)?,
                     Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
+            "signing_broker_sign" if driver.can_signing_broker() => {
+                // Pure synchronous provider operation, after the connection
+                // ID/budget and strict parameter gates. No durable external
+                // effect or replay receipt; every call revalidates authority.
+                let result = (|| -> Result<Value> {
+                    let rev = request.params.get("grant_rev").and_then(Value::as_u64)
+                        .filter(|rev| *rev > 0 && *rev <= i64::MAX as u64)
+                        .ok_or(Error::Protocol("signing broker requires a grant revision"))?;
+                    let message = param_text(&request.params, "message", 64 * 1024)?;
+                    let tag = driver.signing_broker_sign(rev, message.as_bytes())?;
+                    let mut hex = [0u8; 64];
+                    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                    for (byte, pair) in tag.iter().zip(hex.chunks_exact_mut(2)) {
+                        pair[0] = DIGITS[(byte >> 4) as usize];
+                        pair[1] = DIGITS[(byte & 15) as usize];
+                    }
+                    Ok(json!({"tag":std::str::from_utf8(&hex).expect("ASCII tag")}))
+                })();
+                match result {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected"}))?,
                 }
             }
             "actor_query" if driver.actor_available() => {
@@ -1242,6 +1275,7 @@ mod r12_protocol_tests {
             r#"{"v":1,"id":"actorctrl","method":"actor_op","params":{"operation":"cancel","turn_id":1}}"#,
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"cp_fixture"}}"#,
             r#"{"v":1,"id":"vault-set","method":"agent_vault_set","params":{"name":"signing","binding":null,"rev":1}}"#,
+            r#"{"v":1,"id":"broker","method":"signing_broker_sign","params":{"grant_rev":1,"message":"never"}}"#,
         ].join("\n")+"\n";
         let mut bytes = Vec::new();
         serve_stdio(&mut fake, Cursor::new(lines), &mut bytes, false).unwrap();
@@ -1258,6 +1292,10 @@ mod r12_protocol_tests {
         );
         assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_set"], false);
         assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_list"], false);
+        assert_eq!(
+            frames[0]["data"]["capabilities"]["signing_broker_sign"],
+            false
+        );
         assert_eq!(frames[1]["type"], "response");
         assert!(frames
             .iter()
@@ -1279,8 +1317,8 @@ mod r12_protocol_tests {
                 .iter()
                 .filter(|v| v["data"]["code"] == "unsupported_method")
                 .count(),
-            5,
-            "unbound stdio must never permit raw Actor, checkpoint or Vault mutation authority"
+            6,
+            "unbound stdio must never permit raw Actor, checkpoint or Vault authority"
         );
         assert_eq!(frames.iter().filter(|v| v["type"] == "started").count(), 1);
     }
