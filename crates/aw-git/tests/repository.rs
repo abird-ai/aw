@@ -55,6 +55,25 @@ impl Fixture {
     fn repo(&self) -> Repository {
         Repository::discover(&self.git, &self.root).unwrap()
     }
+    #[cfg(feature = "source-driver")]
+    fn interrupt_private_index(&self, verb: &str) -> aw_git::source_driver::GitSourceDriver {
+        use std::os::unix::fs::PermissionsExt;
+        // A trusted fixture executable reports failure after real Git writes
+        // the original private index (or completes its checkout).
+        let shell = std::env::var_os("AW_BASH")
+            .map(PathBuf::from)
+            .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let wrapper = self.parent.join("interrupt-git");
+        let git = quote(self.git.to_str().unwrap());
+        std::fs::write(&wrapper, format!(
+            "#!{}\ncase \"${{GIT_INDEX_FILE:-}}\" in\n  */aw-capture-*/index-1)\n    for arg do\n      if [ \"$arg\" = {} ]; then\n        {} \"$@\" || exit $?\n        exit 71\n      fi\n    done;;\nesac\nexec {} \"$@\"\n",
+            shell.display(), quote(verb), git, git,
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        aw_git::source_driver::GitSourceDriver::new(wrapper).unwrap()
+    }
     fn write(&self, p: &str, b: &[u8]) {
         let p = self.root.join(p);
         if let Some(parent) = p.parent() {
@@ -312,6 +331,60 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     driver.release_prepared_capture(&abandoned).unwrap();
     driver.release_prepared_capture(&abandoned).unwrap();
     assert!(driver.verify_anchor(&f.root, &retained).is_err());
+    assert_eq!(
+        std::fs::read(f.root.join("a.txt")).unwrap(),
+        b"abandoned dirty capture\n"
+    );
+    // Interrupt the real private-index pass after Git has written it.
+    // The original descriptor and the driver's synced marker now identify
+    // only the scratch directory, never the real checkout/index.
+    let partial = driver
+        .plan_capture(&binding, "cp_partial_index", "op_partial_index")
+        .unwrap();
+    let before_index = std::fs::read(f.root.join(".git/index")).unwrap();
+    let before_head = f.run(&["rev-parse", "HEAD"]).stdout;
+    assert!(f
+        .interrupt_private_index("read-tree")
+        .execute_capture(&partial)
+        .is_err());
+    let name = format!("aw-capture-{}", partial.descriptor.prepared_identity);
+    let scratch = f.root.join(".git").join(&name);
+    let marker = f.root.join(".git").join(format!("{name}.owner"));
+    assert!(scratch.join("index-1").is_file() && marker.is_file());
+    assert!(matches!(
+        driver.inspect_capture(&partial).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(driver.execute_capture(&partial).is_err());
+
+    // Same private mode and derived name with the original sibling
+    // marker are insufficient when the directory identity differs.
+    use std::os::unix::fs::DirBuilderExt;
+    let moved = scratch.with_extension("moved");
+    std::fs::rename(&scratch, &moved).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&scratch)
+        .unwrap();
+    std::fs::write(scratch.join("index-1"), b"foreign").unwrap();
+    assert!(driver.release_prepared_capture(&partial).is_err());
+    assert_eq!(std::fs::read(scratch.join("index-1")).unwrap(), b"foreign");
+    std::fs::remove_file(scratch.join("index-1")).unwrap();
+    std::fs::remove_dir(&scratch).unwrap();
+    std::fs::rename(&moved, &scratch).unwrap();
+    std::fs::write(scratch.join("unexpected"), b"keep").unwrap();
+    assert!(driver.release_prepared_capture(&partial).is_err());
+    assert!(scratch.join("index-1").is_file());
+    assert_eq!(std::fs::read(scratch.join("unexpected")).unwrap(), b"keep");
+    std::fs::remove_file(scratch.join("unexpected")).unwrap();
+    driver.release_prepared_capture(&partial).unwrap();
+    assert!(!scratch.exists() && !marker.exists());
+    driver.release_prepared_capture(&partial).unwrap();
+    assert_eq!(
+        std::fs::read(f.root.join(".git/index")).unwrap(),
+        before_index
+    );
+    assert_eq!(f.run(&["rev-parse", "HEAD"]).stdout, before_head);
     assert_eq!(
         std::fs::read(f.root.join("a.txt")).unwrap(),
         b"abandoned dirty capture\n"
@@ -946,7 +1019,21 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
     let abandoned = driver
         .plan_restore(&f.root, &dirty, &abandoned_path, "op_abandoned_restore")
         .unwrap();
-    driver.execute_restore(&abandoned).unwrap();
+    // Complete the real dirty checkout but lose its response before
+    // scratch cleanup. Inspection must not publish over that artifact;
+    // abandonment reuses exact scratch and original restore validation.
+    assert!(f
+        .interrupt_private_index("checkout-index")
+        .execute_restore(&abandoned)
+        .is_err());
+    let child = Repository::discover(&f.git, &abandoned_path).unwrap();
+    let name = format!("aw-capture-{}", abandoned.descriptor.prepared_identity);
+    assert!(child.git_dir().join(&name).join("index-1").is_file());
+    assert!(child.git_dir().join(format!("{name}.owner")).is_file());
+    assert!(matches!(
+        restarted.inspect_restore(&abandoned).unwrap(),
+        RecoveryInspection::Unknown
+    ));
     restarted.release_prepared_restore(&abandoned).unwrap();
     restarted.release_prepared_restore(&abandoned).unwrap();
     assert!(!abandoned_path.exists());

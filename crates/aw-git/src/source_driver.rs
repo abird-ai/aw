@@ -1001,6 +1001,7 @@ impl GitSourceDriver {
     pub fn execute_capture(&self, prepared: &PreparedSourceOperation) -> Result<GitSourceAnchor> {
         let plan = CapturePlan::decode(prepared)?;
         let repo = self.binding_repository(&plan.binding)?;
+        PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)?;
         let reference = retention_ref(&plan.checkpoint_id, &plan.binding.name);
         if retained_commit(&repo, &reference)?.is_some() {
             return Err(Error::Conflict(
@@ -1029,12 +1030,14 @@ impl GitSourceDriver {
                         "Git private-index capture changed between passes",
                     ));
                 }
-                write_synthetic(
+                let captured = write_synthetic(
                     &repo,
                     &first_tree,
                     &plan.base,
                     &prepared.descriptor.prepared_identity,
-                )?
+                )?;
+                indexes.finish()?;
+                captured
             }
         } else {
             if legacy_clean_head(&repo)? != plan.base {
@@ -1077,6 +1080,7 @@ impl GitSourceDriver {
         let plan = CapturePlan::decode(prepared)?;
         let recovered = (|| {
             let repo = self.binding_repository(&plan.binding)?;
+            PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)?;
             let captured = retained_commit(
                 &repo,
                 &retention_ref(&plan.checkpoint_id, &plan.binding.name),
@@ -1108,6 +1112,7 @@ impl GitSourceDriver {
     ) -> Result<()> {
         let plan = CapturePlan::decode(prepared)?;
         let repo = self.binding_repository(&plan.binding)?;
+        PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)?;
         if plan.observation.is_some() {
             plan.check_observation(&Snapshot::read(&repo, false)?)?;
         } else if legacy_clean_head(&repo)? != plan.base {
@@ -1120,16 +1125,18 @@ impl GitSourceDriver {
     /// complete source fence and independent host cleanup authority. A
     /// retained ref must match the original descriptor, never an inferred
     /// current HEAD. Absent retention is a valid cleanup observation, not
-    /// proof that capture never ran. Leave uncertain scratch custody intact.
+    /// proof that capture never ran. Reconcile only proven private index custody.
     pub fn release_prepared_capture(&self, prepared: &PreparedSourceOperation) -> Result<()> {
         let plan = CapturePlan::decode(prepared)?;
         let repo = self.binding_repository(&plan.binding)?;
-        PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)?;
         let reference = retention_ref(&plan.checkpoint_id, &plan.binding.name);
-        if let Some(captured) = retained_for_release(&repo, &reference)? {
-            let anchor = plan.anchor(captured);
-            verify_prepared_anchor(&repo, &plan, prepared, &anchor)?;
-            release_exact_retention(&repo, &anchor)?;
+        let anchor = retained_for_release(&repo, &reference)?.map(|captured| plan.anchor(captured));
+        if let Some(anchor) = &anchor {
+            verify_prepared_anchor(&repo, &plan, prepared, anchor)?;
+        }
+        PrivateIndexes::reconcile(&repo, &prepared.descriptor.prepared_identity)?;
+        if let Some(anchor) = &anchor {
+            release_exact_retention(&repo, anchor)?;
         }
         PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)
     }

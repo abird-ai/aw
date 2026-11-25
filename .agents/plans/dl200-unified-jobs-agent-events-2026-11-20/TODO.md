@@ -975,12 +975,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       strict affected Clippy, workspace check and scoped fmt/diff passed.
       No new persistence, Process owner or admission.
       Production containment and interactive/Vault automatic settlement remain open.
+      **Marked Git private-index scratch reconciliation landed:** original Prepared
+      operation, shared capture/restore private-index primitive, synced bounded
+      sibling ownership marker before index writes; exact protected parent/directory
+      identity. Successful execution requires explicit known cleanup. Failed subprocess
+      preserves scratch for original abandonment; no recursive Drop deletion. Read-only
+      inspection/revalidation require absence. Authorized recovery removes only known
+      regular index/lock files and exact directory before marker retirement. Same-mode
+      replacement, unexpected entries, unmarked/malformed evidence or surviving writers
+      remain unresolved. Grouped real Git tests inject failure after index write and
+      checkout, preserve original checkout/index and settle exact scratch. No schema,
+      descriptor or dependency change. Final Git repository **32/32**, Git library/doc
+      tests, Host **16/16**, strict affected Clippy, workspace check and scoped fmt/diff
+      passed. Independent physical namespace authority required; legacy/pre-marker
+      gaps and partial checkout cleanup still open.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production approval provisioning, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, multi-source policy, other baseline effects,
-      remaining partial/scratch cleanup, physical authority/production cleanup,
+      unmarked/ambiguous scratch and partial checkout cleanup, physical authority/production cleanup,
       final-source removal/effectful mutation, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v59.

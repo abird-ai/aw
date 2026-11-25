@@ -28,6 +28,8 @@ pub use capture::{GitCheckpointCaptureHost, GitSourceFence};
 /// aliases and other Stores), and the permitted restore or cleanup effect until
 /// this guard drops. Retirement additionally requires authority over the entire
 /// retained execution layout, including any external physical dependencies.
+/// Scratch recovery requires the original reserved Git artifact namespace to
+/// have remained protected, with no surviving writer or unaccounted alias.
 /// Locations are immutable, in canonical source-name order.
 /// Neither a path pin, Git worktree lock nor a saved evidence handle suffices.
 /// Acquisition before Prepared must be read-only, not a materializing effect.

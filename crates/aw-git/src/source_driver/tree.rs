@@ -597,29 +597,123 @@ fn gitlink(
     }
 }
 
-pub(super) struct PrivateIndexes {
+// Private physical artifact custody only. The original Prepared operation
+// still owns recovery; the marker is not permission, completion or a second
+// operation receipt. The host must exclude other Git/admin writers, including
+// surviving Git workers, before inspection or cleanup. Restart recovery
+// requires the reserved artifact namespace to have remained protected;
+// directory IDs are not cryptographic proof against hostile same-UID writers.
+#[derive(PartialEq, Eq)]
+struct IndexOwner {
+    prepared: String,
+    parent: (u64, u64),
+    directory: (u64, u64),
+}
+
+impl IndexOwner {
+    const MAX_BYTES: u64 = 256;
+
+    fn encode(&self) -> String {
+        format!(
+            "aw-git-index-v1\n{}\n{} {}\n{} {}\n",
+            self.prepared, self.parent.0, self.parent.1, self.directory.0, self.directory.1
+        )
+    }
+
+    fn read(path: &Path) -> Result<Self> {
+        use std::io::Read;
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || aw_platform::path_is_link_like(path)? {
+            return Err(Error::Conflict(
+                "invalid Git private index ownership marker",
+            ));
+        }
+        let mut bytes = Vec::new();
+        aw_platform::open_private_existing(path, false)?
+            .take(Self::MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > Self::MAX_BYTES {
+            return Err(Error::Conflict(
+                "oversized Git private index ownership marker",
+            ));
+        }
+        let invalid = || Error::Conflict("invalid Git private index ownership marker");
+        let raw = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        let mut fields = raw.split_ascii_whitespace();
+        if fields.next() != Some("aw-git-index-v1") {
+            return Err(invalid());
+        }
+        let prepared = fields
+            .next()
+            .filter(|id| super::is_digest(id))
+            .ok_or_else(invalid)?
+            .to_owned();
+        let mut number = || {
+            fields
+                .next()
+                .and_then(|field| field.parse::<u64>().ok())
+                .ok_or_else(invalid)
+        };
+        let owner = Self {
+            prepared,
+            parent: (number()?, number()?),
+            directory: (number()?, number()?),
+        };
+        if owner.encode() != raw {
+            return Err(invalid());
+        }
+        Ok(owner)
+    }
+}
+
+fn path_absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) struct PrivateIndexes<'a> {
+    repo: &'a Repository,
+    prepared: &'a str,
     path: PathBuf,
     identity: aw_platform::DirectoryIdentity,
 }
-impl PrivateIndexes {
-    fn path(repo: &Repository, prepared_identity: &str) -> PathBuf {
-        repo.git_dir.join(format!("aw-capture-{prepared_identity}"))
+
+impl<'a> PrivateIndexes<'a> {
+    fn paths(repo: &Repository, prepared: &str) -> (PathBuf, PathBuf) {
+        let name = format!("aw-capture-{prepared}");
+        (
+            repo.git_dir.join(&name),
+            repo.git_dir.join(format!("{name}.owner")),
+        )
     }
 
-    // An interrupted scratch directory has no independently retained
-    // physical identity. Never delete it merely from its derived name.
-    pub(super) fn require_absent(repo: &Repository, prepared_identity: &str) -> Result<()> {
-        match fs::symlink_metadata(Self::path(repo, prepared_identity)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-            Ok(_) => Err(Error::Conflict(
+    pub(super) fn require_absent(repo: &Repository, prepared: &str) -> Result<()> {
+        let (path, marker) = Self::paths(repo, prepared);
+        if path_absent(&path)? && path_absent(&marker)? {
+            Ok(())
+        } else {
+            Err(Error::Conflict(
                 "original Git private indexes require reconciliation",
-            )),
+            ))
         }
     }
 
-    pub(super) fn create(repo: &Repository, prepared_identity: &str) -> Result<Self> {
-        let path = Self::path(repo, prepared_identity);
+    fn parent(repo: &Repository) -> Result<&aw_platform::DirectoryIdentity> {
+        repo.validate_directories().map_err(git_error)?;
+        Ok(&repo
+            .identity
+            .as_ref()
+            .ok_or(Error::Storage("Git directory identity unavailable"))?
+            .git_dir)
+    }
+
+    pub(super) fn create(repo: &'a Repository, prepared: &'a str) -> Result<Self> {
+        Self::require_absent(repo, prepared)?;
+        let parent = Self::parent(repo)?;
+        let (path, marker) = Self::paths(repo, prepared);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -628,16 +722,126 @@ impl PrivateIndexes {
         #[cfg(not(unix))]
         fs::create_dir(&path)?;
         let identity = aw_platform::DirectoryIdentity::open(&path)?;
-        Ok(Self { path, identity })
+        if aw_platform::secure_private_files_supported() {
+            use std::io::Write;
+            aw_platform::validate_private_dir(&path)?;
+            let owner = IndexOwner {
+                prepared: prepared.into(),
+                parent: parent.identity()?,
+                directory: identity.identity()?,
+            };
+            // Create only; publish and sync physical identity before the
+            // first Git index write. A crash before this leaves Unknown.
+            let mut file = aw_platform::open_private_new(&marker)?;
+            file.write_all(owner.encode().as_bytes())?;
+            file.sync_all()?;
+            aw_platform::sync_parent(&marker)?;
+        }
+        Ok(Self {
+            repo,
+            prepared,
+            path,
+            identity,
+        })
     }
+
     pub(super) fn index(&self, pass: usize) -> PathBuf {
         self.path.join(format!("index-{pass}"))
     }
-}
-impl Drop for PrivateIndexes {
-    fn drop(&mut self) {
-        if self.identity.is_current(&self.path).unwrap_or(false) {
-            let _ = fs::remove_dir_all(&self.path);
+
+    /// No recursive delete or traversal into unknown entries. Check the
+    /// complete small namespace before removing any of its known files.
+    fn remove_indexes(path: &Path, identity: &aw_platform::DirectoryIdentity) -> Result<()> {
+        if !identity.is_current(path)? {
+            return Err(Error::Conflict("Git private index directory changed"));
+        }
+        #[cfg(unix)]
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(path)?.uid()
+        };
+        let mut entries = Vec::with_capacity(4);
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !["index-1", "index-2", "index-1.lock", "index-2.lock"]
+                .iter()
+                .any(|expected| name == *expected)
+                || !entry.file_type()?.is_file()
+                || aw_platform::path_is_link_like(&entry.path())?
+            {
+                return Err(Error::Conflict("unexpected Git private index entry"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = entry.metadata()?;
+                if meta.nlink() != 1 || meta.uid() != uid {
+                    return Err(Error::Conflict(
+                        "Git private index is not exclusively owned",
+                    ));
+                }
+            }
+            entries.push(entry.path());
+        }
+        for entry in entries {
+            fs::remove_file(entry)?;
+        }
+        fs::remove_dir(path)?;
+        Ok(())
+    }
+
+    /// Exact cleanup for a durable Prepared operation. Missing markers,
+    /// mismatched physical identity and unexpected content stay Unknown.
+    /// A sibling marker survives removal of its directory, so a crash
+    /// between the two removals is recoverable without inventing identity.
+    pub(super) fn reconcile(repo: &Repository, prepared: &str) -> Result<()> {
+        let parent = Self::parent(repo)?;
+        let (path, marker) = Self::paths(repo, prepared);
+        if path_absent(&marker)? {
+            return Self::require_absent(repo, prepared);
+        }
+        let owner = IndexOwner::read(&marker)?;
+        if owner.prepared != prepared || owner.parent != parent.identity()? {
+            return Err(Error::Conflict("Git private index ownership changed"));
+        }
+        if !path_absent(&path)? {
+            aw_platform::validate_private_dir(&path)?;
+            let identity = aw_platform::DirectoryIdentity::open(&path)?;
+            if owner.directory != identity.identity()? {
+                return Err(Error::Conflict(
+                    "Git private index directory identity changed",
+                ));
+            }
+            Self::remove_indexes(&path, &identity)?;
+        }
+        // Persist directory removal before retiring its only durable pin.
+        aw_platform::sync_parent(&path)?;
+        repo.validate_directories().map_err(git_error)?;
+        if !path_absent(&path)? || IndexOwner::read(&marker)? != owner {
+            return Err(Error::Conflict(
+                "Git private index cleanup boundary changed",
+            ));
+        }
+        fs::remove_file(&marker)?;
+        aw_platform::sync_parent(&marker)?;
+        Self::require_absent(repo, prepared)
+    }
+
+    /// Success requires known cleanup. Errors leave artifacts for explicit
+    /// recovery; Drop cannot infer that a failed Git subprocess is quiescent.
+    pub(super) fn finish(self) -> Result<()> {
+        Self::parent(self.repo)?;
+        if !self.identity.is_current(&self.path)? {
+            return Err(Error::Conflict("Git private index directory changed"));
+        }
+        if aw_platform::secure_private_files_supported() {
+            Self::reconcile(self.repo, self.prepared)
+        } else {
+            // No restart-time deletion authority on platforms without
+            // verified private custody. The live pin suffices for success.
+            Self::remove_indexes(&self.path, &self.identity)?;
+            Self::require_absent(self.repo, self.prepared)
         }
     }
 }

@@ -14,8 +14,10 @@ use aw_store::{
 /// The independent live authority owner guarantees exact source disclosure,
 /// checkout quiescence, Git administration and retention (including external
 /// aliases, other Stores and live dependencies) for the authorized effect
-/// through settlement. Locations are immutable in canonical source-name order.
-/// Neither the Store barrier nor a directory pin provides this guarantee.
+/// through settlement. Scratch recovery also requires the original reserved
+/// Git artifact namespace to have remained protected, with no surviving
+/// writer or unaccounted alias. Locations are immutable in canonical source-name
+/// order. Neither the Store barrier nor a directory pin provides this guarantee.
 pub trait GitSourceFence {
     fn locations(&self) -> &[GitSourceLocation];
 }

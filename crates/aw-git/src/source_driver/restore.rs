@@ -500,6 +500,7 @@ fn materialize(
         .map(OsString::from);
         run_os(repo, &args, None, Some(&captured_index))?;
         checkout(&captured_index)?;
+        private.finish()?;
     } else {
         checkout(&index)?;
     }
@@ -513,6 +514,7 @@ fn inspect_binding(
     prepared: &PreparedSourceOperation,
     trees: &RestoreTrees,
 ) -> Result<SourceBinding> {
+    PrivateIndexes::require_absent(repo, &prepared.descriptor.prepared_identity)?;
     verify_restored(repo, &trees.base, trees.captured())?;
     let binding = plan.binding(repo)?;
     // Keep the observed checkout identity, rather than rediscovering a path
@@ -734,6 +736,7 @@ impl GitSourceDriver {
         }
 
         let child = restored_repo(&origin, &plan, prepared)?;
+        PrivateIndexes::require_absent(&child, &prepared.descriptor.prepared_identity)?;
         if plan.binding(&child)? != *binding {
             return Err(Error::Conflict("Git retirement checkout identity changed"));
         }
@@ -759,7 +762,7 @@ impl GitSourceDriver {
         }
         let child = restored_repo(&origin, &plan, prepared)?;
         child.guard_managed_checkout().map_err(git_error)?;
-        PrivateIndexes::require_absent(&child, &prepared.descriptor.prepared_identity)?;
+        PrivateIndexes::reconcile(&child, &prepared.descriptor.prepared_identity)?;
         let untouched = match fs::symlink_metadata(child.git_dir.join("index")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut untouched = true;

@@ -52,7 +52,8 @@ retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
 staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
-and finite Process quiescence are implemented locally.
+and finite Process quiescence, plus marked Git private-index scratch reconciliation,
+are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2385,13 +2386,39 @@ Store failures remain recorded, not rerun. No schema, second Process/Job owner
 or source-bearing admission change. Runtime loss and failed
 proof commit still require reconciliation; production containment remains separate.
 
+Git capture and dirty restore now share explicit private-index scratch custody.
+The original Prepared descriptor still owns the operation. `PrivateIndexes` creates
+its private directory once and, on platforms with verified private files, syncs a
+small sibling ownership marker containing the prepared identity and exact parent/
+directory physical identities before Git writes any index. This is external artifact
+ownership evidence only, not a new operation ledger, grant or completion record.
+Successful execution explicitly removes the known scratch files and directory before
+publication/retention; failed subprocesses leave custody for authorized recovery, not
+recursive Drop cleanup. Read-only inspection and final revalidation require both
+scratch and marker absent. Abandonment of unpublished capture/restore verifies the
+original descriptor and exact repository, reconciles only the protected namespace's
+known regular single-link index/lock files, syncs removal before retiring the marker,
+and reuses the existing conditional ref or exact worktree cleanup. Replaced directory,
+foreign content, malformed/missing marker, unaccounted alias or still-live Git writer
+is not deletion authority. The independent host must guarantee the original namespace
+remained protected and exclude surviving writers; this is not cryptographic protection
+against hostile same-UID code. The pre-marker creation gap, legacy unmarked scratch,
+partial/changed checkout and unsupported private-file platforms remain conservative
+Unknown. No descriptor/schema or dependency change. Existing grouped real Git
+capture/restore regressions inject failure after an actual private-index write or
+checkout, verify refusal of same-mode replacement and foreign entries, preserve the
+real HEAD/index/files, and settle the exact marked scratch through original abandonment.
+Final Git repository **32/32**, Git library and doc tests, Host **16/16**, strict
+Git/Host all-target/all-feature Clippy, workspace all-target/all-feature check and
+scoped fmt/diff passed. Earlier broad Store failures remain recorded, not rerun.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
-reconciliation, multi-source policy, general unpublished partial/scratch cleanup and
-production cleanup composition/physical authority, final-source removal/effectful
+reconciliation, multi-source policy, unmarked/ambiguous scratch and partial checkout
+cleanup, production cleanup composition/physical authority, final-source removal/effectful
 mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v59.
