@@ -35,6 +35,32 @@ pub fn default_directory() -> Result<PathBuf> {
     Ok(base.join("abird/aw"))
 }
 
+/// Open the product's exclusive SQLite owner with its installed definitions.
+/// Only trusted host executable configuration is consulted; no repository
+/// discovery, materialization, grant issuance, or activation occurs here.
+pub fn open_sqlite_owner(directory: &Path) -> Result<SessionStore> {
+    #[cfg(feature = "workspace")]
+    {
+        let git = std::env::var_os("AW_GIT")
+            .map(PathBuf::from)
+            .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from));
+        open_sqlite_owner_with_git(directory, git.as_deref())
+    }
+    #[cfg(not(feature = "workspace"))]
+    {
+        SessionStore::open(directory)
+    }
+}
+
+#[cfg(feature = "workspace")]
+fn open_sqlite_owner_with_git(directory: &Path, git: Option<&Path>) -> Result<SessionStore> {
+    let registry = aw_agent_core::SourceDriverRegistry::new();
+    if let Some(executable) = git {
+        aw_git::source_driver::GitSourceDriver::new(executable)?.register(&registry)?;
+    }
+    SessionStore::open_with_sources(directory, registry, Default::default())
+}
+
 pub fn actor(_context: &ExecutionContext, web: bool) -> Result<PrincipalId> {
     if web {
         PrincipalId::new("browser:paired")
@@ -492,6 +518,130 @@ mod phase48_tests {
         ) -> aw_agent_core::CompletionFuture<'a> {
             Box::pin(async { Err(Error::Protocol("provider unused")) })
         }
+    }
+
+    #[cfg(all(unix, feature = "workspace"))]
+    #[test]
+    fn configured_owner_installs_git_before_revalidating_source_dependencies() {
+        use aw_agent_core::{CheckpointPolicy, DriverKey, SourceAccess, SourceName};
+        use aw_git::source_driver::GitSourceDriver;
+        use aw_store::{
+            AgentCreateContext, AgentCreateRequest, AgentSandboxSelection, SourceCompatibility,
+        };
+
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(temp_root("source-owner"));
+        let root = &temp.0;
+        let state = root.join("state");
+        let repo = root.join("repo");
+        let initial = root.join("initial");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&initial).unwrap();
+        let git = std::env::var_os("AW_GIT")
+            .map(PathBuf::from)
+            .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from))
+            .expect("real Git fixture requires AW_GIT or AW_DEFAULT_GIT");
+        let output = std::process::Command::new(&git)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--initial-branch=main"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let key = DriverKey::builtin("git").unwrap();
+        let actor = PrincipalId::new("internal:fixture:source-owner").unwrap();
+        assert!(open_sqlite_owner_with_git(&state, Some(Path::new("git"))).is_err());
+        assert!(
+            !state.exists(),
+            "invalid explicit executable must fail before owner open"
+        );
+
+        let store = open_sqlite_owner_with_git(&state, Some(&git)).unwrap();
+        let handle = store.source_driver_handle::<GitSourceDriver>(&key).unwrap();
+        let driver = store.source_driver(&handle).unwrap();
+        let (session, branch) = store
+            .create(&actor, "source-free", binding(&initial, "fixture"))
+            .unwrap();
+        let owner = store
+            .agent_binding(&actor, &session.id, &branch.id)
+            .unwrap();
+        let project = format!(
+            "/d:{}/i:{}/p:{}",
+            owner.domain_handle, owner.identity_handle, owner.project_handle
+        );
+        let source = driver
+            .binding(
+                &repo,
+                SourceName::new("code").unwrap(),
+                SourceAccess::ReadWrite,
+                CheckpointPolicy::Required,
+            )
+            .unwrap();
+        let layout = binding(&repo, "fixture");
+        let original = store
+            .sandbox_create_fresh_with_sources(&actor, &project, &layout, &[source])
+            .unwrap();
+        assert_eq!(
+            original.sources[0].compatibility,
+            SourceCompatibility::Compatible
+        );
+        drop(store);
+
+        // With no definition, metadata remains visible but degraded. Reinstalling
+        // only the definition restores schema compatibility, not materialization
+        // or execution authority. A missing checkout must not be probed on open.
+        fs::rename(&repo, root.join("offline-repo")).unwrap();
+        let store = open_sqlite_owner_with_git(&state, None).unwrap();
+        let mut degraded = original.clone();
+        degraded.sources[0].compatibility = SourceCompatibility::RecoveryRequired;
+        assert_eq!(
+            store.sandbox_get(&actor, &original.canonical_ref).unwrap(),
+            degraded
+        );
+        assert!(store.source_driver_handle::<GitSourceDriver>(&key).is_err());
+        drop(store);
+
+        let store = open_sqlite_owner_with_git(&state, Some(&git)).unwrap();
+        let handle = store.source_driver_handle::<GitSourceDriver>(&key).unwrap();
+        assert!(store.source_driver(&handle).is_ok());
+        assert!(store.source_driver_handle::<()>(&key).is_err());
+        assert_eq!(
+            store.sandbox_get(&actor, &original.canonical_ref).unwrap(),
+            original
+        );
+        assert!(!repo.exists());
+        fs::rename(root.join("offline-repo"), &repo).unwrap();
+        assert!(matches!(
+            store.agent_create(
+                &actor,
+                &AgentCreateContext {
+                    current_project_ref: project,
+                    current_agent_ref: None,
+                    binding: layout,
+                    auto_sandbox_ref: None,
+                    request_id: None,
+                    execution_site: "local".into(),
+                },
+                AgentCreateRequest {
+                    sandbox: AgentSandboxSelection::Existing(original.canonical_ref),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Denied(
+                "source-bearing Agent Sandbox realization is unavailable"
+            ))
+        ));
+        assert!(store.activate(&actor, &session.id, &branch.id).is_ok());
     }
 
     #[test]

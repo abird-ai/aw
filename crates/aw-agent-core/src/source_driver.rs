@@ -962,6 +962,28 @@ impl SourceDriverRegistryReader {
         Ok(self.reader.snapshot()?.generation)
     }
 
+    /// Resolve a currently installed native definition by its stable key and
+    /// concrete type. The returned handle pins this registration, not authority.
+    pub fn handle<T: Send + Sync + 'static>(
+        &self,
+        driver: &DriverKey,
+    ) -> Result<SourceDriverHandle<T>> {
+        driver.validate()?;
+        let snapshot = self.reader.snapshot()?;
+        let entry = snapshot
+            .value
+            .entries
+            .get(driver)
+            .ok_or(Error::Denied("required SourceDriver is unavailable"))?;
+        entry.implementation.get::<T>()?;
+        Ok(SourceDriverHandle {
+            driver: driver.clone(),
+            schemas: entry.descriptor.schemas,
+            registration_revision: entry.descriptor.registration_revision,
+            implementation: std::marker::PhantomData,
+        })
+    }
+
     pub fn get<T: Send + Sync + 'static>(&self, handle: &SourceDriverHandle<T>) -> Result<Arc<T>> {
         let snapshot = self.reader.snapshot()?;
         let entry = snapshot
@@ -1046,6 +1068,13 @@ mod tests {
             .register(driver.clone(), v1_schemas(), GitV1("first"))
             .unwrap();
         let reader = registry.reader().unwrap();
+        let installed = reader.handle::<GitV1>(&driver).unwrap();
+        assert_eq!(installed.descriptor(), first.descriptor());
+        assert!(Arc::ptr_eq(
+            &reader.get(&installed).unwrap(),
+            &reader.get(&first).unwrap(),
+        ));
+        assert!(reader.handle::<GitV2>(&driver).is_err());
         assert_eq!(reader.get(&first).unwrap().as_ref(), &GitV1("first"));
 
         let recovery = RecoveryDescriptor::new(

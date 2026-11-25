@@ -983,6 +983,15 @@ impl SessionStore {
         self.inner.source_limit
     }
 
+    /// Resolve the installed definition in this Store's actual registry.
+    /// Neither the stable key nor the resulting handle grants source access.
+    pub fn source_driver_handle<T: Send + Sync + 'static>(
+        &self,
+        driver: &aw_agent_core::DriverKey,
+    ) -> Result<aw_agent_core::SourceDriverHandle<T>> {
+        self.inner.source_drivers.reader()?.handle(driver)
+    }
+
     /// Trusted host lookup in this Store's actual registered driver leaf.
     /// Resolving an implementation is not source/disclosure authority.
     pub fn source_driver<T: Send + Sync + 'static>(

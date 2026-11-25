@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: trusted local shell/finite Job/Graph containment (this local checkpoint; documentation parent `cf0b131e3f6e7beb681060f4cbdaf430ff0df2b1`, prior signed implementation `2b4fac33d8345f284ecfd3e0585f332c72037dc6`). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: production Git SourceDriver owner-open registration (this local checkpoint; signed parent `def7bba2549567dce1c06877fd1d59857f7ea213`, trusted local shell containment). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1250,6 +1250,19 @@ Current implementation: trusted local shell/finite Job/Graph containment (this l
       warnings). Shared checkout includes concurrent dependency work; exact
       owned tree only for signing. Windows/Bubblewrap and broad Store/workspace
       runtime not requalified. Original journal owners still occupied.
+      **Production Git SourceDriver owner-open registration landed:** existing
+      typed leaf installed before startup compatibility on eager/lazy main,
+      OAuth, scheduled and realm-checked team owners. Trusted executable
+      selection only; missing driver degrades, invalid explicit executable
+      refuses before Store open. Typed installed handle resolution reuses the
+      original leaf. No source probe/grant/activation, new registry or schema.
+      Real Git/SQLite restart, registry and Store migration regressions **1/1**
+      each; strict AgentCore/Store Clippy, full/durable-only/minimal product
+      checks and scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix shell not
+      qualified, existing durable/minimal dead-code warnings). Resource CLI
+      owner remains occupied, so its separate open paths still need composition.
+      Original source-bearing admission stays held; no automatic recovery or
+      physical authority from the installed definition.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

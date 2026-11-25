@@ -1984,7 +1984,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             || args.workspace.is_some()
             || args.domain.is_some())
     {
-        Some(SessionStore::open(
+        Some(sessions::open_sqlite_owner(
             directory
                 .as_deref()
                 .ok_or(Error::Denied("state disabled"))?,
@@ -2178,7 +2178,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     // shared config mutation lock before authorization begins.
                     let host_id = ensure_chatgpt_host_id(args.config.as_deref(), &mut file_config)?;
                     if let Some(update) = chatgpt_plan_profile_update(
-                        SessionStore::open(directory.as_deref().ok_or(Error::Denied(
+                        sessions::open_sqlite_owner(directory.as_deref().ok_or(Error::Denied(
                             "Sign in with ChatGPT requires durable local state for SecretStore custody",
                         ))?)?,
                         &actor,
@@ -3143,7 +3143,7 @@ fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
         .map_err(|_| Error::Storage("system clock precedes Unix epoch"))?
         .as_micros()
         .min(i64::MAX as u128) as i64;
-    let store = SessionStore::open(&state)?;
+    let store = sessions::open_sqlite_owner(&state)?;
     let client = store.local_process_info()?.process_id;
     let Some(claim) = store.schedule_claim_due(&actor, &client, at)? else {
         print_json(&serde_json::json!({"due":false}))?;
@@ -3160,7 +3160,7 @@ fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
     drop(store);
 
     let result = run_agent(args.into_run(run_id));
-    let settle = SessionStore::open(&state)
+    let settle = sessions::open_sqlite_owner(&state)
         .and_then(|store| store.schedule_settle_occurrence(&actor, &occurrence_id));
     match result {
         Ok(code) => {
@@ -4825,7 +4825,7 @@ impl Host {
             .state_dir
             .as_deref()
             .ok_or(Error::Denied("state disabled"))?;
-        let store = SessionStore::open(path)?;
+        let store = sessions::open_sqlite_owner(path)?;
         self.sqlite_store = Some(store.clone());
         Ok(store)
     }

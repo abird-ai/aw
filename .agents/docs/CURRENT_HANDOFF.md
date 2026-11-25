@@ -18,7 +18,55 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: trusted local shell containment
+## Latest local implementation delta — 2026-11-25: install production Git SourceDriver at owner open
+
+Parent: `def7bba2549567dce1c06877fd1d59857f7ea213` (trusted local shell
+containment). Verified the previous signed checkpoint and clean owned paths.
+The interrupted provisioning turn had made no source changes. The original
+Agent/Turn journal paths and `src/resources_cli.rs` remain concurrently owned;
+this cut does not modify them or enable source-bearing Agent admission.
+
+- `sessions::open_sqlite_owner` registers the real built-in Git driver in the
+  existing SourceDriver leaf before the exclusive Store's compatibility pass.
+  Workspace-enabled builds use the trusted `AW_GIT` / build-time
+  `AW_DEFAULT_GIT` executable selection, never ambient PATH lookup. Missing
+  selection means an empty registry and ordinary degraded diagnostics; an
+  explicitly selected invalid executable errors before opening the Store.
+  No Git invocation, source discovery, layout approval, grant or activation
+  occurs at startup. No new registry, configuration schema or execution path.
+- Eager/lazy main product owner open, OAuth, scheduled execution and settlement,
+  and the existing realm-checked team owner open share this composition.
+  `SessionStore::open_with_sources` remains the original reusable Store entry.
+  Durable-only and minimal/stateless feature boundaries stay independent of
+  Git source effects. Trusted-local direct mode remains unchanged.
+- `SourceDriverRegistryReader::handle<T>` and `SessionStore::source_driver_handle`
+  resolve a current native definition from the actual installed leaf by stable
+  key and concrete type. They reuse existing schema/registration identity and
+  `get`, not a parallel catalog or a source authorization token.
+- One real Git + SQLite restart regression exercises invalid configured path
+  refusal, source-free creation, live Sandbox source metadata, unavailable
+  driver degradation, compatible reinstallation even while the checkout is
+  absent, type mismatch refusal, held source-bearing construction and ordinary
+  source-free activation. Startup schema compatibility remains distinct from
+  physical identity, live policy and external-effect authority.
+
+Validation on L5 (installed Rust 1.95.0, not the unavailable pinned Nix
+1.98.1 environment): product startup regression **1/1**, typed registry **1/1**,
+existing durable SourceBinding migration/restart **1/1**, strict AgentCore/Store
+all-target/all-feature Clippy, full product all-target/all-feature check,
+durable-only library and minimal all-target checks, scoped fmt/diff all passed.
+Durable-only has one existing dead-code warning; minimal has two. Builds include
+concurrently owned dependencies in the shared checkout; the signed tree contains
+only exact owned changes. Broad unchanged suites and platform-native
+qualification not rerun. Store v60, Git recovery v4; no publication.
+
+Next: coordinate the resource CLI owner to adopt the same startup composition;
+original live source-aware Actor/Turn admission remains the priority when the
+journal owners become available. Otherwise select an independent actual physical
+authority/provisioning consumer. Installed Git is not authority to inspect an
+arbitrary persisted source or automatically recover an external effect.
+
+## Previous local implementation delta — 2026-11-25: trusted local shell containment
 
 This checkpoint follows the signed comprehensive documentation parent
 `cf0b131e3f6e7beb681060f4cbdaf430ff0df2b1` (implementation predecessor

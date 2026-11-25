@@ -324,7 +324,7 @@ fn open_store(cfg: &TeamConfig) -> Result<SessionStore> {
             return Err(Error::Denied("state directory belongs to another realm"));
         }
     }
-    let store = SessionStore::open(&cfg.state_dir)?;
+    let store = aw::sessions::open_sqlite_owner(&cfg.state_dir)?;
     if stamp_path.exists() {
         let stamp: RealmStamp = serde_json::from_slice(&private::read(&stamp_path, 1024)?)
             .map_err(|_| Error::Denied("invalid realm stamp"))?;
