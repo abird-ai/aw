@@ -98,6 +98,86 @@ impl Drop for Fixture {
 }
 #[cfg(feature = "source-driver")]
 #[test]
+fn prepared_git_derive_reconciles_capture_only_without_retry() {
+    use aw_agent_core::{
+        CheckpointPolicy, RecoveryInspection, SourceAccess, SourceName, SourceOperationKind,
+    };
+    use aw_git::source_driver::{GitRestoreLocation, GitSourceDriver};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let f = Fixture::new();
+    let driver = GitSourceDriver::new(&f.git).unwrap();
+    let binding = driver
+        .binding(
+            &f.root,
+            SourceName::new("code").unwrap(),
+            SourceAccess::ReadWrite,
+            CheckpointPolicy::Required,
+        )
+        .unwrap();
+    f.write("a.txt", b"dirty parent");
+    let destination = f.parent.join("derived");
+    aw_platform::ensure_private_dir(&destination).unwrap();
+    let identity = |p: &std::path::Path| {
+        let meta = std::fs::metadata(p).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let location = GitRestoreLocation {
+        name: binding.name.clone(),
+        repository: f.root.clone(),
+        repository_identity: identity(&f.root),
+        target: destination.join("code"),
+        parent_identity: identity(&destination),
+    };
+    let prepared = driver
+        .plan_derive_approved(&location, &binding, "sbx_capture_only")
+        .unwrap();
+    assert_eq!(prepared.operation, SourceOperationKind::Derive);
+    assert_eq!(prepared.descriptor.recovery_schema, 4);
+    assert!(matches!(
+        driver.inspect_derive(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    let retention = "refs/aw/checkpoints/sbx_capture_only/code";
+    assert!(f.run(&["for-each-ref", retention]).stdout.is_empty());
+
+    // Refuse only worktree creation, after the actual capture succeeds.
+    // No artificial record or synthetic anchor supplied by the test.
+    let shell = std::env::var_os("AW_BASH")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let wrapper = f.parent.join("interrupt-derive");
+    let executable = format!("'{}'", f.git.to_str().unwrap().replace('\'', "'\\''"));
+    std::fs::write(&wrapper, format!(
+        "#!{}\nprevious=\nfor arg do\n  if [ \"$previous\" = worktree ] && [ \"$arg\" = add ]; then exit 71; fi\n  previous=$arg\ndone\nexec {} \"$@\"\n",
+        shell.display(), executable,
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let interrupted = GitSourceDriver::new(wrapper).unwrap();
+    assert!(interrupted.execute_derive(&prepared).is_err());
+    assert!(!f.run(&["for-each-ref", retention]).stdout.is_empty());
+    assert!(!location.target.exists());
+    assert!(matches!(
+        driver.inspect_derive(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(driver.execute_derive(&prepared).is_err());
+    std::fs::create_dir(&location.target).unwrap();
+    assert!(driver.release_prepared_derive(&prepared).is_err());
+    assert!(!f.run(&["for-each-ref", retention]).stdout.is_empty());
+    std::fs::remove_dir(&location.target).unwrap();
+    driver.release_prepared_derive(&prepared).unwrap();
+    driver.release_prepared_derive(&prepared).unwrap();
+    assert!(f.run(&["for-each-ref", retention]).stdout.is_empty());
+    assert_eq!(
+        std::fs::read(f.root.join("a.txt")).unwrap(),
+        b"dirty parent"
+    );
+    assert!(!location.target.exists());
+}
+
+#[cfg(feature = "source-driver")]
+#[test]
 fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     use aw_agent_core::{
         CheckpointPolicy, DriverKey, Error as SourceError, ExternalEvidence,

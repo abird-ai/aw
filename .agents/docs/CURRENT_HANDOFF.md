@@ -56,8 +56,9 @@ and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
 source detachment, independently approved multi-source native filesystem
 realization, durable native artifact custody/recovery and exact Store-backed Git
-native approval provisioning, shared finite Vault Process settlement, and v60
-Project-scoped standalone versioned Sandbox construction are implemented locally.
+native approval provisioning, shared finite Vault Process settlement, v60
+Project-scoped standalone versioned Sandbox construction, and same-Project
+required-source Sandbox derivation are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2636,6 +2637,47 @@ strict Store/Host all-target/all-feature Clippy (after redundant-borrow cleanup)
 workspace all-target/all-feature check and scoped fmt/diff passed. This is the retained-version
 fresh Project baseline case, not mutable parent derivation, unversioned baseline
 capture, effectful replace/remove, public RPC or source-bearing execution admission.
+
+Same-Project mutable parent Sandbox derivation now uses the same v60 Project
+construction receipt, source barrier, inspection validation, publish and abandon
+owners. `SandboxCreateFrom::{Baseline,Parent}` and borrowed `SandboxCreateSources`
+select the exact retained anchors or original versioned parent bindings; existing
+baseline JSON/fingerprint remains compatible. Parent lineage and exact open parent
+revision, complete nonempty required binding set, Project writer, legacy layout
+quiescence, fresh destination and compatibility are checked before planning, at
+claim and publication. Derive requests include the exact parent in their replay
+fingerprint. No public checkpoint, Agent, Session, extra receipt stage or ledger.
+Core `SourceOperationKind::Derive` and Git recovery schema 4 preserve old schemas
+1–3. One Git descriptor fixes the original capture observation/identity and exact
+reserved destination before either effect. Driver reuses private-index capture,
+verifies retained deterministic snapshot, and composes existing RestorePlan
+materialization using the outer descriptor's stable worktree marker. No new plan
+or capture on inspection/recovery; capture-only or partial child is Unknown.
+Abandon/retire removes only the original child first, then its exact private
+capture retention. When retention is already absent, require target and original
+marked registration absent before release; no prune or guessed cleanup. Parent
+HEAD/index/content remain unchanged; live independent whole-set physical and
+provider authority remains mandatory, including backing custody. Parent logical
+close is allowed once quiescent, but retained children (including closed awaiting
+cleanup) block physical parent retirement and structural binding edits. Derived
+binding edits are held until effectful structural custody exists. Publication
+retains exact parent lineage and original Applied provenance; retirement uses
+same registered driver and existing closed-Sandbox owner. First realization
+supports nonempty all-required same-SourceRef isolated Git parent sources; mixed
+or ephemeral/source-free parents and alternative new-backing source identities
+remain held rather than guessing a baseline policy. Native COW drivers may reuse
+the core operation and Store contract with explicit compatible semantics. No DB
+schema change. Focused real Git capture-only failure regression refuses retry,
+protects foreign target and releases exact original retention after proven absence.
+Expanded existing Host lifecycle derives from dirty linked parent, tests partial-set
+abandonment, failed publication/restart/resume/replay, no public checkpoint or
+Session, unchanged parent HEAD/index, independently changing parent contents and
+retained child/parent retirement ordering. Final validation: core source contracts
+1/1, Git 33/33 (library and doc targets also passed), construction receipts 1/1,
+Sandbox owners 4/4, Checkpoint owners 4/4, Host 16/16; strict affected-crate
+Clippy, workspace all-target/all-feature check, scoped fmt and diff checks passed.
+The earlier broad Store result (239/244, five recorded legacy failures) was not
+rerun.
 
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.

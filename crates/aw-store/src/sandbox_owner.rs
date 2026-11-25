@@ -24,7 +24,9 @@ pub use effects::{
     SandboxToolRecovery, SandboxToolTerminalRef,
 };
 pub(crate) mod construction;
-pub use construction::{InspectedSandboxCreate, PreparedSandboxCreate};
+pub use construction::{
+    InspectedSandboxCreate, PreparedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
+};
 mod grants;
 pub use grants::{
     EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
@@ -410,12 +412,33 @@ pub(crate) fn publish_fresh_in(
     registry: &SourceDriverRegistry,
     limit: SourceSetLimit,
 ) -> Result<FreshSandbox> {
+    publish_constructed_in(
+        tx,
+        actor,
+        (canonical_ref, None),
+        binding,
+        sources,
+        registry,
+        limit,
+    )
+}
+
+fn publish_constructed_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    candidate: (&str, Option<&str>),
+    binding: &SessionBinding,
+    sources: &[SourceBinding],
+    registry: &SourceDriverRegistry,
+    limit: SourceSetLimit,
+) -> Result<FreshSandbox> {
+    let (canonical_ref, parent) = candidate;
     source_bindings::validate_set(limit, registry, sources)?;
     let key = parse_sandbox_ref(canonical_ref)?;
     authorize_project(tx, actor, &key.project, true)?;
     let layout = layout(binding)?;
     require_no_retained_layout_in(tx, &layout.tool_root, &layout.working_directory)?;
-    let reference = insert_sandbox(tx, &key.project, &key.sandbox, None, &layout, Some(actor))?;
+    let reference = insert_sandbox(tx, &key.project, &key.sandbox, parent, &layout, Some(actor))?;
     source_bindings::insert(tx, &reference, sources)?;
     Ok(FreshSandbox { reference })
 }

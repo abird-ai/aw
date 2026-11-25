@@ -29,6 +29,7 @@ const BINDING_SCHEMA: u32 = 1;
 const ANCHOR_SCHEMA: u32 = 2;
 const CAPTURE_RECOVERY_SCHEMA: u32 = 2;
 const RESTORE_RECOVERY_SCHEMA: u32 = 3;
+const DERIVE_RECOVERY_SCHEMA: u32 = 4;
 
 fn key() -> DriverKey {
     DriverKey {
@@ -861,7 +862,7 @@ impl GitSourceDriver {
             SourceDriverSchemas {
                 binding: schema(BINDING_SCHEMA),
                 anchor: schema(ANCHOR_SCHEMA),
-                recovery: schema(RESTORE_RECOVERY_SCHEMA),
+                recovery: schema(DERIVE_RECOVERY_SCHEMA),
             },
             self,
         )

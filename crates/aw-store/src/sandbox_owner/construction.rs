@@ -1,13 +1,16 @@
 //! Standalone fresh Sandbox construction using the original Prepared receipt
 //! and restore materialization contracts. No Agent/session is manufactured.
 use super::{
-    authorize_project, layout, parse_project_ref, parse_sandbox_ref, publish_fresh_in,
-    require_fresh_layout_in, snapshot_with_sources, SandboxSnapshot,
+    authorize_project, layout, parse_project_ref, parse_sandbox_ref, publish_constructed_in,
+    require_fresh_layout_in, require_layout_quiescent_in, snapshot_with_sources,
+    source_bindings::{self, VersionedSourceBinding},
+    SandboxLifecycle, SandboxSnapshot,
 };
 use crate::{
     construction_receipt::{
-        self, require_matching_sources, validate_inspected_bindings, ConstructionCandidate,
-        ConstructionOperation, ConstructionPreparation, PreparationState,
+        self, require_matching_sources, validate_inspected_bindings,
+        validate_materialized_bindings, ConstructionCandidate, ConstructionOperation,
+        ConstructionPreparation, PreparationState,
     },
     db, id, label,
     store_scope::StoreScope,
@@ -15,8 +18,9 @@ use crate::{
     SourceMutationBarrier, SourceMutationSet, StoreMode,
 };
 use aw_agent_core::{
-    ExternalEvidence, PreparedSourceSet, RecoveryInspection, SourceBinding,
-    SourceDriverRegistryReader, SourcePublicationFence, SourcePublicationProof, SourceSet,
+    CheckpointPolicy, DriverSchemaPin, ExternalEvidence, PreparedSourceSet, RecoveryInspection,
+    SourceBinding, SourceDriverRegistryReader, SourceOperationKind, SourcePublicationFence,
+    SourcePublicationProof, SourceSet, SourceSetLimit,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -30,10 +34,160 @@ pub(crate) struct SandboxCreateBoundary {
     layout_digest: String,
     // Independently retained immutable baseline versions. Not a copy of
     // another Sandbox's current mutable state or a public checkpoint.
-    pub(crate) baseline: SourceSet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline: Option<SourceSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<ParentDerivation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentDerivation {
+    reference: String,
+    rev: u64,
+    bindings: Vec<VersionedSourceBinding>,
+}
+
+/// Trusted selection. The mutable parent's exact bindings are observed
+/// by the Sandbox owner, not supplied by the caller.
+pub enum SandboxCreateFrom<'a> {
+    Baseline(SourceSet),
+    Parent(&'a str),
+}
+
+#[derive(Clone, Copy)]
+pub enum SandboxCreateSources<'a> {
+    Baseline(&'a SourceSet),
+    Parent(&'a [VersionedSourceBinding]),
+}
+
+impl SandboxCreateSources<'_> {
+    fn mutation_set(self) -> Result<SourceMutationSet> {
+        match self {
+            Self::Baseline(set) => SourceMutationSet::from_anchors(&set.anchors),
+            Self::Parent(bindings) => {
+                SourceMutationSet::from_binding_refs(bindings.iter().map(|source| &source.binding))
+            }
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Baseline(set) => set.anchors.len(),
+            Self::Parent(bindings) => bindings.len(),
+        }
+    }
+
+    fn pin(self, index: usize) -> Result<DriverSchemaPin> {
+        match self {
+            Self::Baseline(set) => set.anchors[index].pin(),
+            Self::Parent(bindings) => bindings[index].binding.pin(),
+        }
+    }
+
+    fn validate_inspection(
+        self,
+        registry: &SourceDriverRegistryReader,
+        results: Vec<RecoveryInspection<SourceBinding>>,
+    ) -> Result<(Vec<SourceBinding>, Vec<ExternalEvidence>)> {
+        match self {
+            Self::Baseline(anchors) => validate_inspected_bindings(registry, anchors, results),
+            Self::Parent(sources) => validate_materialized_bindings(
+                registry,
+                sources.len(),
+                results,
+                |index, binding| {
+                    let original = &sources[index].binding;
+                    if binding.name != original.name
+                        || binding.driver != original.driver
+                        || binding.source_ref != original.source_ref
+                        || binding.access != original.access
+                        || binding.checkpoint_policy != original.checkpoint_policy
+                        || binding.materialization == original.materialization
+                    {
+                        return Err(Error::Conflict(
+                            "derived binding differs from isolated parent source",
+                        ));
+                    }
+                    Ok(())
+                },
+            ),
+        }
+    }
+}
+
+fn observe_parent(
+    c: &Connection,
+    project: &str,
+    reference: &str,
+    registry: &SourceDriverRegistryReader,
+    limit: SourceSetLimit,
+) -> Result<ParentDerivation> {
+    let key = parse_sandbox_ref(reference)?;
+    if key.project.canonical() != project || key.canonical() != reference {
+        return Err(Error::Denied(
+            "Sandbox derivation requires exact same Project",
+        ));
+    }
+    let parent = snapshot_with_sources(c, reference)?;
+    if parent.lifecycle != SandboxLifecycle::Open {
+        return Err(Error::Conflict("Sandbox derivation requires open parent"));
+    }
+    require_layout_quiescent_in(c, reference, &crate::tool_root_key(&parent.tool_root)?)?;
+    if parent.working_directory != parent.tool_root {
+        require_layout_quiescent_in(
+            c,
+            reference,
+            &crate::tool_root_key(&parent.working_directory)?,
+        )?;
+    }
+    let bindings = source_bindings::select_in(c, reference, None, limit, registry)?;
+    // Do not silently omit/recreate ephemeral bindings without destination policy.
+    if bindings.is_empty() || bindings.len() != parent.sources.len() {
+        return Err(Error::Denied(
+            "effectful derivation requires nonempty all-required parent sources",
+        ));
+    }
+    Ok(ParentDerivation {
+        reference: reference.to_owned(),
+        rev: parent.rev,
+        bindings,
+    })
 }
 
 impl SandboxCreateBoundary {
+    fn input(&self) -> SandboxCreateSources<'_> {
+        match (&self.baseline, &self.parent) {
+            (Some(baseline), None) => SandboxCreateSources::Baseline(baseline),
+            (None, Some(parent)) => SandboxCreateSources::Parent(&parent.bindings),
+            _ => unreachable!("validated Sandbox construction selection"),
+        }
+    }
+
+    pub(crate) fn parent_ref(&self) -> Option<&str> {
+        self.parent.as_ref().map(|parent| parent.reference.as_str())
+    }
+
+    pub(crate) fn operation(&self) -> SourceOperationKind {
+        if self.parent.is_some() {
+            SourceOperationKind::Derive
+        } else {
+            SourceOperationKind::Restore
+        }
+    }
+
+    pub(crate) fn source_pin(&self, index: usize) -> Result<DriverSchemaPin> {
+        self.input().pin(index)
+    }
+
+    pub(crate) fn require_compatible(&self, registry: &SourceDriverRegistryReader) -> Result<()> {
+        let input = self.input();
+        for index in 0..input.len() {
+            registry.resolve(&input.pin(index)?)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(
         &self,
         candidate: &ConstructionCandidate,
@@ -53,22 +207,57 @@ impl SandboxCreateBoundary {
                 .layout_digest
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || self.baseline.anchors.is_empty()
-            || self
-                .baseline
-                .anchors
-                .windows(2)
-                .any(|pair| pair[0].name.as_str() >= pair[1].name.as_str())
+            || self.baseline.is_some() == self.parent.is_some()
         {
             return Err(Error::Storage(
                 "invalid standalone Sandbox construction boundary",
             ));
         }
-        self.baseline.validate()?;
-        require_matching_sources(
-            &self.baseline,
-            sources.ok_or(Error::Storage("Sandbox construction descriptors missing"))?,
-        )
+        let sources = sources.ok_or(Error::Storage("Sandbox construction descriptors missing"))?;
+        match self.input() {
+            SandboxCreateSources::Baseline(baseline) => {
+                baseline.validate()?;
+                if baseline.anchors.is_empty()
+                    || baseline
+                        .anchors
+                        .windows(2)
+                        .any(|pair| pair[0].name.as_str() >= pair[1].name.as_str())
+                {
+                    return Err(Error::Storage("invalid standalone baseline source set"));
+                }
+                require_matching_sources(baseline, sources)
+            }
+            SandboxCreateSources::Parent(bindings) => {
+                let parent = self.parent.as_ref().expect("parent selection");
+                let key = parse_sandbox_ref(&parent.reference)?;
+                sources.validate()?;
+                if key.project != project
+                    || key.canonical() != parent.reference
+                    || parent.reference == *sandbox
+                    || parent.rev == 0
+                    || bindings.is_empty()
+                    || bindings.len() != sources.sources.len()
+                    || sources.operation != SourceOperationKind::Derive
+                    || bindings
+                        .windows(2)
+                        .any(|pair| pair[0].binding.name.as_str() >= pair[1].binding.name.as_str())
+                {
+                    return Err(Error::Storage("invalid Sandbox parent derivation boundary"));
+                }
+                for (binding, source) in bindings.iter().zip(&sources.sources) {
+                    binding.validate()?;
+                    if binding.binding.name != source.name
+                        || binding.binding.driver != source.prepared.descriptor.driver
+                        || binding.binding.checkpoint_policy != CheckpointPolicy::Required
+                    {
+                        return Err(Error::Conflict(
+                            "derive descriptors differ from complete required parent sources",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn authorize(
@@ -90,6 +279,7 @@ impl SandboxCreateBoundary {
         tx: &Transaction<'_>,
         actor: &PrincipalId,
         binding: &SessionBinding,
+        registry: &SourceDriverRegistryReader,
     ) -> Result<()> {
         self.authorize(tx, actor, true)?;
         let project = parse_project_ref(&self.project_ref)?;
@@ -100,15 +290,38 @@ impl SandboxCreateBoundary {
                 "Sandbox construction authority or layout changed",
             ));
         }
+        if let Some(parent) = &self.parent {
+            let current = observe_parent(
+                tx,
+                &self.project_ref,
+                &parent.reference,
+                registry,
+                SourceSetLimit::default(),
+            )?;
+            if current != *parent {
+                return Err(Error::Conflict("Sandbox derivation parent changed"));
+            }
+        }
         require_fresh_layout_in(tx, &self.project_ref, binding)
     }
 }
 
-fn fingerprint(project: &str, request_id: &str) -> Result<String> {
+fn fingerprint(project: &str, from: Option<&str>, request_id: &str) -> Result<String> {
     label(request_id, 256)?;
     let mut hash = Sha256::new();
-    hash.update(b"aw-sandbox-create-baseline-v1\0");
-    hash.update(crate::json(&(project, request_id))?.as_bytes());
+    if let Some(parent) = from {
+        let key = parse_sandbox_ref(parent)?;
+        if key.project.canonical() != project || key.canonical() != parent {
+            return Err(Error::Denied(
+                "Sandbox derivation requires exact same Project",
+            ));
+        }
+        hash.update(b"aw-sandbox-create-derive-v1\0");
+        hash.update(crate::json(&(project, parent, request_id))?.as_bytes());
+    } else {
+        hash.update(b"aw-sandbox-create-baseline-v1\0");
+        hash.update(crate::json(&(project, request_id))?.as_bytes());
+    }
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -125,6 +338,7 @@ fn prior(
     c: &Connection,
     actor: &PrincipalId,
     project_ref: &str,
+    from: Option<&str>,
     request_id: &str,
 ) -> Result<(String, Option<ConstructionPreparation>)> {
     let project = parse_project_ref(project_ref)?;
@@ -136,7 +350,7 @@ fn prior(
     }
     let creator = user_for_principal(c, actor)?
         .ok_or(Error::Denied("Sandbox construction caller unavailable"))?;
-    let expected = fingerprint(project_ref, request_id)?;
+    let expected = fingerprint(project_ref, from, request_id)?;
     let receipt = construction_receipt::lookup_in(
         c,
         ConstructionOperation::SandboxCreate,
@@ -146,10 +360,9 @@ fn prior(
     if let Some(receipt) = &receipt {
         receipt.require_actor(c, actor)?;
         if receipt.fingerprint != expected
-            || receipt
-                .sandbox_boundary
-                .as_ref()
-                .is_none_or(|boundary| boundary.project_ref != project_ref)
+            || receipt.sandbox_boundary.as_ref().is_none_or(|boundary| {
+                boundary.project_ref != project_ref || boundary.parent_ref() != from
+            })
         {
             return Err(Error::Conflict(
                 "Sandbox construction request differs from original",
@@ -163,9 +376,10 @@ fn require_new(
     c: &Connection,
     actor: &PrincipalId,
     project: &str,
+    from: Option<&str>,
     request: &str,
 ) -> Result<String> {
-    let (creator, receipt) = prior(c, actor, project, request)?;
+    let (creator, receipt) = prior(c, actor, project, from, request)?;
     if receipt.is_some() {
         return Err(Error::Conflict(
             "Sandbox construction already claimed; replay or inspect",
@@ -179,8 +393,8 @@ fn compatible(
     boundary: &SandboxCreateBoundary,
     sources: &PreparedSourceSet,
 ) -> Result<()> {
-    for (anchor, source) in boundary.baseline.anchors.iter().zip(&sources.sources) {
-        registry.resolve(&anchor.pin()?)?;
+    boundary.require_compatible(registry)?;
+    for source in &sources.sources {
         registry.resolve(&source.prepared.descriptor.pin()?)?;
     }
     Ok(())
@@ -208,8 +422,8 @@ impl<'a> PreparedSandboxCreate<'a> {
             _ => unreachable!("validated Sandbox candidate"),
         }
     }
-    pub fn anchors(&self) -> &SourceSet {
-        &self.boundary().baseline
+    pub fn input(&self) -> SandboxCreateSources<'_> {
+        self.boundary().input()
     }
     pub fn sources(&self) -> &PreparedSourceSet {
         self.receipt.sources.as_ref().expect("validated source set")
@@ -231,8 +445,9 @@ impl<'a> PreparedSandboxCreate<'a> {
     pub fn revalidate(&self, binding: &SessionBinding) -> Result<()> {
         let mut connection = self.store.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        self.require_current_in(&tx)?;
-        self.boundary().require_current(&tx, &self.actor, binding)?;
+        let registry = self.require_current_in(&tx)?;
+        self.boundary()
+            .require_current(&tx, &self.actor, binding, &registry)?;
         db(tx.rollback())
     }
 
@@ -257,15 +472,14 @@ impl<'a> PreparedSandboxCreate<'a> {
         self,
         inspect: impl FnOnce(
             &SourceDriverRegistryReader,
-            &SourceSet,
+            SandboxCreateSources<'_>,
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedSandboxCreate<'a>> {
         let result = (|| {
             let registry = self.inspection_registry()?;
-            let results = inspect(&registry, self.anchors(), self.sources())?;
-            let (bindings, evidence) =
-                validate_inspected_bindings(&registry, self.anchors(), results)?;
+            let results = inspect(&registry, self.input(), self.sources())?;
+            let (bindings, evidence) = self.input().validate_inspection(&registry, results)?;
             self.inspection_registry()?;
             Ok((bindings, evidence))
         })();
@@ -284,7 +498,11 @@ impl<'a> PreparedSandboxCreate<'a> {
 
     pub fn abandon<F>(
         self,
-        reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
     ) -> Result<()> {
         construction_receipt::reconcile_unpublished_sources(
             self.store,
@@ -293,7 +511,7 @@ impl<'a> PreparedSandboxCreate<'a> {
             &self.barrier,
             || {
                 let registry = self.inspection_registry()?;
-                reconcile(&registry, self.anchors(), self.sources())
+                reconcile(&registry, self.input(), self.sources())
             },
         )
     }
@@ -312,7 +530,7 @@ impl InspectedSandboxCreate<'_> {
         binding: &SessionBinding,
         verify: impl FnOnce(
             &SourceDriverRegistryReader,
-            &SourceSet,
+            SandboxCreateSources<'_>,
             &PreparedSourceSet,
             &[SourceBinding],
             &[ExternalEvidence],
@@ -324,7 +542,7 @@ impl InspectedSandboxCreate<'_> {
             let registry = create.inspection_registry()?;
             let proofs = verify(
                 &registry,
-                create.anchors(),
+                create.input(),
                 create.sources(),
                 &self.bindings,
                 &self.evidence,
@@ -339,13 +557,13 @@ impl InspectedSandboxCreate<'_> {
                 |tx| {
                     create
                         .boundary()
-                        .require_current(tx, &create.actor, binding)?;
+                        .require_current(tx, &create.actor, binding, &registry)?;
                     create.receipt.candidate.require_absent_in(tx)?;
                     compatible(&registry, create.boundary(), create.sources())?;
-                    let fresh = publish_fresh_in(
+                    let fresh = publish_constructed_in(
                         tx,
                         &create.actor,
-                        create.sandbox_ref(),
+                        (create.sandbox_ref(), create.boundary().parent_ref()),
                         binding,
                         &self.bindings,
                         &create.store.inner.source_drivers,
@@ -372,12 +590,13 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
     ) -> Result<Option<SandboxSnapshot>> {
         owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction())?;
-        let (_, receipt) = prior(&tx, actor, project_ref, request_id)?;
+        let (_, receipt) = prior(&tx, actor, project_ref, from, request_id)?;
         let result = match receipt {
             None => None,
             Some(receipt) if receipt.state == PreparationState::Applied => {
@@ -409,37 +628,60 @@ impl SessionStore {
         actor: &PrincipalId,
         project_ref: &str,
         binding: &SessionBinding,
-        mut baseline: SourceSet,
+        from: SandboxCreateFrom<'_>,
         request_id: &str,
-        plan: impl FnOnce(&str, &str, &SourceSet) -> Result<PreparedSourceSet>,
+        plan: impl FnOnce(&str, &str, SandboxCreateSources<'_>) -> Result<PreparedSourceSet>,
     ) -> Result<PreparedSandboxCreate<'_>> {
         owner(self)?;
-        baseline.admit(self.source_set_limit())?;
-        if baseline.anchors.is_empty() {
-            return Err(Error::Denied(
-                "effectful Sandbox baseline requires retained sources",
-            ));
-        }
-        baseline
-            .anchors
-            .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        let set = SourceMutationSet::from_anchors(&baseline.anchors)?;
-        let (creator, writer_epoch, scope) = {
+        let parent_ref = match &from {
+            SandboxCreateFrom::Parent(parent) => Some(*parent),
+            _ => None,
+        };
+        let (creator, boundary, scope) = {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            let creator = require_new(&tx, actor, project_ref, request_id)?;
+            let creator = require_new(&tx, actor, project_ref, parent_ref, request_id)?;
             let project = parse_project_ref(project_ref)?;
             authorize_project(&tx, actor, &project, true)?;
             let writer_epoch = workspace_writer::writer_row(&tx, &project.project)?.writer_epoch;
             require_fresh_layout_in(&tx, project_ref, binding)?;
-            set.require_unleased_in(&tx)?;
             let registry = self.inner.source_drivers.reader()?;
-            for anchor in &baseline.anchors {
-                registry.resolve(&anchor.pin()?)?;
-            }
+            let (baseline, parent) = match from {
+                SandboxCreateFrom::Baseline(mut baseline) => {
+                    baseline.admit(self.source_set_limit())?;
+                    if baseline.anchors.is_empty() {
+                        return Err(Error::Denied(
+                            "effectful Sandbox baseline requires retained sources",
+                        ));
+                    }
+                    baseline
+                        .anchors
+                        .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+                    (Some(baseline), None)
+                }
+                SandboxCreateFrom::Parent(reference) => (
+                    None,
+                    Some(observe_parent(
+                        &tx,
+                        project_ref,
+                        reference,
+                        &registry,
+                        self.source_set_limit(),
+                    )?),
+                ),
+            };
+            let boundary = SandboxCreateBoundary {
+                project_ref: project_ref.to_owned(),
+                writer_epoch,
+                layout_digest: layout(binding)?.digest,
+                baseline,
+                parent,
+            };
+            boundary.require_compatible(&registry)?;
+            boundary.input().mutation_set()?.require_unleased_in(&tx)?;
             let scope = StoreScope::load(&tx)?;
             db(tx.commit())?;
-            (creator, writer_epoch, scope)
+            (creator, boundary, scope)
         };
         let candidate = ConstructionCandidate::Sandbox {
             sandbox: format!("{project_ref}/s:{}", id("sbx")?),
@@ -447,18 +689,13 @@ impl SessionStore {
         let ConstructionCandidate::Sandbox { sandbox } = &candidate else {
             unreachable!()
         };
-        let mut sources = plan(candidate.prepare_id(), sandbox, &baseline)?;
+        let mut sources = plan(candidate.prepare_id(), sandbox, boundary.input())?;
         sources.admit(self.source_set_limit())?;
         sources
             .sources
             .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        let boundary = SandboxCreateBoundary {
-            project_ref: project_ref.to_owned(),
-            writer_epoch,
-            layout_digest: layout(binding)?.digest,
-            baseline,
-        };
         boundary.validate(&candidate, Some(&sources))?;
+        let set = boundary.input().mutation_set()?;
         let receipt = ConstructionPreparation {
             operation: ConstructionOperation::SandboxCreate,
             scope: creator.clone(),
@@ -466,7 +703,7 @@ impl SessionStore {
             parent_session_id: String::new(),
             parent_branch_id: String::new(),
             request_id: request_id.to_owned(),
-            fingerprint: fingerprint(project_ref, request_id)?,
+            fingerprint: fingerprint(project_ref, parent_ref, request_id)?,
             state: PreparationState::Prepared,
             candidate,
             task: None,
@@ -480,7 +717,7 @@ impl SessionStore {
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if StoreScope::load(&tx)? != scope
-            || require_new(&tx, actor, project_ref, request_id)? != receipt.creator
+            || require_new(&tx, actor, project_ref, parent_ref, request_id)? != receipt.creator
         {
             return Err(Error::Conflict(
                 "Sandbox construction owner changed during planning",
@@ -491,7 +728,7 @@ impl SessionStore {
             .sandbox_boundary
             .as_ref()
             .expect("Project boundary")
-            .require_current(&tx, actor, binding)?;
+            .require_current(&tx, actor, binding, &self.inner.source_drivers.reader()?)?;
         let barrier = construction_receipt::claim_sources_in(self, &tx, actor, &receipt, &set)?;
         db(tx.commit())?;
         Ok(PreparedSandboxCreate {
@@ -506,13 +743,14 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
         abandon: bool,
     ) -> Result<Option<PreparedSandboxCreate<'_>>> {
         owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let (_, receipt) = prior(&tx, actor, project_ref, request_id)?;
+        let (_, receipt) = prior(&tx, actor, project_ref, from, request_id)?;
         let receipt = receipt.ok_or(Error::Denied("original Sandbox construction unavailable"))?;
         if abandon && receipt.state == PreparationState::Rejected {
             return Ok(None);
@@ -534,7 +772,7 @@ impl SessionStore {
                 .as_ref()
                 .ok_or(Error::Storage("Sandbox recovery descriptors missing"))?,
         )?;
-        let set = SourceMutationSet::from_anchors(&boundary.baseline.anchors)?;
+        let set = boundary.input().mutation_set()?;
         let barrier =
             self.recover_source_mutation_barrier_in(&tx, &set, receipt.candidate.prepare_id())?;
         construction_receipt::require_unpublished_sources_in(&tx, actor, &receipt, &barrier)?;
@@ -551,14 +789,15 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
         inspect: impl FnOnce(
             &SourceDriverRegistryReader,
-            &SourceSet,
+            SandboxCreateSources<'_>,
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedSandboxCreate<'_>> {
-        self.resume_sandbox_create(actor, project_ref, request_id, false)?
+        self.resume_sandbox_create(actor, project_ref, from, request_id, false)?
             .ok_or(Error::Conflict(
                 "Sandbox construction has no unresolved candidate",
             ))?
@@ -569,10 +808,15 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
-        reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
     ) -> Result<()> {
-        match self.resume_sandbox_create(actor, project_ref, request_id, true)? {
+        match self.resume_sandbox_create(actor, project_ref, from, request_id, true)? {
             Some(prepared) => prepared.abandon(reconcile),
             None => Ok(()),
         }

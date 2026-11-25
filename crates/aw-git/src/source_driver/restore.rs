@@ -7,7 +7,8 @@ use super::tree::{
 use super::{
     access_name, binding_for_repo, descriptor_field, git_error, hash_directory, head, is_digest,
     key, materialization_parts, parse_access, parse_policy, policy_name, prepare_operation, run_os,
-    verify_retained, GitSourceAnchor, GitSourceDriver, BINDING_SCHEMA, RESTORE_RECOVERY_SCHEMA,
+    verify_retained, CapturePlan, GitSourceAnchor, GitSourceDriver, BINDING_SCHEMA,
+    CAPTURE_RECOVERY_SCHEMA, DERIVE_RECOVERY_SCHEMA, RESTORE_RECOVERY_SCHEMA,
 };
 use crate::Repository;
 use aw_agent_core::{
@@ -249,6 +250,158 @@ impl RestorePlan {
     }
 }
 
+// A single driver-owned recipe for capture followed by isolated restore.
+// The capture fields and destination are immutable before either effect.
+// The outer identity marks the child, including when its private retention
+// has already been removed during recovery.
+struct DerivePlan {
+    capture: CapturePlan,
+    target: PathBuf,
+    parent_stamp: String,
+}
+
+impl DerivePlan {
+    fn prepare(&self, prepare_id: &str) -> Result<PreparedSourceOperation> {
+        if self.capture.checkpoint_id != prepare_id
+            || self.capture.observation.is_none()
+            || !is_digest(&self.parent_stamp)
+        {
+            return Err(Error::Storage("invalid Git derive capture identity"));
+        }
+        let target = target_text(&self.target)?;
+        let mut candidate = self.capture.binding.clone();
+        candidate.materialization = format!("{}:{target}", self.parent_stamp);
+        materialization_parts(&candidate)?;
+        let mut fields = self.capture.fields()?;
+        fields.push(RecoveryField::new(
+            "target",
+            RecoveryFieldKind::Reference,
+            target,
+        )?);
+        fields.push(RecoveryField::new(
+            "parent",
+            RecoveryFieldKind::Digest,
+            &self.parent_stamp,
+        )?);
+        prepare_operation(
+            SourceOperationKind::Derive,
+            DERIVE_RECOVERY_SCHEMA,
+            b"aw-git-derive-v1\0",
+            prepare_id,
+            fields,
+        )
+    }
+
+    fn decode(prepared: &PreparedSourceOperation) -> Result<Self> {
+        prepared.validate()?;
+        let d = &prepared.descriptor;
+        if prepared.operation != SourceOperationKind::Derive
+            || d.driver != key()
+            || d.recovery_schema != DERIVE_RECOVERY_SCHEMA
+        {
+            return Err(Error::Denied("incompatible Git derive descriptor"));
+        }
+        let capture = prepare_operation(
+            SourceOperationKind::Capture,
+            CAPTURE_RECOVERY_SCHEMA,
+            b"aw-git-capture-v2\0",
+            &d.prepare_id,
+            d.fields
+                .iter()
+                .filter(|field| field.name != "target" && field.name != "parent")
+                .cloned()
+                .collect(),
+        )?;
+        let plan = Self {
+            capture: CapturePlan::decode(&capture)?,
+            target: PathBuf::from(descriptor_field(d, "target")?),
+            parent_stamp: descriptor_field(d, "parent")?.to_owned(),
+        };
+        if plan.prepare(&d.prepare_id)? != *prepared {
+            return Err(Error::Storage(
+                "Git derive descriptor does not match its identity",
+            ));
+        }
+        Ok(plan)
+    }
+
+    fn capture_descriptor(&self) -> Result<PreparedSourceOperation> {
+        self.capture.prepare(&self.capture.checkpoint_id)
+    }
+
+    fn restore(&self, anchor: GitSourceAnchor) -> RestorePlan {
+        RestorePlan {
+            anchor,
+            origin: self.capture.binding.clone(),
+            target: self.target.clone(),
+            parent_stamp: self.parent_stamp.clone(),
+        }
+    }
+
+    fn verify_location(
+        &self,
+        driver: &GitSourceDriver,
+        location: &GitRestoreLocation,
+    ) -> Result<()> {
+        let (_, origin) = materialization_parts(&self.capture.binding)?;
+        if location.name != self.capture.binding.name
+            || origin != location.repository
+            || self.target != location.target
+        {
+            return Err(Error::Denied(
+                "Git derive descriptor differs from approved locations",
+            ));
+        }
+        location.check_directories()?;
+        self.check_parent()?;
+        driver.verify_materialization(
+            &self.capture.binding,
+            &location.repository,
+            location.repository_identity,
+        )?;
+        Ok(())
+    }
+
+    fn check_parent(&self) -> Result<()> {
+        if parent_stamp(&self.target)? != self.parent_stamp {
+            return Err(Error::Conflict("Git derive destination parent changed"));
+        }
+        Ok(())
+    }
+
+    fn require_binding(&self, binding: &SourceBinding) -> Result<()> {
+        let (_, path) = materialization_parts(binding)?;
+        let mut expected = self.capture.binding.clone();
+        expected
+            .materialization
+            .clone_from(&binding.materialization);
+        if path != self.target || expected != *binding {
+            return Err(Error::Conflict(
+                "Git derived binding differs from original destination",
+            ));
+        }
+        Ok(())
+    }
+
+    // No fresh snapshot or planner during recovery. The exact retained
+    // capture is verified against the original observation and deterministic
+    // synthetic commit identity; absent retention alone is not success.
+    fn retained(&self, driver: &GitSourceDriver) -> Result<(Repository, Option<GitSourceAnchor>)> {
+        self.check_parent()?;
+        let repo = driver.binding_repository(&self.capture.binding)?;
+        let capture = self.capture_descriptor()?;
+        let reference =
+            super::retention_ref(&self.capture.checkpoint_id, &self.capture.binding.name);
+        let anchor = super::retained_for_release(&repo, &reference)?
+            .map(|commit| self.capture.anchor(commit));
+        if let Some(anchor) = &anchor {
+            super::verify_prepared_anchor(&repo, &self.capture, &capture, anchor)?;
+            PrivateIndexes::require_absent(&repo, &capture.descriptor.prepared_identity)?;
+        }
+        Ok((repo, anchor))
+    }
+}
+
 struct RestoreTrees {
     base: Tree,
     captured: Option<Tree>,
@@ -426,11 +579,26 @@ fn require_released(
     plan: &RestorePlan,
     prepared: &PreparedSourceOperation,
 ) -> Result<()> {
-    check_fresh(origin, &plan.target)?;
+    require_released_at(origin, &plan.target, &plan.parent_stamp, prepared)
+}
+
+fn require_released_at(
+    origin: &Repository,
+    target: &Path,
+    expected_parent: &str,
+    prepared: &PreparedSourceOperation,
+) -> Result<()> {
+    check_fresh(origin, target)?;
+    let check_parent = || {
+        if parent_stamp(target)? != expected_parent {
+            return Err(Error::Conflict("Git restore destination parent changed"));
+        }
+        Ok(())
+    };
     let admin = origin.common.join("worktrees");
     let entries = match fs::read_dir(&admin) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return plan.check_parent(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return check_parent(),
         Err(error) => return Err(error.into()),
     };
     let expected = format!("{}\n", lock_reason(prepared));
@@ -448,7 +616,7 @@ fn require_released(
             ));
         }
     }
-    plan.check_parent()
+    check_parent()
 }
 
 fn restored_repo(
@@ -623,6 +791,11 @@ impl GitSourceDriver {
         prepared: &PreparedSourceOperation,
         binding: &SourceBinding,
     ) -> Result<()> {
+        if prepared.operation == SourceOperationKind::Derive {
+            let plan = DerivePlan::decode(prepared)?;
+            plan.require_binding(binding)?;
+            return plan.verify_location(self, location);
+        }
         let plan = RestorePlan::decode(prepared)?;
         plan.require_binding(binding)?;
         plan.verify_location(self, location)
@@ -652,11 +825,128 @@ impl GitSourceDriver {
         plan.prepare(prepare_id)
     }
 
+    /// Plan a named child from the exact current parent checkout. This
+    /// creates neither a retention ref nor a worktree. The independently
+    /// approved locations must remain protected across both effects.
+    pub fn plan_derive_approved(
+        &self,
+        location: &GitRestoreLocation,
+        binding: &SourceBinding,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
+        location.check_directories()?;
+        if location.name != binding.name {
+            return Err(Error::Denied("Git derive approval names another source"));
+        }
+        let repo = self.verify_materialization(
+            binding,
+            &location.repository,
+            location.repository_identity,
+        )?;
+        check_fresh(&repo, &location.target)?;
+        let capture = Self::plan_capture_in(&repo, binding, prepare_id, prepare_id)?;
+        DerivePlan {
+            capture: CapturePlan::decode(&capture)?,
+            target: location.target.clone(),
+            parent_stamp: parent_stamp(&location.target)?,
+        }
+        .prepare(prepare_id)
+    }
+
+    pub fn verify_derive_location(
+        &self,
+        location: &GitRestoreLocation,
+        binding: &SourceBinding,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<()> {
+        let plan = DerivePlan::decode(prepared)?;
+        if plan.capture.binding != *binding {
+            return Err(Error::Denied(
+                "Git derive descriptor names another parent binding",
+            ));
+        }
+        plan.verify_location(self, location)
+    }
+
+    /// First attempt only. Both effects belong to the original descriptor;
+    /// a retained capture or partial child is never permission to retry.
+    pub fn execute_derive(&self, prepared: &PreparedSourceOperation) -> Result<SourceBinding> {
+        let plan = DerivePlan::decode(prepared)?;
+        plan.check_parent()?;
+        let repo = self.binding_repository(&plan.capture.binding)?;
+        require_released_at(&repo, &plan.target, &plan.parent_stamp, prepared)?;
+        let anchor = self.execute_capture(&plan.capture_descriptor()?)?;
+        self.execute_restore_plan(&plan.restore(anchor), prepared)
+    }
+
+    pub fn inspect_derive(
+        &self,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<RecoveryInspection<SourceBinding>> {
+        let plan = DerivePlan::decode(prepared)?;
+        let Ok((_, Some(anchor))) = plan.retained(self) else {
+            return Ok(RecoveryInspection::Unknown);
+        };
+        self.inspect_restore_plan(&plan.restore(anchor), prepared)
+    }
+
+    pub fn revalidate_derive(
+        &self,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<()> {
+        let plan = DerivePlan::decode(prepared)?;
+        let (_, anchor) = plan.retained(self)?;
+        let anchor = anchor.ok_or(Error::Conflict("Git derived retention unavailable"))?;
+        self.revalidate_capture(&plan.capture_descriptor()?, &anchor)?;
+        self.revalidate_restore_plan(&plan.restore(anchor), prepared, binding)
+    }
+
+    /// Dispose of only the unpublished operation's private child and
+    /// capture retention, in that order. A removed retention and surviving
+    /// registration are unresolved; never infer an absent child from a ref.
+    pub fn release_prepared_derive(&self, prepared: &PreparedSourceOperation) -> Result<()> {
+        self.release_derive(prepared, None)
+    }
+
+    fn release_derive(
+        &self,
+        prepared: &PreparedSourceOperation,
+        published: Option<&SourceBinding>,
+    ) -> Result<()> {
+        let plan = DerivePlan::decode(prepared)?;
+        if let Some(binding) = published {
+            plan.require_binding(binding)?;
+        }
+        let (repo, anchor) = plan.retained(self)?;
+        if let Some(anchor) = anchor {
+            let restore = plan.restore(anchor);
+            if let Some(binding) = published {
+                self.release_restored_plan(&restore, prepared, binding)?;
+            } else {
+                self.release_prepared_plan(&restore, prepared)?;
+            }
+        }
+        // Handles no-start, capture-only, and retries after physical
+        // removal but failed Store settlement. Check the original outer
+        // lock identity even if the captured version no longer exists.
+        require_released_at(&repo, &plan.target, &plan.parent_stamp, prepared)?;
+        self.release_prepared_capture(&plan.capture_descriptor()?)
+    }
+
     /// First attempt only, under the caller's live source/destination barrier
     /// and durable Prepared custody. An uncertain result is inspected, not
     /// blindly retried or removed. No synthetic commit becomes visible HEAD.
     pub fn execute_restore(&self, prepared: &PreparedSourceOperation) -> Result<SourceBinding> {
         let plan = RestorePlan::decode(prepared)?;
+        self.execute_restore_plan(&plan, prepared)
+    }
+
+    fn execute_restore_plan(
+        &self,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<SourceBinding> {
         let repo = plan.repository(self)?;
         let trees = plan.trees(&repo)?;
         check_fresh(&repo, &plan.target)?;
@@ -677,9 +967,9 @@ impl GitSourceDriver {
         run_os(&repo, &args, None, None).map_err(|_| {
             Error::Conflict("Git restore outcome uncertain; inspect the Prepared operation")
         })?;
-        let child = restored_repo(&repo, &plan, prepared)?;
-        materialize(&child, &plan, prepared)?;
-        inspect_binding(&repo, &child, &plan, prepared, &trees)
+        let child = restored_repo(&repo, plan, prepared)?;
+        materialize(&child, plan, prepared)?;
+        inspect_binding(&repo, &child, plan, prepared, &trees)
     }
 
     /// Read-only recovery. Absence, partial checkout, changed contents or
@@ -690,11 +980,19 @@ impl GitSourceDriver {
         prepared: &PreparedSourceOperation,
     ) -> Result<RecoveryInspection<SourceBinding>> {
         let plan = RestorePlan::decode(prepared)?;
+        self.inspect_restore_plan(&plan, prepared)
+    }
+
+    fn inspect_restore_plan(
+        &self,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<RecoveryInspection<SourceBinding>> {
         let result = (|| {
             let repo = plan.repository(self)?;
             let trees = plan.trees(&repo)?;
-            let child = restored_repo(&repo, &plan, prepared)?;
-            inspect_binding(&repo, &child, &plan, prepared, &trees)
+            let child = restored_repo(&repo, plan, prepared)?;
+            inspect_binding(&repo, &child, plan, prepared, &trees)
         })();
         let Ok(binding) = result else {
             return Ok(RecoveryInspection::Unknown);
@@ -721,7 +1019,19 @@ impl GitSourceDriver {
         prepared: &PreparedSourceOperation,
         binding: &SourceBinding,
     ) -> Result<()> {
+        if prepared.operation == SourceOperationKind::Derive {
+            return self.release_derive(prepared, Some(binding));
+        }
         let plan = RestorePlan::decode(prepared)?;
+        self.release_restored_plan(&plan, prepared, binding)
+    }
+
+    fn release_restored_plan(
+        &self,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<()> {
         plan.require_binding(binding)?;
 
         // The checkpoint may already be retired. The original descriptor
@@ -732,21 +1042,21 @@ impl GitSourceDriver {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // Both the target and its registration must be absent.
                 // Partial removal is Unknown; never prune or unlock it.
-                return require_released(&origin, &plan, prepared);
+                return require_released(&origin, plan, prepared);
             }
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
 
-        let child = restored_repo(&origin, &plan, prepared)?;
+        let child = restored_repo(&origin, plan, prepared)?;
         PrivateIndexes::require_absent(&child, &prepared.descriptor.prepared_identity)?;
         if plan.binding(&child)? != *binding {
             return Err(Error::Conflict("Git retirement checkout identity changed"));
         }
         let trees = plan.trees(&origin)?;
         verify_restored(&child, &trees.base, trees.captured())?;
-        validate_restored_repo(&origin, &child, &plan, prepared)?;
-        remove_verified_restore(&origin, &child, &plan, prepared)
+        validate_restored_repo(&origin, &child, plan, prepared)?;
+        remove_verified_restore(&origin, &child, plan, prepared)
     }
 
     /// Reconcile only the original unpublished candidate, under separately
@@ -756,15 +1066,23 @@ impl GitSourceDriver {
     /// fresh destination must have remained private and unpublished.
     pub fn release_prepared_restore(&self, prepared: &PreparedSourceOperation) -> Result<()> {
         let plan = RestorePlan::decode(prepared)?;
+        self.release_prepared_plan(&plan, prepared)
+    }
+
+    fn release_prepared_plan(
+        &self,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<()> {
         let origin = plan.origin_repository(self)?;
         match fs::symlink_metadata(&plan.target) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return require_released(&origin, &plan, prepared)
+                return require_released(&origin, plan, prepared)
             }
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
-        let child = restored_repo(&origin, &plan, prepared)?;
+        let child = restored_repo(&origin, plan, prepared)?;
         child.guard_managed_checkout().map_err(git_error)?;
         PrivateIndexes::reconcile(&child, &prepared.descriptor.prepared_identity)?;
         absent(&child.git_dir.join("index.lock"))?;
@@ -786,8 +1104,8 @@ impl GitSourceDriver {
             let trees = plan.trees(&origin)?;
             verify_partial_restore(&child, &trees.base, trees.captured())?;
         }
-        validate_restored_repo(&origin, &child, &plan, prepared)?;
-        remove_verified_restore(&origin, &child, &plan, prepared)
+        validate_restored_repo(&origin, &child, plan, prepared)?;
+        remove_verified_restore(&origin, &child, plan, prepared)
     }
 
     /// Revalidate exact materialization under the live host barrier before
@@ -798,10 +1116,19 @@ impl GitSourceDriver {
         binding: &SourceBinding,
     ) -> Result<()> {
         let plan = RestorePlan::decode(prepared)?;
+        self.revalidate_restore_plan(&plan, prepared, binding)
+    }
+
+    fn revalidate_restore_plan(
+        &self,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<()> {
         let repo = plan.repository(self)?;
         let trees = plan.trees(&repo)?;
-        let child = restored_repo(&repo, &plan, prepared)?;
-        if inspect_binding(&repo, &child, &plan, prepared, &trees)? != *binding {
+        let child = restored_repo(&repo, plan, prepared)?;
+        if inspect_binding(&repo, &child, plan, prepared, &trees)? != *binding {
             return Err(Error::Conflict(
                 "Git restored binding differs from Prepared operation",
             ));

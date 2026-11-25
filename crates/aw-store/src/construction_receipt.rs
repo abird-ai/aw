@@ -425,10 +425,12 @@ impl ConstructionPreparation {
                     "source-bearing Agent candidate requires a fresh Sandbox identity",
                 ));
             }
-            let kind = if self.operation == ConstructionOperation::CheckpointCreate {
-                SourceOperationKind::Capture
-            } else {
-                SourceOperationKind::Restore
+            let kind = match &self.sandbox_boundary {
+                Some(boundary) => boundary.operation(),
+                None if self.operation == ConstructionOperation::CheckpointCreate => {
+                    SourceOperationKind::Capture
+                }
+                None => SourceOperationKind::Restore,
             };
             if sources.operation != kind || sources.prepare_id != self.candidate.prepare_id() {
                 return Err(Error::Conflict(
@@ -664,10 +666,7 @@ pub(crate) fn claim_in(
     }
     if let Some(boundary) = &receipt.sandbox_boundary {
         boundary.authorize(tx, actor, true)?;
-        let reader = registry.reader()?;
-        for anchor in &boundary.baseline.anchors {
-            reader.resolve(&anchor.pin()?)?;
-        }
+        boundary.require_compatible(&registry.reader()?)?;
     } else {
         agent_owner::authorize_permission(tx, actor, receipt.origin(), AgentPermission::View)?;
     }
@@ -996,9 +995,14 @@ fn require_published_candidate_in(
             agent_owner::canonical_ref(tx, AgentKey::new(session, branch))?
         }
         ConstructionCandidate::Sandbox { sandbox } => {
+            let parent = receipt
+                .sandbox_boundary
+                .as_ref()
+                .and_then(|boundary| boundary.parent_ref());
             let published: bool = db(tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1 AND lifecycle='open')",
-                [sandbox], |row| row.get(0),
+                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1 AND lifecycle='open'
+                 AND parent_sandbox_id IS ?2)",
+                params![sandbox, parent], |row| row.get(0),
             ))?;
             if !published {
                 return Err(Error::Conflict(
@@ -1099,35 +1103,53 @@ pub(crate) fn validate_inspected_bindings(
     anchors: &SourceSet,
     results: Vec<RecoveryInspection<SourceBinding>>,
 ) -> Result<(Vec<SourceBinding>, Vec<ExternalEvidence>)> {
-    if results.len() != anchors.anchors.len() {
+    validate_materialized_bindings(
+        registry,
+        anchors.anchors.len(),
+        results,
+        |index, binding| {
+            let anchor = &anchors.anchors[index];
+            if binding.name != anchor.name
+                || binding.driver != anchor.driver
+                || binding.source_ref != anchor.source_ref
+                || binding.access != anchor.access
+                || binding.checkpoint_policy != anchor.checkpoint_policy
+            {
+                return Err(Error::Conflict(
+                    "restored binding differs from its source anchor",
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn validate_materialized_bindings(
+    registry: &SourceDriverRegistryReader,
+    count: usize,
+    results: Vec<RecoveryInspection<SourceBinding>>,
+    mut require_binding: impl FnMut(usize, &SourceBinding) -> Result<()>,
+) -> Result<(Vec<SourceBinding>, Vec<ExternalEvidence>)> {
+    if results.len() != count {
         return Err(Error::Conflict(
-            "restore inspection requires the complete source set",
+            "materialization inspection requires the complete source set",
         ));
     }
-    let mut bindings = Vec::with_capacity(results.len());
-    let mut evidence = Vec::with_capacity(results.len());
-    for (anchor, result) in anchors.anchors.iter().zip(results) {
+    let mut bindings = Vec::with_capacity(count);
+    let mut evidence = Vec::with_capacity(count);
+    for (index, result) in results.into_iter().enumerate() {
         let RecoveryInspection::Completed {
             result: binding,
             evidence: proof,
         } = result
         else {
             return Err(Error::Conflict(
-                "restore materialization is unresolved; inspect before retry",
+                "source materialization is unresolved; inspect before retry",
             ));
         };
         binding.validate()?;
         proof.validate()?;
-        if binding.name != anchor.name
-            || binding.driver != anchor.driver
-            || binding.source_ref != anchor.source_ref
-            || binding.access != anchor.access
-            || binding.checkpoint_policy != anchor.checkpoint_policy
-        {
-            return Err(Error::Conflict(
-                "restored binding differs from its source anchor",
-            ));
-        }
+        require_binding(index, &binding)?;
         registry.resolve(&binding.pin()?)?;
         bindings.push(binding);
         evidence.push(proof);
@@ -1342,15 +1364,15 @@ pub(crate) fn visit_unresolved_sources(
                     status = SourceCompatibility::RecoveryRequired;
                 }
             }
-            if let Some(set) = restore_set.as_ref().or_else(|| {
-                receipt
-                    .sandbox_boundary
-                    .as_ref()
-                    .map(|boundary| &boundary.baseline)
-            }) {
-                if compatibility(registry, &set.anchors[index].pin()?)?
-                    == SourceCompatibility::RecoveryRequired
-                {
+            let input_pin = if let Some(set) = &restore_set {
+                Some(set.anchors[index].pin()?)
+            } else if let Some(boundary) = &receipt.sandbox_boundary {
+                Some(boundary.source_pin(index)?)
+            } else {
+                None
+            };
+            if let Some(pin) = input_pin {
+                if compatibility(registry, &pin)? == SourceCompatibility::RecoveryRequired {
                     status = SourceCompatibility::RecoveryRequired;
                 }
             }

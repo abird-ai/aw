@@ -376,6 +376,12 @@ impl SessionStore {
         if old.map(|stored| &stored.binding) == binding {
             return super::snapshot_with_sources(&tx, &sandbox);
         }
+        require_no_retained_children_in(&tx, &sandbox)?;
+        if current.parent_sandbox_ref.is_some() {
+            return Err(Error::Conflict(
+                "derived Sandbox source changes require effectful structural custody",
+            ));
+        }
         let tool_root = current
             .tool_root
             .to_str()
@@ -540,10 +546,30 @@ fn closed_retained_in(
     Ok((snapshot, bindings))
 }
 
+// A derived child can retain the parent's physical origin even after
+// logical close. Its original cleanup must settle before that backing
+// may be replaced or retired. Lineage remains independent of Agent ACL.
+fn require_no_retained_children_in(c: &Connection, sandbox: &str) -> Result<()> {
+    let retained: bool = db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandboxes_current s
+         JOIN sandbox_source_bindings_current b ON b.sandbox_id=s.sandbox_id
+         WHERE s.parent_sandbox_id=?1)",
+        [sandbox],
+        |row| row.get(0),
+    ))?;
+    if retained {
+        return Err(Error::Conflict(
+            "Sandbox materialization is still required by a retained child",
+        ));
+    }
+    Ok(())
+}
+
 fn require_unshared_materializations_in(
     c: &Connection,
     snapshot: &super::SandboxSnapshot,
 ) -> Result<()> {
+    require_no_retained_children_in(c, &snapshot.canonical_ref)?;
     let root = snapshot
         .tool_root
         .to_str()

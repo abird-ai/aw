@@ -1097,7 +1097,27 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Broad Store **239/244**, exact same five previously recorded legacy failures.
       Final Host **16/16**, strict Store/Host all-target/all-feature Clippy,
       workspace check and scoped fmt/diff passed. Fresh retained versions only; mutable parent derive, unversioned baseline effects,
-      effectful structural mutation and public RPC remain open.
+      effectful structural mutation and public RPC remained open at that checkpoint.
+      **Same-Project required-source Sandbox derivation landed:** same Project receipt,
+      barrier, inspection/publication and exact cleanup; original versioned required
+      parent bindings and rev, current writer/quiescence, fresh isolated destination,
+      exact parent fingerprint and lineage. One `Derive` descriptor, Git recovery
+      schema 4 (schemas 1–3 unchanged): original capture + destination fixed before
+      effects, reuse deterministic retained snapshot and original RestorePlan/outer
+      lock identity, no new planner on inspection. No Agent/Session/public checkpoint
+      or extra ledger. Release child before private retention; missing retention
+      requires original target and marked registration absent. Parent physical
+      retirement and binding mutations blocked by retained children even after
+      logical close; derived binding edits held pending effectful structural custody.
+      Real grouped Git capture-only failure and Host dirty linked-parent derive,
+      partial-set abandonment, failed publication/reopen/resume/replay, exact child
+      and parent retirement; no parent HEAD/index rewrite. Baseline encoding retained.
+      First realization nonempty all-required same-SourceRef Git; ephemeral/source-free
+      parents/new backing identities need explicit policy. Independent physical authority
+      remains mandatory. Schema v60 unchanged. Validation: core 1/1, Git 33/33,
+      construction 1/1, Sandbox 4/4, Checkpoint 4/4, Host 16/16; strict Clippy,
+      workspace all-target/all-feature check, scoped fmt/diff passed. Earlier
+      broad Store 239/244 was not rerun.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

@@ -334,6 +334,7 @@ pub fn validate_source_set_hard_limit(count: usize) -> Result<()> {
 pub enum SourceOperationKind {
     Capture,
     Restore,
+    Derive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

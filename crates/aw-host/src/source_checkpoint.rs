@@ -9,8 +9,8 @@ use aw_agent_core::{
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
-    InspectedCheckpointRestore, InspectedSandboxCreate, SandboxSnapshot, SessionBinding,
-    SessionStore, VersionedSourceBinding,
+    InspectedCheckpointRestore, InspectedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
+    SandboxSnapshot, SessionBinding, SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -166,97 +166,181 @@ impl<'a> ManagedGitLayout<'a> {
     }
 }
 
+fn approved_parent(
+    bindings: &[VersionedSourceBinding],
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    let locations = fence.locations();
+    if bindings.len() != locations.len()
+        || bindings
+            .iter()
+            .zip(locations)
+            .any(|(source, location)| source.binding.name != location.name)
+    {
+        return Err(Error::Denied(
+            "Git derive approval must cover exact required parent sources",
+        ));
+    }
+    require_disjoint_locations(locations)
+}
+
 fn plan(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     fence: &impl GitRestoreFence,
     prepare_id: &str,
 ) -> Result<PreparedSourceSet> {
-    let anchors = approved_anchors(anchors, fence)?;
-    let sources = anchors
-        .iter()
-        .zip(fence.locations())
-        .map(|(anchor, location)| {
-            Ok(NamedPreparedSource {
-                name: anchor.name.clone(),
-                prepared: driver.plan_restore_approved(location, anchor, prepare_id)?,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let (operation, sources) = match input {
+        SandboxCreateSources::Baseline(anchors) => {
+            let anchors = approved_anchors(anchors, fence)?;
+            (
+                SourceOperationKind::Restore,
+                anchors
+                    .iter()
+                    .zip(fence.locations())
+                    .map(|(anchor, location)| {
+                        Ok(NamedPreparedSource {
+                            name: anchor.name.clone(),
+                            prepared: driver.plan_restore_approved(location, anchor, prepare_id)?,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            )
+        }
+        SandboxCreateSources::Parent(bindings) => {
+            approved_parent(bindings, fence)?;
+            (
+                SourceOperationKind::Derive,
+                bindings
+                    .iter()
+                    .zip(fence.locations())
+                    .map(|(source, location)| {
+                        Ok(NamedPreparedSource {
+                            name: source.binding.name.clone(),
+                            prepared: driver.plan_derive_approved(
+                                location,
+                                &source.binding,
+                                prepare_id,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            )
+        }
+    };
     Ok(PreparedSourceSet {
         prepare_id: prepare_id.to_owned(),
-        operation: SourceOperationKind::Restore,
+        operation,
         sources,
     })
 }
 
 fn require_locations(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     prepared: &PreparedSourceSet,
     fence: &impl GitRestoreFence,
 ) -> Result<()> {
-    let anchors = approved_anchors(anchors, fence)?;
-    if prepared.sources.len() != anchors.len() {
+    if prepared.sources.len() != fence.locations().len() {
         return Err(Error::Conflict(
-            "Git restore preparation differs from approved SourceSet",
+            "Git materialization preparation differs from approved source set",
         ));
     }
-    for ((anchor, source), location) in anchors.iter().zip(&prepared.sources).zip(fence.locations())
-    {
-        if source.name != anchor.name {
-            return Err(Error::Conflict(
-                "Git restore preparation names another source",
-            ));
+    match input {
+        SandboxCreateSources::Baseline(anchors) => {
+            let anchors = approved_anchors(anchors, fence)?;
+            if prepared.operation != SourceOperationKind::Restore {
+                return Err(Error::Conflict("not a Git restore preparation"));
+            }
+            for ((anchor, source), location) in
+                anchors.iter().zip(&prepared.sources).zip(fence.locations())
+            {
+                if source.name != anchor.name {
+                    return Err(Error::Conflict(
+                        "Git restore preparation names another source",
+                    ));
+                }
+                driver.verify_restore_location(location, anchor, &source.prepared)?;
+            }
         }
-        driver.verify_restore_location(location, anchor, &source.prepared)?;
+        SandboxCreateSources::Parent(bindings) => {
+            approved_parent(bindings, fence)?;
+            if prepared.operation != SourceOperationKind::Derive {
+                return Err(Error::Conflict("not a Git derive preparation"));
+            }
+            for ((binding, source), location) in bindings
+                .iter()
+                .zip(&prepared.sources)
+                .zip(fence.locations())
+            {
+                if source.name != binding.binding.name {
+                    return Err(Error::Conflict(
+                        "Git derive preparation names another source",
+                    ));
+                }
+                driver.verify_derive_location(location, &binding.binding, &source.prepared)?;
+            }
+        }
     }
     Ok(())
 }
 
 fn inspect(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     prepared: &PreparedSourceSet,
     fence: &impl GitRestoreFence,
 ) -> Result<Vec<RecoveryInspection<SourceBinding>>> {
-    require_locations(driver, anchors, prepared, fence)?;
+    require_locations(driver, input, prepared, fence)?;
     prepared
         .sources
         .iter()
-        .map(|source| driver.inspect_restore(&source.prepared))
+        .map(|source| match input {
+            SandboxCreateSources::Baseline(_) => driver.inspect_restore(&source.prepared),
+            SandboxCreateSources::Parent(_) => driver.inspect_derive(&source.prepared),
+        })
         .collect()
 }
 
 fn execute(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     prepared: &PreparedSourceSet,
     fence: &impl GitRestoreFence,
 ) -> Result<()> {
-    require_locations(driver, anchors, prepared, fence)?;
+    require_locations(driver, input, prepared, fence)?;
     for source in &prepared.sources {
-        driver.execute_restore(&source.prepared)?;
+        match input {
+            SandboxCreateSources::Baseline(_) => driver.execute_restore(&source.prepared)?,
+            SandboxCreateSources::Parent(_) => driver.execute_derive(&source.prepared)?,
+        };
     }
     Ok(())
 }
 
 fn publication_proofs<'a, F: GitRestoreFence>(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     sources: &PreparedSourceSet,
     bindings: &[SourceBinding],
     evidence: &[ExternalEvidence],
     fence: &'a F,
 ) -> Result<Vec<SourcePublicationProof<Publication<'a, F>>>> {
-    require_locations(driver, anchors, sources, fence)?;
+    require_locations(driver, input, sources, fence)?;
     sources
         .sources
         .iter()
         .zip(bindings)
         .zip(evidence)
         .map(|((source, binding), evidence)| {
-            driver.revalidate_restore(&source.prepared, binding)?;
+            match input {
+                SandboxCreateSources::Baseline(_) => {
+                    driver.revalidate_restore(&source.prepared, binding)?
+                }
+                SandboxCreateSources::Parent(_) => {
+                    driver.revalidate_derive(&source.prepared, binding)?
+                }
+            };
             Ok(SourcePublicationProof::Held(Publication {
                 _fence: fence,
                 evidence: evidence.clone(),
@@ -267,15 +351,48 @@ fn publication_proofs<'a, F: GitRestoreFence>(
 
 fn abandon_materializations<F: GitRestoreFence>(
     driver: &GitSourceDriver,
-    anchors: &SourceSet,
+    input: SandboxCreateSources<'_>,
     sources: &PreparedSourceSet,
     fence: F,
 ) -> Result<F> {
-    require_locations(driver, anchors, sources, &fence)?;
+    require_locations(driver, input, sources, &fence)?;
     for source in &sources.sources {
-        driver.release_prepared_restore(&source.prepared)?;
+        match input {
+            SandboxCreateSources::Baseline(_) => {
+                driver.release_prepared_restore(&source.prepared)?
+            }
+            SandboxCreateSources::Parent(_) => driver.release_prepared_derive(&source.prepared)?,
+        }
     }
     Ok(fence)
+}
+
+fn require_derive_layout(
+    layout: &SessionBinding,
+    input: SandboxCreateSources<'_>,
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    if let SandboxCreateSources::Parent(bindings) = input {
+        let cwd = layout
+            .working_directory
+            .strip_prefix(&layout.tool_root)
+            .map_err(|_| Error::Denied("derived cwd must stay within its layout"))?;
+        if cwd
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::Denied("derived cwd must stay within its layout"));
+        }
+        for location in fence.locations() {
+            crate::source_filesystem::require_named_root(
+                &layout.tool_root,
+                &location.name,
+                &location.target,
+                bindings.len(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Uses the actual SourceDriver registered in the Store; no second driver
@@ -370,7 +487,12 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             execution_site,
             |prepare_id, _, anchors| {
                 let approval = authorize(&layout, anchors)?;
-                let sources = plan(&driver, anchors, &approval, prepare_id)?;
+                let sources = plan(
+                    &driver,
+                    SandboxCreateSources::Baseline(anchors),
+                    &approval,
+                    prepare_id,
+                )?;
                 fence = Some(approval);
                 Ok(sources)
             },
@@ -380,7 +502,12 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         // first Git mutation. An uncertain result never retries execution.
         let executed = (|| {
             prepared.revalidate(&layout)?;
-            execute(&driver, prepared.anchors(), prepared.sources(), &fence)
+            execute(
+                &driver,
+                SandboxCreateSources::Baseline(prepared.anchors()),
+                prepared.sources(),
+                &fence,
+            )
         })();
         if let Err(error) = executed {
             prepared.mark_unknown()?;
@@ -388,7 +515,12 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         }
         let inspected = prepared.inspect(|registry, anchors, sources| {
             let driver = registry.get(self.driver)?;
-            inspect(&driver, anchors, sources, &fence)
+            inspect(
+                &driver,
+                SandboxCreateSources::Baseline(anchors),
+                sources,
+                &fence,
+            )
         })?;
         self.publish(inspected, &layout, &fence)
     }
@@ -410,7 +542,12 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             |registry, anchors, sources| {
                 let approval = authorize(layout, anchors, sources)?;
                 let driver = registry.get(self.driver)?;
-                let result = inspect(&driver, anchors, sources, &approval)?;
+                let result = inspect(
+                    &driver,
+                    SandboxCreateSources::Baseline(anchors),
+                    sources,
+                    &approval,
+                )?;
                 fence = Some(approval);
                 Ok(result)
             },
@@ -430,7 +567,14 @@ impl<'a> GitCheckpointRestoreHost<'a> {
     ) -> Result<CheckpointRestoreResult> {
         inspected.publish(layout, |registry, anchors, sources, bindings, evidence| {
             let driver = registry.get(self.driver)?;
-            publication_proofs(&driver, anchors, sources, bindings, evidence, fence)
+            publication_proofs(
+                &driver,
+                SandboxCreateSources::Baseline(anchors),
+                sources,
+                bindings,
+                evidence,
+                fence,
+            )
         })
     }
 
@@ -447,7 +591,12 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             .checkpoint_abandon_restore(actor, request_id, |registry, anchors, sources| {
                 let fence = authorize(anchors, sources)?;
                 let driver = registry.get(self.driver)?;
-                abandon_materializations(&driver, anchors, sources, fence)
+                abandon_materializations(
+                    &driver,
+                    SandboxCreateSources::Baseline(anchors),
+                    sources,
+                    fence,
+                )
             })
     }
 
@@ -462,24 +611,80 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         select: impl FnOnce() -> Result<(SessionBinding, SourceSet)>,
         authorize: impl FnOnce(&SessionBinding, &SourceSet) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
-        if let Some(result) = self
-            .store
-            .sandbox_replay_create(actor, project_ref, request_id)?
+        self.create_sandbox_selected(
+            actor,
+            project_ref,
+            None,
+            request_id,
+            || {
+                let (layout, baseline) = select()?;
+                Ok((layout, SandboxCreateFrom::Baseline(baseline)))
+            },
+            |layout, input| {
+                let SandboxCreateSources::Baseline(anchors) = input else {
+                    return Err(Error::Conflict("expected versioned baseline"));
+                };
+                authorize(layout, anchors)
+            },
+        )
+    }
+
+    /// Derive an isolated child from the complete current required source
+    /// set of an open same-Project parent. No public checkpoint or Agent.
+    /// The independent host fence protects parent content, destination,
+    /// Git administration and retained child backing through publication.
+    pub fn derive_sandbox<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        request_id: &str,
+        select_layout: impl FnOnce() -> Result<SessionBinding>,
+        authorize: impl FnOnce(&SessionBinding, &[VersionedSourceBinding]) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.create_sandbox_selected(
+            actor,
+            project_ref,
+            Some(parent),
+            request_id,
+            || Ok((select_layout()?, SandboxCreateFrom::Parent(parent))),
+            |layout, input| {
+                let SandboxCreateSources::Parent(bindings) = input else {
+                    return Err(Error::Conflict("expected parent sources"));
+                };
+                authorize(layout, bindings)
+            },
+        )
+    }
+
+    fn create_sandbox_selected<'b, F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        from: Option<&str>,
+        request_id: &str,
+        select: impl FnOnce() -> Result<(SessionBinding, SandboxCreateFrom<'b>)>,
+        authorize: impl FnOnce(&SessionBinding, SandboxCreateSources<'_>) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        if let Some(result) =
+            self.store
+                .sandbox_replay_create(actor, project_ref, from, request_id)?
         {
             return Ok(result);
         }
-        let (layout, baseline) = select()?;
+        let (layout, selection) = select()?;
         let driver = self.store.source_driver(self.driver)?;
         let mut fence = None;
         let prepared = self.store.sandbox_prepare_create(
             actor,
             project_ref,
             &layout,
-            baseline,
+            selection,
             request_id,
-            |prepare_id, _, anchors| {
-                let approval = authorize(&layout, anchors)?;
-                let sources = plan(&driver, anchors, &approval, prepare_id)?;
+            |prepare_id, _, input| {
+                let approval = authorize(&layout, input)?;
+                require_derive_layout(&layout, input, &approval)?;
+                let sources = plan(&driver, input, &approval, prepare_id)?;
                 fence = Some(approval);
                 Ok(sources)
             },
@@ -487,15 +692,15 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         let fence = fence.expect("successful Sandbox preparation called planner");
         let executed = (|| {
             prepared.revalidate(&layout)?;
-            execute(&driver, prepared.anchors(), prepared.sources(), &fence)
+            execute(&driver, prepared.input(), prepared.sources(), &fence)
         })();
         if let Err(error) = executed {
             prepared.mark_unknown()?;
             return Err(error);
         }
-        let inspected = prepared.inspect(|registry, anchors, sources| {
+        let inspected = prepared.inspect(|registry, input, sources| {
             let driver = registry.get(self.driver)?;
-            inspect(&driver, anchors, sources, &fence)
+            inspect(&driver, input, sources, &fence)
         })?;
         self.publish_sandbox(inspected, &layout, &fence)
     }
@@ -504,19 +709,26 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
         layout: &SessionBinding,
-        authorize: impl FnOnce(&SessionBinding, &SourceSet, &PreparedSourceSet) -> Result<F>,
+        authorize: impl FnOnce(
+            &SessionBinding,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
         let mut fence = None;
         let inspected = self.store.sandbox_inspect_create(
             actor,
             project_ref,
+            from,
             request_id,
-            |registry, anchors, sources| {
-                let approval = authorize(layout, anchors, sources)?;
+            |registry, input, sources| {
+                let approval = authorize(layout, input, sources)?;
+                require_derive_layout(layout, input, &approval)?;
                 let driver = registry.get(self.driver)?;
-                let result = inspect(&driver, anchors, sources, &approval)?;
+                let result = inspect(&driver, input, sources, &approval)?;
                 fence = Some(approval);
                 Ok(result)
             },
@@ -534,9 +746,9 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         layout: &SessionBinding,
         fence: &F,
     ) -> Result<SandboxSnapshot> {
-        inspected.publish(layout, |registry, anchors, sources, bindings, evidence| {
+        inspected.publish(layout, |registry, input, sources, bindings, evidence| {
             let driver = registry.get(self.driver)?;
-            publication_proofs(&driver, anchors, sources, bindings, evidence, fence)
+            publication_proofs(&driver, input, sources, bindings, evidence, fence)
         })
     }
 
@@ -544,23 +756,25 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         &self,
         actor: &PrincipalId,
         project_ref: &str,
+        from: Option<&str>,
         request_id: &str,
-        authorize: impl FnOnce(&SourceSet, &PreparedSourceSet) -> Result<F>,
+        authorize: impl FnOnce(SandboxCreateSources<'_>, &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
         self.store.sandbox_abandon_create(
             actor,
             project_ref,
+            from,
             request_id,
-            |registry, anchors, sources| {
-                let fence = authorize(anchors, sources)?;
+            |registry, input, sources| {
+                let fence = authorize(input, sources)?;
                 let driver = registry.get(self.driver)?;
-                abandon_materializations(&driver, anchors, sources, fence)
+                abandon_materializations(&driver, input, sources, fence)
             },
         )
     }
 
     /// Reconcile a closed, retained Sandbox created by a Git restore or
-    /// standalone versioned baseline. Only the original unmodified set is supported.
+    /// standalone construction (baseline or derive). Only the original unmodified set is supported.
     /// Authorize the whole layout and exact Applied descriptors independently.
     /// Keep the external fence through Store settlement; never remove shared
     /// backing or unrelated files. Already released layouts do not reauthorize.
@@ -1477,6 +1691,7 @@ mod tests {
             .resume_sandbox_create::<Fence<'_>>(
                 &actor,
                 &project,
+                None,
                 request_id,
                 &layout(&standalone_root),
                 |_, _, _| panic!("missing driver cannot inspect original Project custody"),
@@ -1489,9 +1704,13 @@ mod tests {
             .resume_sandbox_create(
                 &actor,
                 &project,
+                None,
                 request_id,
                 &layout(&standalone_root),
                 |_, sources, _| {
+                    let SandboxCreateSources::Baseline(sources) = sources else {
+                        panic!("baseline selection changed")
+                    };
                     assert_eq!(sources, &baseline);
                     Ok(fence(locations(&standalone_root), 4))
                 },
@@ -1514,14 +1733,234 @@ mod tests {
             standalone
         );
         assert!(host
-            .abandon_sandbox_create::<Fence<'_>>(&actor, &project, request_id, |_, _| panic!(
+            .abandon_sandbox_create::<Fence<'_>>(&actor, &project, None, request_id, |_, _| panic!(
                 "Applied Sandbox is not a private candidate"
             ),)
             .is_err());
+        // Derive the actual mutable parent state, not its historical
+        // baseline anchor. The linked parent checkout is also retained
+        // as a physical dependency of the child.
+        let child_root = root.join("derived-standalone");
+        private_dir(&child_root);
+        let child_locations = |destination: &Path| {
+            ["code", "data"]
+                .into_iter()
+                .map(|name| {
+                    let repository = standalone_root.join(name);
+                    GitRestoreLocation {
+                        name: SourceName::new(name).unwrap(),
+                        repository_identity: identity(&repository),
+                        repository,
+                        target: destination.join(name),
+                        parent_identity: identity(destination),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let parent_ref = &standalone.canonical_ref;
+        let parent_code = standalone_root.join("code");
+        fs::write(parent_code.join("tracked"), b"parent changed").unwrap();
+        fs::write(
+            parent_code.join("new-child-input"),
+            b"untracked parent content",
+        )
+        .unwrap();
+        let parent_head = git(&executable, &parent_code, &["rev-parse", "HEAD"]);
+        let parent_index = git(&executable, &parent_code, &["ls-files", "--stage"]);
+        let checkpoint_count = || -> u64 {
+            Connection::open(&database)
+                .unwrap()
+                .query_row("SELECT count(*) FROM checkpoints", [], |row| row.get(0))
+                .unwrap()
+        };
+        let checkpoints_before = checkpoint_count();
+        let derived_request = "fixture:derive-standalone";
+        assert!(host
+            .derive_sandbox::<Fence<'_>>(
+                &actor,
+                &project,
+                parent_ref,
+                request_id,
+                || panic!("baseline request cannot be reused as derive"),
+                |_, _| panic!("baseline request cannot authorize derive"),
+            )
+            .is_err());
+
+        // A first source may have completed while another never started.
+        // Abandon exactly those private resources, without touching the
+        // parent or a public checkpoint.
+        let partial_root = root.join("abandoned-derive");
+        private_dir(&partial_root);
+        let approval = fence(child_locations(&partial_root), 4);
+        let prepared = store
+            .sandbox_prepare_create(
+                &actor,
+                &project,
+                &layout(&partial_root),
+                SandboxCreateFrom::Parent(parent_ref),
+                "fixture:abandoned-derive",
+                |prepare_id, _, input| {
+                    let implementation = store.source_driver(&driver)?;
+                    plan(&implementation, input, &approval, prepare_id)
+                },
+            )
+            .unwrap();
+        let partial_ref = prepared.sandbox_ref().to_owned();
+        let implementation = store.source_driver(&driver).unwrap();
+        implementation
+            .execute_derive(&prepared.sources().sources[0].prepared)
+            .unwrap();
+        assert!(partial_root.join("code/tracked").is_file());
+        assert!(!partial_root.join("data").exists());
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        host.abandon_sandbox_create(
+            &actor,
+            &project,
+            Some(parent_ref),
+            "fixture:abandoned-derive",
+            |_, _| Ok(fence(child_locations(&partial_root), 4)),
+        )
+        .unwrap();
+        assert!(store.sandbox_get(&actor, &partial_ref).is_err());
+        assert_eq!(fs::read_dir(&partial_root).unwrap().count(), 0);
+
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_derive BEFORE INSERT ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture derived publish failure'); END;",
+            )
+            .unwrap();
+        assert!(host
+            .derive_sandbox(
+                &actor,
+                &project,
+                parent_ref,
+                derived_request,
+                || Ok(layout(&child_root)),
+                |_, sources| {
+                    assert_eq!(sources.len(), 2);
+                    Ok(fence(child_locations(&child_root), 4))
+                },
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(child_root.join("code/tracked")).unwrap(),
+            b"parent changed"
+        );
+        assert_eq!(
+            fs::read(child_root.join("code/new-child-input")).unwrap(),
+            b"untracked parent content"
+        );
+        assert_eq!(
+            git(&executable, &parent_code, &["rev-parse", "HEAD"]),
+            parent_head
+        );
+        assert_eq!(
+            git(&executable, &parent_code, &["ls-files", "--stage"]),
+            parent_index
+        );
+        assert_eq!(
+            fs::read(parent_code.join("tracked")).unwrap(),
+            b"parent changed"
+        );
+        assert!(store
+            .sandbox_close(&actor, parent_ref, Some(standalone.rev))
+            .is_err());
+        assert!(host
+            .derive_sandbox::<Fence<'_>>(
+                &actor,
+                &project,
+                parent_ref,
+                derived_request,
+                || panic!("unresolved derive cannot select another layout"),
+                |_, _| panic!("unresolved derive cannot authorize a new effect"),
+            )
+            .is_err());
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_derive;")
+            .unwrap();
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let child = host.resume_sandbox_create(
+            &actor, &project, Some(parent_ref), derived_request, &layout(&child_root),
+            |_, input, prepared| {
+                assert!(matches!(input, SandboxCreateSources::Parent(bindings) if bindings.len() == 2));
+                assert_eq!(prepared.operation, SourceOperationKind::Derive);
+                Ok(fence(child_locations(&child_root), 4))
+            },
+        ).unwrap();
+        assert_eq!(
+            child.parent_sandbox_ref.as_deref(),
+            Some(parent_ref.as_str())
+        );
+        assert_eq!(child.sources.len(), 2);
+        assert_eq!(count_sessions(), sessions_before);
+        assert_eq!(checkpoint_count(), checkpoints_before);
+        assert_eq!(
+            host.derive_sandbox::<Fence<'_>>(
+                &actor,
+                &project,
+                parent_ref,
+                derived_request,
+                || panic!("Applied child cannot select another layout"),
+                |_, _| panic!("Applied child cannot authorize materialization again"),
+            )
+            .unwrap(),
+            child
+        );
+        // Parent content can move on without changing the isolated child.
+        fs::write(parent_code.join("tracked"), b"code").unwrap();
+        fs::remove_file(parent_code.join("new-child-input")).unwrap();
+        assert_eq!(
+            fs::read(child_root.join("code/tracked")).unwrap(),
+            b"parent changed"
+        );
+        assert!(store
+            .sandbox_sources_set(
+                &actor,
+                parent_ref,
+                &standalone.sources[0].name,
+                None,
+                standalone.rev
+            )
+            .is_err());
         let closed = store
-            .sandbox_close(&actor, &standalone.canonical_ref, Some(standalone.rev))
+            .sandbox_close(&actor, parent_ref, Some(standalone.rev))
             .unwrap();
         assert_eq!(closed.sources.len(), 2);
+        let parent_cleanup = || {
+            host.reconcile_closed_sandbox::<Fence<'_>>(&actor, parent_ref, |_, _, _| {
+                panic!("retained child must fence parent cleanup")
+            })
+        };
+        assert!(parent_cleanup().is_err());
+        store
+            .sandbox_close(&actor, &child.canonical_ref, Some(child.rev))
+            .unwrap();
+        assert!(parent_cleanup().is_err());
+        let retired = host
+            .reconcile_closed_sandbox(&actor, &child.canonical_ref, |_, _, prepared| {
+                assert_eq!(prepared.operation, SourceOperationKind::Derive);
+                Ok(fence(child_locations(&child_root), 4))
+            })
+            .unwrap();
+        assert!(retired.sources.is_empty());
+        assert_eq!(fs::read_dir(&child_root).unwrap().count(), 0);
+        let capture_ref_prefix = format!(
+            "refs/aw/checkpoints/{}/",
+            child.canonical_ref.rsplit_once("/s:").unwrap().1
+        );
+        assert!(git(
+            &executable,
+            &parent_code,
+            &["for-each-ref", &capture_ref_prefix]
+        )
+        .is_empty());
+        assert_eq!(count_sessions(), sessions_before);
         let released = host
             .reconcile_closed_sandbox(
                 &actor,
@@ -1549,7 +1988,7 @@ mod tests {
                 &actor,
                 &project,
                 &layout(&abandoned_root),
-                baseline.clone(),
+                SandboxCreateFrom::Baseline(baseline.clone()),
                 "fixture:abandoned-standalone",
                 |prepare_id, _, anchors| {
                     let implementation = store.source_driver(&driver)?;
@@ -1560,13 +1999,18 @@ mod tests {
         let abandoned = prepared.sandbox_ref().to_owned();
         prepared.mark_unknown().unwrap();
         drop(approval);
-        host.abandon_sandbox_create(&actor, &project, "fixture:abandoned-standalone", |_, _| {
-            Ok(fence(locations(&abandoned_root), 4))
-        })
+        host.abandon_sandbox_create(
+            &actor,
+            &project,
+            None,
+            "fixture:abandoned-standalone",
+            |_, _| Ok(fence(locations(&abandoned_root), 4)),
+        )
         .unwrap();
         host.abandon_sandbox_create::<Fence<'_>>(
             &actor,
             &project,
+            None,
             "fixture:abandoned-standalone",
             |_, _| panic!("Rejected Sandbox cannot inspect again"),
         )

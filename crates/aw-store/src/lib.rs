@@ -211,11 +211,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
     EffectiveSourceBinding, InspectedSandboxCreate, PreparedSandboxCreate, PreparedSandboxEffect,
-    SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease, SandboxEffectOrigin,
-    SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantObservation,
-    SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle, SandboxPolicyEvidence,
-    SandboxSnapshot, SandboxSourceGrant, SandboxToolRecovery, SandboxToolTerminalRef,
-    SourceBindingCompatibility, SourceBindingSummary,
+    SandboxCreateFrom, SandboxCreateSources, SandboxEffectAuthority, SandboxEffectLaunch,
+    SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
+    SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
+    SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
+    SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
