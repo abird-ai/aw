@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: offline Git checkpoint retention reconciliation (this checkpoint; parent `0e68089d9f5983b27325548fb667aa1940e45bb1`, configured signing Vault activation). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: configured offline Git checkpoint capture and exact recovery (this checkpoint; parent `0c9eab3e8566fb9fc3fddc6a7a708f9b2dbd05ed`, offline retention reconciliation). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1400,20 +1400,38 @@ Current implementation: offline Git checkpoint retention reconciliation (this ch
       checks, full binary build and required-approval CLI smoke passed.
       See CURRENT_HANDOFF for validation corrections and remaining
       platform/inventory qualification.
+      **Configured offline Git checkpoint capture/recovery landed:** the existing
+      configured native approval acquires a separate exact host-operation
+      fence after Store source selection, before physical probes. Explicit
+      offline `checkpoint-capture` uses original capture Prepared/inspect/
+      publication owners with the live approval guard, advisory config lease
+      and private ordinary checkout pins. Manager/actor/current OS principal
+      and complete named selection must match; no SandboxGrant or activation.
+      Exact Applied replay before config/driver lookup; explicit recover
+      matches original semantic fingerprint before receipt/barrier reclamation,
+      never recaptures an unresolved invocation. Shared offline Git maintenance
+      helpers, no new schema/ledger/config format. Independent host physical
+      exclusion remains mandatory. Store checkpoint 4/4, Host lifecycle 1/1,
+      native source Process 2/2, grouped offline capture/recovery/retention
+      1/1; strict Store/Host/CLI Clippy, durable/minimal checks, full binary,
+      actual command help/required-argument smoke and scoped fmt/diff passed.
+      See CURRENT_HANDOFF for remaining platform qualification.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
-      Production activation of configured Git owners and independent physical authority,
+      Native Actor activation of configured Git owners and independent physical authority,
       complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and
       non-exact partial checkout cleanup, physical authority/production cleanup, bound-Agent mutation
       and other structural removal cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
-      activation/redacted local binding RPCs and narrow offline Git retention reconciliation are landed; do not repeat.
+      activation/redacted local binding RPCs, offline Git capture/exact recovery
+      and narrow offline retention reconciliation are landed; do not repeat.
       Remaining Vault production broker/Process dispatch, socket/file/env projection integration, independent protected metadata
       disclosure, general physical retention authority/Project retention-admin authorization,
-      task-bearing/captured-source capture and restore and remaining Sandbox/Vault host RPCs held.
+      task-bearing restore, captured-source capture/restore RPC, incomplete
+      capture cleanup CLI and remaining Sandbox/Vault host RPCs held.
       See current comprehensive handoff §5 for next cuts, limitations and acceptance. Schema v60.
       AW remote main last verified at 4ddeed8; subsequent implementation and documentation
       checkpoints remain local. No new remote verification or publication.

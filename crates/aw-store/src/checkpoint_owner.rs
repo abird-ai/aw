@@ -16,7 +16,8 @@ use aw_agent_core::{
     SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
 pub use capture::{
-    CheckpointCaptureSelection, InspectedCheckpointCapture, PreparedCheckpointCapture,
+    CheckpointCaptureRequest, CheckpointCaptureSelection, InspectedCheckpointCapture,
+    PreparedCheckpointCapture,
 };
 pub use restore::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,

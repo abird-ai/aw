@@ -180,6 +180,24 @@ impl GitNativeSourceResolver {
         manager: &PrincipalId,
         root: &Path,
     ) -> Result<NativeSourceApproval> {
+        self.provision_configured_approval_with(manager, root, |_, _, _| Ok(()))
+            .map(|(approval, ())| approval)
+    }
+
+    /// Compose another independently authorized host operation with this
+    /// configured decision. Acquire its live physical fence after Store
+    /// authorization, before probing any Git checkout or artifact namespace.
+    /// The returned fence and approval must both survive that operation.
+    pub fn provision_configured_approval_with<F>(
+        &self,
+        manager: &PrincipalId,
+        root: &Path,
+        authorize: impl FnOnce(
+            &SandboxSnapshot,
+            &NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
+            &[VersionedSourceBinding],
+        ) -> Result<F>,
+    ) -> Result<(NativeSourceApproval, F)> {
         if !aw_platform::secure_private_files_supported()
             || !root.is_absolute()
             || root.canonicalize()? != root
@@ -244,6 +262,7 @@ impl GitNativeSourceResolver {
             Some(&config.sandbox_ref),
             spec,
             root,
+            authorize,
         )
     }
 
@@ -261,17 +280,30 @@ impl GitNativeSourceResolver {
         spec: NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
         state_root: &Path,
     ) -> Result<NativeSourceApproval> {
-        self.provision_approval_in(manager, expected_sandbox_rev, None, spec, state_root)
+        self.provision_approval_in(
+            manager,
+            expected_sandbox_rev,
+            None,
+            spec,
+            state_root,
+            |_, _, _| Ok(()),
+        )
+        .map(|(approval, ())| approval)
     }
 
-    fn provision_approval_in(
+    fn provision_approval_in<F>(
         &self,
         manager: &PrincipalId,
         expected_sandbox_rev: u64,
         expected_sandbox: Option<&str>,
         mut spec: NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
         state_root: &Path,
-    ) -> Result<NativeSourceApproval> {
+        authorize: impl FnOnce(
+            &SandboxSnapshot,
+            &NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
+            &[VersionedSourceBinding],
+        ) -> Result<F>,
+    ) -> Result<(NativeSourceApproval, F)> {
         spec.validate(&self.store)?;
         spec.directories
             .sort_unstable_by(|a, b| a.location.name.as_str().cmp(b.location.name.as_str()));
@@ -297,6 +329,24 @@ impl GitNativeSourceResolver {
                 "native source approval differs from Sandbox layout",
             ));
         }
+        // Match the complete configured set before any physical probes, even
+        // from the independently authorized operation callback.
+        for (source, directory) in sources.iter().zip(&spec.directories) {
+            crate::source_filesystem::require_named_root(
+                &spec.base,
+                &directory.location.name,
+                &directory.location.repository,
+                names.len(),
+            )?;
+            if source.binding.name != directory.location.name
+                || source.binding_rev != directory.binding_rev
+                || !source.binding.access.permits(directory.access)
+                || &source.binding.driver != self.driver.driver()
+            {
+                return Err(Error::Denied("approved native source binding changed"));
+            }
+        }
+        let fence = authorize(&sandbox, &spec, &sources)?;
         if expected_sandbox.is_some() {
             // Config and artifact state must not be inside the layout, even
             // a sibling outside this independently selected grant. Check only
@@ -308,19 +358,6 @@ impl GitNativeSourceResolver {
         // Verify the entire selected set before creating artifact state.
         for (source, directory) in sources.iter().zip(&spec.directories) {
             let location = &directory.location;
-            crate::source_filesystem::require_named_root(
-                &spec.base,
-                &location.name,
-                &location.repository,
-                names.len(),
-            )?;
-            if source.binding.name != location.name
-                || source.binding_rev != directory.binding_rev
-                || !source.binding.access.permits(directory.access)
-                || &source.binding.driver != self.driver.driver()
-            {
-                return Err(Error::Denied("approved native source binding changed"));
-            }
             repos.push(driver.verify_materialization(
                 &source.binding,
                 &location.repository,
@@ -388,7 +425,7 @@ impl GitNativeSourceResolver {
             }
         }
         drop(repos);
-        Ok(approval)
+        Ok((approval, fence))
     }
 
     /// Blocking, read-only preparation. Called by the native route on a

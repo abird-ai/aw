@@ -1,12 +1,14 @@
 //! Offline trusted host composition for exact retired Git retention only.
 //! No Agent activation, ambient repository discovery or client RPC authority.
+use crate::git_maintenance::{
+    lock_private_approval, overlaps, pin_private_checkout, require_existing_store,
+};
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::{validate_source_set_hard_limit, SourceSet};
 use aw_git::source_driver::{GitSourceAnchor, GitSourceLocation};
 use aw_host::source_checkpoint::{reconcile_retired_git, GitSourceFence};
 use aw_platform::DirectoryIdentity;
 use aw_store::SessionStore;
-use fs2::FileExt;
 use serde::Deserialize;
 use std::{
     fs::File,
@@ -40,34 +42,12 @@ struct Approval {
     _lease: File,
 }
 
-fn overlaps(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
-}
-
-fn canonical_private_directory(path: &Path) -> Result<()> {
-    if !path.is_absolute() || path.canonicalize()? != path {
-        return Err(Error::Denied(
-            "retention approval requires canonical private directories",
-        ));
-    }
-    aw_platform::validate_private_dir(path)?;
-    Ok(())
-}
-
 impl Approval {
     fn open(path: &Path, manager: &PrincipalId) -> Result<Self> {
         let parent = path
             .parent()
             .ok_or(Error::Denied("retention approval directory required"))?;
-        canonical_private_directory(parent)?;
-        if !path.is_absolute() || path.canonicalize()? != path {
-            return Err(Error::Denied(
-                "retention approval requires a canonical file",
-            ));
-        }
-        let file = aw_platform::open_private_existing(path, true)?;
-        FileExt::try_lock_exclusive(&file)
-            .map_err(|_| Error::Conflict("retention approval is busy"))?;
+        let file = lock_private_approval(path)?;
         let mut bytes = Vec::new();
         (&file)
             .take(MAX_APPROVAL_BYTES as u64 + 1)
@@ -110,17 +90,12 @@ impl Approval {
         {
             return Err(Error::Denied("duplicate retention approval source name"));
         }
-        canonical_private_directory(&config.store_directory)?;
         if overlaps(parent, &config.store_directory) {
             return Err(Error::Denied(
                 "retention approval must be outside Store state",
             ));
         }
-        // Never initialize a missing Store as a side effect of maintenance.
-        aw_platform::open_private_existing(
-            &config.store_directory.join("sessions.sqlite3"),
-            false,
-        )?;
+        require_existing_store(&config.store_directory)?;
         Ok(Self {
             config,
             directory: parent.to_owned(),
@@ -159,34 +134,10 @@ impl Approval {
                     "retention approval names another checkpoint or source",
                 ));
             }
-            let root = &location.repository;
-            if overlaps(root, &self.config.store_directory) || overlaps(root, &self.directory) {
-                return Err(Error::Denied(
-                    "approved checkout overlaps private host state",
-                ));
-            }
-            canonical_private_directory(root)?;
-            let pin = DirectoryIdentity::open(root)?;
-            if pin.identity()? != location.repository_identity {
-                return Err(Error::Conflict("approved retention checkout changed"));
-            }
-            // This first offline path permits only a private ordinary checkout
-            // with its own contained administration. Linked checkout pointers
-            // and separate common directories require a separate host decision.
-            let admin = root.join(".git");
-            let objects = admin.join("objects");
-            for path in [&admin, &objects] {
-                if path.canonicalize()? != *path {
-                    return Err(Error::Denied("retention administration must be contained"));
-                }
-                pins.push(DirectoryIdentity::open(path)?);
-            }
-            match std::fs::symlink_metadata(admin.join("commondir")) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(error) => return Err(error.into()),
-                Ok(_) => return Err(Error::Denied("separate Git common directory not approved")),
-            }
-            pins.push(pin);
+            pins.extend(pin_private_checkout(
+                location,
+                &[&self.config.store_directory, &self.directory],
+            )?);
         }
         Ok(Fence {
             _approval: self,
@@ -220,12 +171,14 @@ pub(crate) fn run(path: &Path) -> Result<u8> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use aw_agent_core::{CheckpointPolicy, SourceAccess, SourceDriverRegistry, SourceName};
+    use aw_agent_core::{
+        CheckpointPolicy, NamedPreparedSource, PreparedSourceSet, SourceAccess,
+        SourceDriverRegistry, SourceName, SourceOperationKind,
+    };
     use aw_git::source_driver::GitSourceDriver;
-    use aw_host::source_checkpoint::GitCheckpointCaptureHost;
     use aw_store::{
-        AgentHistoryForkAccess, CheckpointCaptureSelection, CheckpointRestoreRequest,
-        SessionBinding, SourceMutationOutcome, SourceMutationSet,
+        AgentHistoryForkAccess, CheckpointCaptureRequest, CheckpointCaptureSelection,
+        CheckpointRestoreRequest, SessionBinding, SourceMutationOutcome, SourceMutationSet,
     };
     use aw_store_api::SessionBackend;
     use serde_json::json;
@@ -237,13 +190,6 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    struct CaptureFence(Vec<GitSourceLocation>);
-    impl GitSourceFence for CaptureFence {
-        fn locations(&self) -> &[GitSourceLocation] {
-            &self.0
-        }
-    }
-
     fn git(executable: &Path, root: &Path, args: &[&str]) -> String {
         let out = Command::new(executable)
             .current_dir(root)
@@ -262,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_retention_reconciles_exact_retired_git_refs_without_activation() {
+    fn offline_configured_capture_and_retention_reconcile_exact_git_refs_without_activation() {
         let temp = Temp(crate::test_support::temp_dir("offline-retention"));
         let root = temp.0.canonicalize().unwrap();
         let repo = root.join("repo");
@@ -352,17 +298,136 @@ mod tests {
             repository: repo.clone(),
             repository_identity: DirectoryIdentity::open(&repo).unwrap().identity().unwrap(),
         };
-        // All fixture backing directories and writers are under this test's exclusive control.
-        let capture = GitCheckpointCaptureHost::new(&store, &handle)
-            .capture(
+        // This isolated fixture owns all checkout, Git administration and config
+        // writers. Exercise the real configured offline owner, not a fake grant.
+        let agent_ref = &restored.agent.canonical_ref;
+        let sandbox = store
+            .sandbox_get(&actor, restored.agent.sandbox_ref.as_deref().unwrap())
+            .unwrap();
+        let grant_before = store.sandbox_grant_status(&actor, agent_ref).unwrap();
+        let agent_before = store.agent_get(&actor, agent_ref).unwrap();
+        let request = CheckpointCaptureRequest {
+            reference: agent_ref,
+            selection: CheckpointCaptureSelection::Auto,
+            note: Some("offline fixture"),
+        };
+        let native_config = json!({
+            "version":1,"store_directory":state,
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":actor,"actor":actor,"agent_ref":agent_ref,
+            "sandbox_ref":sandbox.canonical_ref,"sandbox_rev":sandbox.rev,
+            "policy_ref":"host:fixture-offline-git","base":repo,
+            "directories":[{"name":location.name,"repository":location.repository,
+                "repository_identity":location.repository_identity,
+                "binding_rev":sandbox.sources[0].binding_rev,"access":"read_write"}]
+        });
+        let native_path = approvals.join("git-native.json");
+        let mut wrong_native = native_config.clone();
+        wrong_native["directories"][0]["binding_rev"] = json!(sandbox.sources[0].binding_rev + 1);
+        let mut native_file = aw_platform::open_private_new(&native_path).unwrap();
+        native_file
+            .write_all(&serde_json::to_vec(&wrong_native).unwrap())
+            .unwrap();
+        drop(native_file);
+        let invoke = |store: &SessionStore, root: &Path, id: &str, recover: bool| {
+            crate::checkpoint_capture::capture(store, &actor, root, &request, id, recover)
+        };
+        assert!(invoke(&store, &approvals, "fixture:fresh-capture", false).is_err());
+        assert!(git(
+            &executable,
+            &repo,
+            &["for-each-ref", "refs/aw/checkpoints/"]
+        )
+        .is_empty());
+        assert_eq!(fs::read_dir(&approvals).unwrap().count(), 1);
+        fs::write(&native_path, serde_json::to_vec(&native_config).unwrap()).unwrap();
+        let held_config = lock_private_approval(&native_path).unwrap();
+        assert!(invoke(&store, &approvals, "fixture:fresh-capture", false).is_err());
+        drop(held_config);
+        let fresh = invoke(&store, &approvals, "fixture:fresh-capture", false).unwrap();
+        assert_eq!(fresh.sources.len(), 1);
+        assert_eq!(
+            invoke(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:fresh-capture",
+                false
+            )
+            .unwrap(),
+            fresh
+        );
+        assert_eq!(
+            store.sandbox_grant_status(&actor, agent_ref).unwrap(),
+            grant_before
+        );
+        assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
+
+        // Interrupt a real prepared capture after retention creation, before
+        // publication, then reopen and recover through the configured path.
+        let driver = store.source_driver(&handle).unwrap();
+        let prepared = store
+            .checkpoint_prepare_capture(
                 &actor,
-                &restored.agent.canonical_ref,
-                CheckpointCaptureSelection::Auto,
-                None,
+                agent_ref,
+                request.selection.clone(),
+                request.note,
                 "fixture:capture",
-                |_| Ok(CaptureFence(vec![location.clone()])),
+                |checkpoint, bindings| {
+                    assert_eq!(bindings.len(), 1);
+                    Ok(PreparedSourceSet {
+                        prepare_id: checkpoint.to_owned(),
+                        operation: SourceOperationKind::Capture,
+                        sources: vec![NamedPreparedSource {
+                            name: location.name.clone(),
+                            prepared: driver.plan_capture_approved(
+                                &location,
+                                &bindings[0].binding,
+                                checkpoint,
+                                checkpoint,
+                            )?,
+                        }],
+                    })
+                },
             )
             .unwrap();
+        let interrupted_id = prepared.checkpoint_id().to_owned();
+        prepared.revalidate().unwrap();
+        driver
+            .execute_capture(&prepared.sources().sources[0].prepared)
+            .unwrap();
+        prepared.mark_unknown().unwrap();
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        assert!(invoke(&store, &approvals, "fixture:capture", false).is_err());
+        let wrong_request = CheckpointCaptureRequest {
+            note: Some("different request"),
+            ..request.clone()
+        };
+        assert!(store
+            .checkpoint_inspect_capture_exact(
+                &actor,
+                &wrong_request,
+                "fixture:capture",
+                |_, _, _| panic!("mismatched receipt reached inspection")
+            )
+            .is_err());
+        assert!(crate::checkpoint_capture::capture(
+            &store,
+            &actor,
+            &approvals,
+            &wrong_request,
+            "fixture:capture",
+            true
+        )
+        .is_err());
+        let capture = invoke(&store, &approvals, "fixture:capture", true).unwrap();
+        assert_eq!(capture.id, interrupted_id);
+        assert_eq!(
+            store.sandbox_grant_status(&actor, agent_ref).unwrap(),
+            grant_before
+        );
+        assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
         let reference = format!("refs/aw/checkpoints/{}/code", capture.id);
         let captured = git(&executable, &repo, &["rev-parse", &reference]);
         assert_ne!(captured, head);
@@ -432,6 +497,16 @@ mod tests {
             .reconcile(&store)
             .unwrap();
         assert!(git(&executable, &repo, &["for-each-ref", &reference]).is_empty());
+        // Independent live checkpoint retention was never part of this cleanup.
+        assert!(!git(
+            &executable,
+            &repo,
+            &[
+                "for-each-ref",
+                &format!("refs/aw/checkpoints/{}/code", fresh.id)
+            ]
+        )
+        .is_empty());
         store
             .acquire_source_mutation_barrier(&mutations, "fixture:retention-settled")
             .unwrap()
@@ -450,6 +525,17 @@ mod tests {
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            invoke(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:capture",
+                true
+            )
+            .unwrap()
+            .lifecycle,
+            aw_store::CheckpointLifecycle::Retired
+        );
         Approval::open(&path, &actor)
             .unwrap()
             .reconcile(&store)

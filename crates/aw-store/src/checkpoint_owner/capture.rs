@@ -63,6 +63,29 @@ impl CheckpointCaptureSelection {
     }
 }
 
+/// Exact semantic request for explicit source-bearing recovery. The original
+/// host envelope supplies the request ID separately, just as for creation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointCaptureRequest<'a> {
+    pub reference: &'a str,
+    pub selection: CheckpointCaptureSelection,
+    pub note: Option<&'a str>,
+}
+
+impl CheckpointCaptureRequest<'_> {
+    fn fingerprint(&self) -> Result<String> {
+        label(self.reference, 2048)?;
+        if let Some(note) = self.note {
+            label(note, 2048)?;
+        }
+        fingerprint(
+            self.reference,
+            &self.selection.clone().canonicalize()?,
+            self.note,
+        )
+    }
+}
+
 /// Durable, exact Store-owned capture inputs; not source authority.
 /// Current compatibility is diagnostic, so it is not part of this identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

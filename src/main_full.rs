@@ -3,9 +3,13 @@ mod attach;
 #[cfg(feature = "net")]
 mod awnet;
 #[cfg(feature = "workspace")]
+mod checkpoint_capture;
+#[cfg(feature = "workspace")]
 mod checkpoint_retention;
 #[cfg(all(feature = "device", target_os = "linux"))]
 mod device;
+#[cfg(feature = "workspace")]
+mod git_maintenance;
 mod resource_cli_args;
 mod resources_cli;
 #[cfg(feature = "routing")]
@@ -108,6 +112,12 @@ enum TopCommand {
     Skill {
         #[command(subcommand)]
         command: resources_cli::SkillCommand,
+    },
+    /// Offline capture of independently approved Git sources, or inspect an interrupted capture.
+    #[cfg(feature = "workspace")]
+    CheckpointCapture {
+        #[command(flatten)]
+        args: checkpoint_capture::Args,
     },
     /// Offline Git retention reconciliation for one retired checkpoint.
     #[cfg(feature = "workspace")]
@@ -1665,6 +1675,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::Skill { command } => resources_cli::skill(command),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointRetention { approval } => checkpoint_retention::run(&approval),
+        #[cfg(feature = "workspace")]
+        TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         TopCommand::Session { command } => match command {
             resources_cli::SessionCommand::Open { session, run } => {
                 let mut run = run.into_run(None);

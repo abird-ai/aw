@@ -278,7 +278,29 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceAnchor>>>,
     ) -> Result<InspectedCheckpointCapture<'_>> {
-        self.recover_checkpoint_capture(actor, request_id)?
+        self.recover_checkpoint_capture(actor, request_id, None)?
+            .ok_or(Error::Conflict(
+                "checkpoint capture candidate already reconciled",
+            ))?
+            .inspect(inspect)
+    }
+
+    /// Recover only the exact original semantic request. A host configuring a
+    /// current Agent must not inspect another Agent's unresolved capture even
+    /// if both share a Sandbox and the same named physical sources.
+    pub fn checkpoint_inspect_capture_exact(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointCaptureRequest<'_>,
+        request_id: &str,
+        inspect: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+        ) -> Result<Vec<RecoveryInspection<SourceAnchor>>>,
+    ) -> Result<InspectedCheckpointCapture<'_>> {
+        let fingerprint = request.fingerprint()?;
+        self.recover_checkpoint_capture(actor, request_id, Some(&fingerprint))?
             .ok_or(Error::Conflict(
                 "checkpoint capture candidate already reconciled",
             ))?
@@ -297,7 +319,7 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<F>,
     ) -> Result<()> {
-        match self.recover_checkpoint_capture(actor, request_id)? {
+        match self.recover_checkpoint_capture(actor, request_id, None)? {
             Some(capture) => capture.abandon(reconcile),
             None => Ok(()),
         }
@@ -307,6 +329,7 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         request_id: &str,
+        expected_fingerprint: Option<&str>,
     ) -> Result<Option<PreparedCheckpointCapture<'_>>> {
         label(request_id, 256)?;
         if self.inner.mode != crate::StoreMode::OwnerLock {
@@ -326,6 +349,11 @@ impl SessionStore {
                 request_id,
             )?
             .ok_or(Error::Denied("checkpoint recovery receipt unavailable"))?;
+            if expected_fingerprint.is_some_and(|expected| receipt.fingerprint != expected) {
+                return Err(Error::Denied(
+                    "checkpoint recovery request differs from original semantics",
+                ));
+            }
             if construction_receipt::is_reconciled_in(&tx, &receipt)? {
                 return Ok(None);
             }

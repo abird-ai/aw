@@ -7,8 +7,8 @@ use aw_agent_core::{
 };
 use aw_git::source_driver::{GitSourceAnchor, GitSourceDriver, GitSourceLocation};
 use aw_store::{
-    CheckpointCaptureSelection, CheckpointSnapshot, InspectedCheckpointCapture, SessionStore,
-    VersionedSourceBinding,
+    CheckpointCaptureRequest, CheckpointCaptureSelection, CheckpointSnapshot,
+    InspectedCheckpointCapture, SessionStore, VersionedSourceBinding,
 };
 
 /// The independent live authority owner guarantees exact source disclosure,
@@ -192,21 +192,49 @@ impl<'a> GitCheckpointCaptureHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
     ) -> Result<CheckpointSnapshot> {
+        self.resume_in(actor, request_id, None, authorize)
+    }
+
+    /// Explicit recovery of the original complete semantic request. Never
+    /// inspect a different Agent's receipt through a shared source layout.
+    pub fn resume_exact<F: GitSourceFence>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointCaptureRequest<'_>,
+        request_id: &str,
+        authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
+    ) -> Result<CheckpointSnapshot> {
+        self.resume_in(actor, request_id, Some(request), authorize)
+    }
+
+    fn resume_in<F: GitSourceFence>(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        request: Option<&CheckpointCaptureRequest<'_>>,
+        authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
+    ) -> Result<CheckpointSnapshot> {
         let mut fence = None;
-        let inspected = self.store.checkpoint_inspect_capture(
-            actor,
-            request_id,
-            |registry, bindings, sources| {
-                fence = Some(authorize(bindings, sources)?);
-                let driver = registry.get(self.driver)?;
-                inspect(
-                    &driver,
-                    bindings,
-                    sources,
-                    fence.as_ref().expect("approved"),
-                )
-            },
-        )?;
+        let inspector = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                         bindings: &[VersionedSourceBinding],
+                         sources: &PreparedSourceSet| {
+            fence = Some(authorize(bindings, sources)?);
+            let driver = registry.get(self.driver)?;
+            inspect(
+                &driver,
+                bindings,
+                sources,
+                fence.as_ref().expect("approved"),
+            )
+        };
+        let inspected = match request {
+            Some(request) => self
+                .store
+                .checkpoint_inspect_capture_exact(actor, request, request_id, inspector),
+            None => self
+                .store
+                .checkpoint_inspect_capture(actor, request_id, inspector),
+        }?;
         self.publish(
             inspected,
             &fence.expect("successful inspection called inspector"),

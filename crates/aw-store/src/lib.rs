@@ -139,9 +139,9 @@ use aw_agent_core::{
     Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
 pub use checkpoint_owner::{
-    CheckpointCaptureSelection, CheckpointCreateScope, CheckpointDeleteOutcome,
-    CheckpointLifecycle, CheckpointRestoreLayout, CheckpointRestoreRequest,
-    CheckpointRestoreResult, CheckpointSnapshot, CheckpointSourceSummary,
+    CheckpointCaptureRequest, CheckpointCaptureSelection, CheckpointCreateScope,
+    CheckpointDeleteOutcome, CheckpointLifecycle, CheckpointRestoreLayout,
+    CheckpointRestoreRequest, CheckpointRestoreResult, CheckpointSnapshot, CheckpointSourceSummary,
     InspectedCheckpointCapture, InspectedCheckpointRestore, PreparedCheckpointCapture,
     PreparedCheckpointRestore,
 };

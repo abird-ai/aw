@@ -19,7 +19,76 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: offline Git checkpoint retention reconciliation
+## Latest local implementation delta — 2026-11-25: configured offline Git checkpoint capture and exact recovery
+
+Parent: `0c9eab3e8566fb9fc3fddc6a7a708f9b2dbd05ed` (offline Git retention
+reconciliation), signature verified. Agent/Turn journal and resource CLI
+owners still occupied; independent offline host slice, L5 only.
+
+- Actual production consumer of the existing configured `git-native.json`
+  approval: `aw checkpoint-capture --state-dir <private-store>
+  <approval-root> <canonical-agent> <request-id>` with optional
+  `--agent-source <name>` (repeat for exact named selection; default Auto),
+  `--agent-note <note>` and `--agent-recover`. No new config schema; the
+  existing config independently selects the exact Store generation, manager,
+  actor, Agent, Sandbox revision, policy, and named binding/root identities.
+  Offline capture requires manager = actor = authenticated local OS principal,
+  existing exclusive Store owner, and the exact selected source set.
+- The configured approval loader now composes a second independently
+  authorized host-operation fence after current Store/source selection and
+  before probing Git or provisioning private artifact namespaces. Existing
+  configured/directed native callers share the same implementation. The
+  offline command is explicit authorization of the bounded Git retention
+  administration effect, separate from native filesystem read/write ceilings.
+  It retains the live `NativeSourceApproval` read guard, approval file's
+  exclusive advisory lease, and checked ordinary checkout/admin/object
+  directory pins through the original Prepared/execute/inspect/publish owner.
+  No SandboxGrant publication, Agent activation or inference. The host must
+  protect all config, artifact, Store and Git backing, aliases and external
+  writers/other retention users; this is not kernel or cross-Store isolation.
+  Separate Git common directories and non-private checkout roots are refused.
+- The capture owner retains its original request fingerprint (canonical Agent
+  selector, canonical selection and note). Exact Applied replay skips approval
+  loading and driver lookup, including retired results. Unresolved requests
+  cannot be fresh capture; explicit `--agent-recover` checks the original
+  complete semantic fingerprint before the original receipt/barrier is
+  reclaimed. It can only inspect/publish already completed physical capture;
+  incomplete/ambiguous retention remains unresolved and is never recaptured.
+  Original generic trusted recovery APIs remain compatible. No second
+  receipt, replay owner, schema or driver registry. CLI request namespace is
+  `cli:checkpoint-capture:<request-id>`.
+- Shared private Git maintenance helpers now serve both offline capture and
+  retired retention reconciliation; no duplicate lease or checkout pin logic.
+  No new cleanup/disclosure authority or runtime registration is inferred
+  from this metadata/maintenance path.
+
+Validation (L5, Rust 1.95.0): Store checkpoint owner 4/4, Host
+source-checkpoint lifecycle 1/1, native source-Process integration 2/2,
+grouped configured offline capture/recovery/retention regression 1/1.
+The grouped real Git/SQLite fixture verifies stale approval and locked
+config refusal, fresh capture, exact Applied replay without the config,
+interrupted Prepared physical capture/restart, wrong request refusal
+(including at the lower inspection boundary), exact recovery without
+recapture, unchanged Agent/SandboxGrant/HEAD/index/worktree, and retained
+unrelated live refs during retirement. Strict all-feature/all-target
+Store/Host/CLI Clippy, durable lib, minimal all-target checks, full CLI
+build, actual capture/retention help and required-argument smoke, scoped
+fmt/diff passed. Existing feature-specific dead-code warnings remain.
+The preceding Git repository implementation was unchanged; its 33/33
+suite, broad CLI inventory discrepancy and pinned Nix/native-platform
+qualification were not rerun. Physical effects tested only in private
+fixtures; no actual user checkout captured, no publication.
+
+Next: exact live source-aware Actor/Turn admission through the original
+journal/queue/context owners if free. Otherwise independent substantive
+physical source restore/reconciliation or protected metadata/Vault host
+integration. Configured Git approval has an actual offline capture/recovery
+consumer; native Actor tool activation, complete independent physical
+containment, abandoned/incomplete capture cleanup CLI and captured-source
+RPC/restore remain held. Do not confuse this offline host path with live
+source-bearing execution.
+
+## Previous local implementation delta — 2026-11-25: offline Git checkpoint retention reconciliation
 
 Parent: `0e68089d9f5983b27325548fb667aa1940e45bb1` (configured signing
 Vault activation), signature verified. Agent/Turn journal and resource CLI
