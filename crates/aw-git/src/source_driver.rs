@@ -805,6 +805,14 @@ pub struct GitSourceLocation {
     pub repository_identity: (u64, u64),
 }
 
+/// Independently approved, existing empty private layout. This is an
+/// observed physical identity, not permission to disclose or use it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitSourceFreeLayout {
+    pub root: PathBuf,
+    pub identity: (u64, u64),
+}
+
 fn pin_checkout(root: &Path, identity: (u64, u64)) -> Result<aw_platform::DirectoryIdentity> {
     if !root.is_absolute() || root.canonicalize()? != root {
         return Err(Error::Denied(
@@ -913,6 +921,59 @@ impl GitSourceDriver {
             ));
         }
         Ok(repo)
+    }
+
+    /// Verify an already-empty private layout for metadata-only final
+    /// detachment. Both the old source and layout must be independently
+    /// authorized; the host excludes all physical aliases, mounts and
+    /// other writers through commit. Neither of these pins is authority.
+    /// Never unlink a worktree, retire backing objects or change the layout.
+    pub fn verify_source_free_layout(
+        &self,
+        source: &GitSourceLocation,
+        binding: &SourceBinding,
+        layout: &GitSourceFreeLayout,
+    ) -> Result<(Repository, aw_platform::DirectoryIdentity)> {
+        let root = &layout.root;
+        let overlaps = |path: &Path| root.starts_with(path) || path.starts_with(root);
+        if source.name != binding.name
+            || !root.is_absolute()
+            || root.parent().is_none()
+            || overlaps(&source.repository)
+        {
+            return Err(Error::Denied(
+                "source-free layout overlaps or differs from approved source",
+            ));
+        }
+        aw_platform::validate_private_dir(root)?;
+        let pin = aw_platform::DirectoryIdentity::open(root)?;
+        if pin.identity()? != layout.identity || root.canonicalize()? != *root {
+            return Err(Error::Conflict(
+                "approved source-free layout identity changed",
+            ));
+        }
+        let repo =
+            self.verify_materialization(binding, &source.repository, source.repository_identity)?;
+        let identity = repo
+            .identity
+            .as_ref()
+            .ok_or(Error::Storage("Git directory identity unavailable"))?;
+        for (path, directory) in [
+            (&repo.root, &identity.root),
+            (&repo.git_dir, &identity.git_dir),
+            (&repo.common, &identity.common),
+        ] {
+            if overlaps(path) || directory.identity()? == layout.identity {
+                return Err(Error::Denied("source-free layout overlaps Git backing"));
+            }
+        }
+        if fs::read_dir(root)?.next().transpose()?.is_some() || !pin.is_current(root)? {
+            return Err(Error::Conflict(
+                "approved source-free layout is not empty or changed",
+            ));
+        }
+        repo.validate_binding().map_err(git_error)?;
+        Ok((repo, pin))
     }
 
     /// Read-only planning. Persist this exact descriptor in the existing

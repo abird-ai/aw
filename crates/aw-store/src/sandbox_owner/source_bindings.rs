@@ -303,6 +303,44 @@ impl SessionStore {
         binding: Option<&SourceBinding>,
         expected_rev: u64,
     ) -> Result<super::SandboxSnapshot> {
+        self.set_sources(
+            actor,
+            sandbox_ref,
+            name,
+            binding,
+            expected_rev,
+            None::<fn(&super::SandboxSnapshot, &VersionedSourceBinding) -> Result<()>>,
+        )
+    }
+
+    /// Trusted metadata-only realization of sources.set(name, null) for
+    /// the last binding. The existing layout must already be independently
+    /// approved as isolated and source-free, with no retained Agent binding.
+    /// The verifier returns live physical/provider authority held through
+    /// commit. It may observe but must not mutate or reenter the Store.
+    /// Effectful removal still requires the original Prepared custody.
+    pub fn sandbox_sources_detach_final<F>(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+        name: &SourceName,
+        expected_rev: u64,
+        verify: impl FnOnce(&super::SandboxSnapshot, &VersionedSourceBinding) -> Result<F>,
+    ) -> Result<super::SandboxSnapshot> {
+        self.set_sources(actor, sandbox_ref, name, None, expected_rev, Some(verify))
+    }
+
+    fn set_sources<F>(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+        name: &SourceName,
+        binding: Option<&SourceBinding>,
+        expected_rev: u64,
+        verify_final: Option<
+            impl FnOnce(&super::SandboxSnapshot, &VersionedSourceBinding) -> Result<F>,
+        >,
+    ) -> Result<super::SandboxSnapshot> {
         if self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "source binding mutation requires the exclusive Store owner",
@@ -319,6 +357,7 @@ impl SessionStore {
         }
         let key = super::parse_sandbox_ref(sandbox_ref)?;
         let sandbox = key.canonical();
+        let final_fence;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         super::authorize_project(&tx, actor, &key.project, true)?;
@@ -328,25 +367,28 @@ impl SessionStore {
         }
         let bindings = bindings_in(&tx, &sandbox)?;
         let old = bindings.iter().find(|stored| &stored.binding.name == name);
+        if verify_final.is_some() && (bindings.len() > 1 || (!bindings.is_empty() && old.is_none()))
+        {
+            return Err(Error::Conflict(
+                "final detach requires the exact sole source",
+            ));
+        }
         if old.map(|stored| &stored.binding) == binding {
             return super::snapshot_with_sources(&tx, &sandbox);
         }
-        super::require_no_retained_layout_in(
-            &tx,
-            current
-                .tool_root
-                .to_str()
-                .ok_or(Error::Storage("invalid Sandbox tool root"))?,
-            current
-                .working_directory
-                .to_str()
-                .ok_or(Error::Storage("invalid Sandbox working directory"))?,
-        )?;
+        let tool_root = current
+            .tool_root
+            .to_str()
+            .ok_or(Error::Storage("invalid Sandbox tool root"))?;
+        let cwd = current
+            .working_directory
+            .to_str()
+            .ok_or(Error::Storage("invalid Sandbox working directory"))?;
+        super::require_no_retained_layout_in(&tx, tool_root, cwd)?;
         let count = bindings.len() - usize::from(old.is_some()) + usize::from(binding.is_some());
-        if count == 0 {
-            // Removing the last binding must not turn a protected source
-            // layout into an ambient legacy root. Wait for verified
-            // source-free baseline/physical retirement support.
+        if count == 0 && verify_final.is_none() {
+            // Never turn a protected source layout into an ambient root
+            // merely by deleting the last binding row.
             return Err(Error::Conflict(
                 "final source removal requires a verified source-free layout",
             ));
@@ -370,27 +412,21 @@ impl SessionStore {
             .filter(|rev| *rev <= i64::MAX as u64)
             .ok_or(Error::Limit("Sandbox revision exhausted"))?;
 
-        // Source-bearing admission is still held. Never retrofit the first
-        // source into an existing Agent's ambient layout or adopt another
-        // known open root. Physical aliases/cross-Store isolation remain
-        // the trusted host's responsibility.
-        if bindings.is_empty() {
+        // First/last source transitions cannot reinterpret an existing
+        // Agent's ambient layout or another known open layout. Physical
+        // aliases and cross-Store isolation remain the host's responsibility.
+        if bindings.is_empty() || count == 0 {
             let used: bool = db(tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_state_current WHERE sandbox_id=?1)
                  OR EXISTS(SELECT 1 FROM sandboxes_current
-                   WHERE sandbox_id<>?1 AND lifecycle='open' AND tool_root=?2)",
-                params![
-                    sandbox,
-                    current
-                        .tool_root
-                        .to_str()
-                        .ok_or(Error::Storage("invalid Sandbox tool root"))?
-                ],
+                   WHERE sandbox_id<>?1 AND lifecycle='open'
+                     AND (tool_root IN (?2,?3) OR working_directory IN (?2,?3)))",
+                params![sandbox, tool_root, cwd],
                 |row| row.get(0),
             ))?;
             if used {
                 return Err(Error::Conflict(
-                    "initial source attachment requires an unused isolated Sandbox",
+                    "source-bearing layout transition requires an unused isolated Sandbox",
                 ));
             }
         } else {
@@ -420,6 +456,25 @@ impl SessionStore {
             SourceMutationSet::from_bindings(std::slice::from_ref(binding))?
                 .require_unleased_in(&tx)?;
         }
+        final_fence = if count == 0 {
+            let old = old.ok_or(Error::Conflict("final source binding disappeared"))?;
+            self.inner
+                .source_drivers
+                .reader()?
+                .resolve(&old.binding.pin()?)?;
+            let verify = verify_final.ok_or(Error::Conflict(
+                "source-free layout verification unavailable",
+            ))?;
+            Some(verify(
+                &super::snapshot_with_sources(&tx, &sandbox)?,
+                &VersionedSourceBinding {
+                    binding: old.binding.clone(),
+                    binding_rev: old.binding_rev,
+                },
+            )?)
+        } else {
+            None
+        };
         if old.is_some() {
             let changed = db(tx.execute(
                 "DELETE FROM sandbox_source_bindings_current WHERE sandbox_id=?1 AND source_name=?2",
@@ -456,6 +511,7 @@ impl SessionStore {
         )?;
         let result = super::snapshot_with_sources(&tx, &sandbox)?;
         db(tx.commit())?;
+        drop(final_fence);
         Ok(result)
     }
 }

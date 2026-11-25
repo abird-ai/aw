@@ -705,6 +705,160 @@ mod tests {
             expected_agents,
             expected_retained: Some(expected_retained),
         };
+        // The final metadata-only detach may use an independently
+        // reserved empty layout, but never turn a real source checkout
+        // or a shared/used layout into an ambient source-free root.
+        use aw_git::source_driver::GitSourceFreeLayout;
+        let unused_root = root.join("unused-layout");
+        private_dir(&unused_root);
+        let unused = store
+            .sandbox_create_fresh_with_sources(
+                &actor,
+                &source.agent.project_ref,
+                &layout(&unused_root),
+                &bindings[..1],
+            )
+            .unwrap();
+        let name = &bindings[0].name;
+        let approved = GitSourceFreeLayout {
+            root: unused_root.clone(),
+            identity: identity(&unused_root),
+        };
+        let detach = |revision, layout_approval: GitSourceFreeLayout| {
+            crate::source_git::detach_final_source(
+                &store,
+                &driver,
+                &actor,
+                &unused.canonical_ref,
+                name,
+                revision,
+                |snapshot, binding| {
+                    assert_eq!(snapshot.canonical_ref, unused.canonical_ref);
+                    assert_eq!(&binding.binding, &bindings[0]);
+                    assert_eq!(binding.binding_rev, snapshot.sources[0].binding_rev);
+                    Ok((
+                        capture_fence(vec![capture_locations().remove(0)], 2, 0),
+                        layout_approval,
+                    ))
+                },
+            )
+        };
+        let no_verify = |_: &SandboxSnapshot, _: &VersionedSourceBinding| -> Result<()> {
+            panic!("Store refusal/replay must not inspect protected physical locations")
+        };
+        assert!(store
+            .sandbox_sources_set(&actor, &unused.canonical_ref, name, None, unused.rev)
+            .is_err());
+        let set = aw_store::SourceMutationSet::from_bindings(&bindings[..1]).unwrap();
+        let barrier = store
+            .acquire_source_mutation_barrier(&set, "fixture:detach-active")
+            .unwrap();
+        assert!(store
+            .sandbox_sources_detach_final(
+                &actor,
+                &unused.canonical_ref,
+                name,
+                unused.rev,
+                no_verify
+            )
+            .is_err());
+        barrier
+            .settle(aw_store::SourceMutationOutcome::Settled)
+            .unwrap();
+        let shared = store
+            .sandbox_create_fresh(&actor, &unused.project_ref, &layout(&unused_root))
+            .unwrap();
+        assert!(store
+            .sandbox_sources_detach_final(
+                &actor,
+                &unused.canonical_ref,
+                name,
+                unused.rev,
+                no_verify
+            )
+            .is_err());
+        store
+            .sandbox_close(&actor, &shared.canonical_ref, Some(shared.rev))
+            .unwrap();
+        assert!(store
+            .sandbox_sources_detach_final(
+                &actor,
+                &unused.canonical_ref,
+                name,
+                unused.rev + 1,
+                no_verify
+            )
+            .is_err());
+
+        // The actual driver checks physical identity and refuses to
+        // adopt unrelated content in the future source-free layout.
+        let mut wrong = approved.clone();
+        wrong.identity = identity(&source_root.join("code"));
+        assert!(detach(unused.rev, wrong).is_err());
+        fs::write(unused_root.join("protected"), b"keep").unwrap();
+        assert!(detach(unused.rev, approved.clone()).is_err());
+        assert_eq!(fs::read(unused_root.join("protected")).unwrap(), b"keep");
+        fs::remove_file(unused_root.join("protected")).unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &unused.canonical_ref).unwrap(),
+            unused
+        );
+
+        let before_repo = git(
+            &executable,
+            &source_root.join("code"),
+            &["rev-parse", "HEAD"],
+        );
+        let before_index = fs::read(source_root.join("code/.git/index")).unwrap();
+        let detached = detach(unused.rev, approved.clone()).unwrap();
+        assert!(detached.sources.is_empty());
+        assert_eq!(detached.rev, unused.rev + 1);
+        assert_eq!(detached.layout_digest, unused.layout_digest);
+        assert_eq!(detached.tool_root, unused.tool_root);
+        assert_eq!(detached.working_directory, unused.working_directory);
+        assert_eq!(
+            store
+                .sandbox_sources_detach_final(
+                    &actor,
+                    &unused.canonical_ref,
+                    name,
+                    detached.rev,
+                    no_verify
+                )
+                .unwrap(),
+            detached
+        );
+        let reattached = store
+            .sandbox_sources_set(
+                &actor,
+                &unused.canonical_ref,
+                name,
+                Some(&bindings[0]),
+                detached.rev,
+            )
+            .unwrap();
+        assert_eq!(reattached.sources[0].binding_rev, detached.rev + 1);
+        let detached = detach(reattached.rev, approved).unwrap();
+        assert_eq!(detached.rev, reattached.rev + 1);
+        assert!(detached.sources.is_empty());
+        assert_eq!(
+            git(
+                &executable,
+                &source_root.join("code"),
+                &["rev-parse", "HEAD"]
+            ),
+            before_repo
+        );
+        assert_eq!(
+            fs::read(source_root.join("code/.git/index")).unwrap(),
+            before_index
+        );
+        assert_eq!(fs::read(source_root.join("code/tracked")).unwrap(), b"code");
+        assert_eq!(fs::read_dir(&unused_root).unwrap().count(), 0);
+        store
+            .sandbox_close(&actor, &unused.canonical_ref, Some(detached.rev))
+            .unwrap();
+
         let capture_host = GitCheckpointCaptureHost::new(&store, &driver);
         let mut incomplete = capture_locations();
         incomplete.pop();

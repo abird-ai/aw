@@ -53,7 +53,8 @@ baseline restore host consumers, and v59 Agent VaultGrant references with the fi
 staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
 and finite Process quiescence, marked Git private-index scratch reconciliation,
-and exact-subset unpublished Git restore abandonment are implemented locally.
+exact-subset unpublished Git restore abandonment and verified metadata-only final
+source detachment are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2437,14 +2438,38 @@ scoped fmt/diff passed. The initial focused run reached an obsolete fixture asse
 expecting the partial candidate to remain; updated the assertion and retained replay
 after anchor retirement. Earlier broad Store failures remain recorded, not rerun.
 
+Metadata-only final source detachment now uses the original `sandbox.sources.set`
+mutation owner. Trusted `sandbox_sources_detach_final` is its final-null specialization,
+not another RPC or durable operation. Exact sole binding, Project writer, open Sandbox,
+CAS, no retained Agent binding or known shared open layout, complete source-set
+exclusion and legacy run/hazard quiescence precede physical verification. The original
+immediate transaction holds the independently approved verifier guard through commit.
+`source_git::detach_final_source` uses the actual registered Git driver, an independent
+whole-source fence and approved `GitSourceFreeLayout`. Existing cwd/root must be the
+same canonical private empty directory, disjoint from the exact old checkout and Git
+administration/backing directories by path and identity. Host must exclude aliases,
+mounts, other writers and ambient source mappings; pins are not authority. No delete,
+remount, changed layout, Agent admission/rebind or additional receipt. Normal unverified
+final removal still refuses. Exact current-rev empty no-op skips verification, stale
+rev conflicts, reattach mints a fresh binding generation. First-source attachment also
+checks exact shared cwd/root reservations. Existing grouped Store/Host regressions
+cover refusal for retained Agent, live source custody, shared layout, stale rev,
+wrong physical identity and nonempty root; real detach and reattach leave Git HEAD,
+index and files unchanged. Final Sandbox **4/4**, Git repository **32/32**, Git
+library/doc tests, Host **16/16**, strict affected all-target/all-feature Clippy,
+workspace all-target/all-feature check and scoped fmt/diff passed. Earlier broad
+Store failures remain recorded, not rerun. This is only the already-source-free
+layout case; actual materialization removal/replacement still requires Prepared physical effects. Lower
+017 mount/Bubblewrap convergence remains frozen and untouched.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
 reconciliation, multi-source policy, unmarked/ambiguous scratch and non-exact partial
-checkout cleanup, production cleanup composition/physical authority, final-source removal/effectful
-mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
+checkout cleanup, production cleanup composition/physical authority, effectful
+final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v59.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

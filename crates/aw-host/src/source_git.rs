@@ -10,16 +10,55 @@ use crate::{
 };
 use aw_agent_core::{
     AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
-    SandboxDriverRegistry, SourceAccess, SourceDriverHandle, ToolContext,
+    SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext,
 };
-use aw_git::source_driver::GitSourceDriver;
-use aw_store::{SandboxEffectAuthority, SandboxGrantStatus, SessionStore};
+use aw_git::source_driver::{GitSourceDriver, GitSourceFreeLayout};
+use aw_store::{
+    SandboxEffectAuthority, SandboxGrantStatus, SandboxSnapshot, SessionStore,
+    VersionedSourceBinding,
+};
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
 use aw_tools_adapter::{
     native_filesystem::{ExclusionSpec, GrantIdentity, PrivateArtifactRegistry},
     LocalToolOptions,
 };
 use std::sync::Arc;
+
+/// Trusted metadata-only final detach, using the original Sandbox source
+/// mutation owner. The host independently authorizes the exact old source
+/// and already-empty private layout, protecting it from aliasing, external
+/// writers and ambient source mappings through commit. No materialization
+/// is removed and no Agent is activated. The authorization callback must
+/// not reenter the Store while its transaction is held.
+pub fn detach_final_source<F: crate::source_checkpoint::GitSourceFence>(
+    store: &SessionStore,
+    handle: &SourceDriverHandle<GitSourceDriver>,
+    actor: &PrincipalId,
+    sandbox: &str,
+    name: &SourceName,
+    expected_rev: u64,
+    authorize: impl FnOnce(
+        &SandboxSnapshot,
+        &VersionedSourceBinding,
+    ) -> Result<(F, GitSourceFreeLayout)>,
+) -> Result<SandboxSnapshot> {
+    store.sandbox_sources_detach_final(actor, sandbox, name, expected_rev, |snapshot, binding| {
+        let driver = store.source_driver(handle)?;
+        let (fence, layout) = authorize(snapshot, binding)?;
+        let [location] = fence.locations() else {
+            return Err(Error::Denied(
+                "final Git detach requires one independently approved source",
+            ));
+        };
+        if snapshot.tool_root != layout.root || snapshot.working_directory != layout.root {
+            return Err(Error::Denied(
+                "approved source-free layout differs from Sandbox",
+            ));
+        }
+        let pins = driver.verify_source_free_layout(location, &binding.binding, &layout)?;
+        Ok((pins, fence))
+    })
+}
 
 /// Reuse the driver actually registered in the Store. No additional
 /// registry, provider lookup, credential owner or host policy publication.

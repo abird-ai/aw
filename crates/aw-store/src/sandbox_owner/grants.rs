@@ -900,6 +900,17 @@ mod tests {
         assert!(store
             .sandbox_sources_set(&owner, &sandbox, &sources[1].name, None, removed.rev,)
             .is_err());
+        assert!(store
+            .sandbox_sources_detach_final(
+                &owner,
+                &sandbox,
+                &sources[1].name,
+                removed.rev,
+                |_, _| -> Result<()> {
+                    panic!("an existing Agent binding cannot become an ambient layout")
+                }
+            )
+            .is_err());
         let reattached = set(&owner, Some(&sources[0]), removed.rev).unwrap();
         assert_eq!(reattached.sources[0].binding_rev, reattached.rev);
         assert!(store

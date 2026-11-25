@@ -1002,13 +1002,28 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       passed. No new descriptor, schema or dependency. Host namespace protection
       remains required; ambiguous/truncated partial content and uncertain registration
       remain Unknown.
+      **Verified metadata-only final detach landed:** existing source mutation owner
+      accepts final-null only with exact sole binding, unused isolated Sandbox, CAS,
+      Project writer, complete old source exclusion and legacy quiescence. Live verifier
+      guard spans original transaction; no extra receipt. Concrete registered Git host
+      verifies independently approved canonical private empty unchanged cwd/root,
+      disjoint from the exact old checkout and administration/backing by path/identity.
+      No physical deletion, layout change, Agent rebind or admission. Normal unverified
+      final-null still refuses; current-rev empty no-op skips verification, reattachment
+      gets fresh binding revision. Grouped real Store/Host tests cover existing Agent,
+      shared layout, active claim, stale rev, wrong pin, nonempty root and exact detach/
+      reattach preserving original Git state. Sandbox **4/4**, Git repository **32/32**,
+      Git library/doc tests, Host **16/16**, strict affected Clippy, workspace check
+      and scoped fmt/diff passed. Physical alias/writer/mount exclusion is
+      independently host-owned; effectful final removal still pending. Frozen lower
+      mount convergence remains untouched.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production approval provisioning, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, multi-source policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      final-source removal/effectful mutation, remaining Vault broker/socket/file/other env,
+      effectful final-source removal/structural mutation, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v59.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
