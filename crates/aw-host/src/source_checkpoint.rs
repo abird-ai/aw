@@ -732,23 +732,53 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         layout: &SessionBinding,
         authorize: impl FnOnce(&SessionBinding, &SourceSet, &PreparedSourceSet) -> Result<F>,
     ) -> Result<CheckpointRestoreResult> {
+        self.resume_in(actor, request_id, layout, None, authorize)
+    }
+
+    /// Exact captured-source request and layout recovery; no alternate
+    /// baseline, candidate or semantic request can be inspected here.
+    pub fn resume_captured_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        request_id: &str,
+        layout: &SessionBinding,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<CheckpointRestoreResult> {
+        self.resume_in(actor, request_id, layout, Some(request), authorize)
+    }
+
+    fn resume_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        layout: &SessionBinding,
+        request: Option<&CheckpointRestoreRequest>,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<CheckpointRestoreResult> {
         let mut fence = None;
-        let inspected = self.store.checkpoint_inspect_restore(
-            actor,
-            request_id,
-            |registry, anchors, sources| {
-                let approval = authorize(layout, anchors, sources)?;
-                let driver = registry.get(self.driver)?;
-                let result = inspect(
-                    &driver,
-                    SandboxCreateSources::Baseline(anchors),
-                    sources,
-                    &approval,
-                )?;
-                fence = Some(approval);
-                Ok(result)
-            },
-        )?;
+        let inspector = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                         anchors: &SourceSet,
+                         sources: &PreparedSourceSet| {
+            // Keep the authority through the Store's Unknown settlement even
+            // when driver inspection fails, not just on successful inspection.
+            fence = Some(authorize(layout, anchors, sources)?);
+            let driver = registry.get(self.driver)?;
+            inspect(
+                &driver,
+                SandboxCreateSources::Baseline(anchors),
+                sources,
+                fence.as_ref().expect("approved"),
+            )
+        };
+        let inspected = match request {
+            Some(request) => self.store.checkpoint_inspect_captured_restore_exact(
+                actor, request, layout, request_id, inspector,
+            ),
+            None => self
+                .store
+                .checkpoint_inspect_restore(actor, request_id, inspector),
+        }?;
         self.publish(
             inspected,
             layout,

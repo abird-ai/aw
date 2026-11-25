@@ -3,8 +3,10 @@
 use aw::{Error, Result};
 use aw_git::source_driver::GitSourceLocation;
 use aw_platform::DirectoryIdentity;
+use aw_store::SessionStore;
 use fs2::FileExt;
-use std::{fs::File, path::Path};
+use serde::de::DeserializeOwned;
+use std::{fs::File, io::Read, path::Path};
 
 pub(crate) fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
@@ -34,6 +36,42 @@ pub(crate) fn lock_private_approval(path: &Path) -> Result<File> {
     let file = aw_platform::open_private_existing(path, true)?;
     FileExt::try_lock_exclusive(&file).map_err(|_| Error::Conflict("Git approval is busy"))?;
     Ok(file)
+}
+
+/// One bounded, strict typed approval document under the same live lease.
+pub(crate) fn open_private_approval<T: DeserializeOwned>(path: &Path) -> Result<(File, T)> {
+    const MAX_APPROVAL_BYTES: usize = 1024 * 1024;
+    let file = lock_private_approval(path)?;
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_APPROVAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_APPROVAL_BYTES {
+        return Err(Error::Limit("Git approval exceeds 1 MiB"));
+    }
+    let config = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Config("invalid Git maintenance approval".into()))?;
+    Ok((file, config))
+}
+
+pub(crate) fn require_store_scope(
+    store: &SessionStore,
+    directory: &Path,
+    id: &str,
+    generation: u64,
+) -> Result<()> {
+    let process = store.local_process_info()?;
+    if store.directory() != Some(directory)
+        || store.store_id()? != id
+        || process.store_generation != generation
+        || process.process_kind != "owner_lock"
+        || process.state != "active"
+    {
+        return Err(Error::Denied(
+            "Git maintenance approval differs from current Store",
+        ));
+    }
+    Ok(())
 }
 
 /// Do not initialize a missing Store through a maintenance command.

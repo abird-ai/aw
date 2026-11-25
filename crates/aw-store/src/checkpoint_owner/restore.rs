@@ -1467,7 +1467,32 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedCheckpointRestore<'_>> {
-        self.recover_checkpoint_restore(actor, request_id)?
+        self.recover_checkpoint_restore(actor, request_id, None)?
+            .ok_or(Error::Conflict(
+                "checkpoint restore candidate already reconciled",
+            ))?
+            .inspect(inspect)
+    }
+
+    /// Exact captured-source recovery for a host with a current, explicitly
+    /// selected request and layout. Reject changed semantics or layout before
+    /// reclaiming custody or handing original descriptors to a driver.
+    /// Independently selected versioned baselines use their own recovery path.
+    pub fn checkpoint_inspect_captured_restore_exact(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        binding: &SessionBinding,
+        request_id: &str,
+        inspect: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &SourceSet,
+            &PreparedSourceSet,
+        ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
+    ) -> Result<InspectedCheckpointRestore<'_>> {
+        let fingerprint = restore_fingerprint(request, request_id)?;
+        let layout = binding_digest(binding)?;
+        self.recover_checkpoint_restore(actor, request_id, Some((&fingerprint, &layout)))?
             .ok_or(Error::Conflict(
                 "checkpoint restore candidate already reconciled",
             ))?
@@ -1482,7 +1507,7 @@ impl SessionStore {
         request_id: &str,
         reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
-        match self.recover_checkpoint_restore(actor, request_id)? {
+        match self.recover_checkpoint_restore(actor, request_id, None)? {
             Some(restore) => restore.abandon(reconcile),
             None => Ok(()),
         }
@@ -1492,6 +1517,7 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         request_id: &str,
+        exact_captured: Option<(&str, &str)>,
     ) -> Result<Option<PreparedCheckpointRestore<'_>>> {
         label(request_id, 256)?;
         if self.inner.mode != crate::StoreMode::OwnerLock {
@@ -1511,6 +1537,19 @@ impl SessionStore {
                 request_id,
             )?
             .ok_or(Error::Denied("checkpoint restore receipt unavailable"))?;
+            if let Some((fingerprint, layout)) = exact_captured {
+                if receipt.fingerprint != fingerprint
+                    || receipt.restore_boundary.as_ref().is_none_or(|boundary| {
+                        boundary.binding_digest != layout
+                            || boundary.baseline_sources.is_some()
+                            || boundary.has_baseline_selection()
+                    })
+                {
+                    return Err(Error::Denied(
+                        "captured restore request or layout differs from original semantics",
+                    ));
+                }
+            }
             if construction_receipt::is_reconciled_in(&tx, &receipt)? {
                 return Ok(None);
             }

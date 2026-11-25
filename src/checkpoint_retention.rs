@@ -1,7 +1,8 @@
 //! Offline trusted host composition for exact retired Git retention only.
 //! No Agent activation, ambient repository discovery or client RPC authority.
 use crate::git_maintenance::{
-    lock_private_approval, overlaps, pin_private_checkout, require_existing_store,
+    open_private_approval, overlaps, pin_private_checkout, require_existing_store,
+    require_store_scope,
 };
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::{validate_source_set_hard_limit, SourceSet};
@@ -12,11 +13,8 @@ use aw_store::SessionStore;
 use serde::Deserialize;
 use std::{
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
 };
-
-const MAX_APPROVAL_BYTES: usize = 1024 * 1024;
 
 // An independently supplied administrative decision, not a stored SandboxGrant
 // or an authorization inferred from retained source metadata.
@@ -47,16 +45,7 @@ impl Approval {
         let parent = path
             .parent()
             .ok_or(Error::Denied("retention approval directory required"))?;
-        let file = lock_private_approval(path)?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(MAX_APPROVAL_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_APPROVAL_BYTES {
-            return Err(Error::Limit("retention approval exceeds 1 MiB"));
-        }
-        let mut config: Config = serde_json::from_slice(&bytes)
-            .map_err(|_| Error::Config("invalid Git retention approval".into()))?;
+        let (file, mut config): (_, Config) = open_private_approval(path)?;
         if config.version != 1
             || &config.manager != manager
             || config.store_generation == 0
@@ -105,17 +94,7 @@ impl Approval {
 
     fn reconcile(&self, store: &SessionStore) -> Result<()> {
         let c = &self.config;
-        let process = store.local_process_info()?;
-        if store.directory() != Some(c.store_directory.as_path())
-            || store.store_id()? != c.store_id
-            || process.store_generation != c.store_generation
-            || process.process_kind != "owner_lock"
-            || process.state != "active"
-        {
-            return Err(Error::Denied(
-                "retention approval differs from current Store",
-            ));
-        }
+        require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)?;
         reconcile_retired_git(store, &c.manager, &c.checkpoint, |set| self.fence(set))
     }
 
@@ -171,14 +150,16 @@ pub(crate) fn run(path: &Path) -> Result<u8> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::git_maintenance::lock_private_approval;
     use aw_agent_core::{
         CheckpointPolicy, NamedPreparedSource, PreparedSourceSet, SourceAccess,
         SourceDriverRegistry, SourceName, SourceOperationKind,
     };
-    use aw_git::source_driver::GitSourceDriver;
+    use aw_git::source_driver::{GitRestoreLocation, GitSourceDriver};
     use aw_store::{
-        AgentHistoryForkAccess, CheckpointCaptureRequest, CheckpointCaptureSelection,
-        CheckpointRestoreRequest, SessionBinding, SourceMutationOutcome, SourceMutationSet,
+        AgentAdmission, AgentHistoryForkAccess, CheckpointCaptureRequest,
+        CheckpointCaptureSelection, CheckpointRestoreRequest, SessionBinding,
+        SourceMutationOutcome, SourceMutationSet,
     };
     use aw_store_api::SessionBackend;
     use serde_json::json;
@@ -208,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_configured_capture_and_retention_reconcile_exact_git_refs_without_activation() {
+    fn offline_git_checkpoint_lifecycle_uses_exact_approval_without_activation() {
         let temp = Temp(crate::test_support::temp_dir("offline-retention"));
         let root = temp.0.canonicalize().unwrap();
         let repo = root.join("repo");
@@ -428,6 +409,219 @@ mod tests {
             grant_before
         );
         assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
+        // Restore the independently retained fresh checkpoint into named
+        // layouts. No new grant, task, Agent activation or source recapture.
+        let restore_request = CheckpointRestoreRequest {
+            checkpoint: fresh.id.clone(),
+            project: None,
+            title: Some("Offline restored".into()),
+            access: AgentHistoryForkAccess::Private,
+            task: None,
+        };
+        let restore_path = approvals.join("restore.json");
+        let destination = root.join("restored");
+        let interrupted = root.join("restore-interrupted");
+        for path in [&destination, &interrupted] {
+            aw_platform::ensure_private_dir(path).unwrap();
+        }
+        let restore_config = |store: &SessionStore, target: &Path| {
+            json!({
+                "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+                "store_generation":store.local_process_info().unwrap().store_generation,
+                "manager":actor,"checkpoint":fresh.id,"binding":layout(target),
+                "destination_identity":DirectoryIdentity::open(target).unwrap().identity().unwrap(),
+                "repositories":[location],
+            })
+        };
+        let mut restore_file = aw_platform::open_private_new(&restore_path).unwrap();
+        restore_file
+            .write_all(&serde_json::to_vec(&restore_config(&store, &destination)).unwrap())
+            .unwrap();
+        drop(restore_file);
+        let invoke_restore = |store: &SessionStore, path: &Path, id: &str, recover: bool| {
+            crate::checkpoint_restore::restore(store, &actor, path, &restore_request, id, recover)
+        };
+        let verify_restore =
+            |store: &SessionStore, result: &aw_store::CheckpointRestoreResult, target: &Path| {
+                assert_eq!(result.agent.admission, AgentAdmission::Held);
+                assert_eq!(result.agent.project_ref, agent_before.project_ref);
+                // Checkpoint restore creates a fresh local history root,
+                // not a branch/parent-Agent relation.
+                assert_ne!(result.agent.canonical_ref, *agent_ref);
+                assert!(result.agent.parent_agent_ref.is_none());
+                assert!(result.agent.history_content_digest.is_some());
+                assert_eq!(
+                    store
+                        .sandbox_grant_status(&actor, &result.agent.canonical_ref)
+                        .unwrap()
+                        .revision,
+                    0
+                );
+                let sandbox = store
+                    .sandbox_get(&actor, result.agent.sandbox_ref.as_deref().unwrap())
+                    .unwrap();
+                assert_eq!(sandbox.tool_root, target);
+                assert_eq!(sandbox.sources.len(), 1);
+                assert_eq!(sandbox.sources[0].name, location.name);
+                let execution = store
+                    .agent_execution_binding(&actor, &result.agent.canonical_ref)
+                    .unwrap();
+                assert!(store
+                    .actor_queue_list(&actor, execution.session_id())
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    fs::read(target.join("code/tracked")).unwrap(),
+                    b"dirty checkpoint"
+                );
+                assert_eq!(
+                    git(&executable, &target.join("code"), &["rev-parse", "HEAD"]),
+                    head
+                );
+            };
+        fs::write(destination.join("foreign"), b"keep").unwrap();
+        assert!(invoke_restore(&store, &restore_path, "fixture:restore", false).is_err());
+        assert_eq!(fs::read(destination.join("foreign")).unwrap(), b"keep");
+        assert!(!destination.join("code").exists());
+        assert!(store
+            .checkpoint_replay_restore(&actor, &restore_request, "fixture:restore")
+            .unwrap()
+            .is_none());
+        fs::remove_file(destination.join("foreign")).unwrap();
+        let held = lock_private_approval(&restore_path).unwrap();
+        assert!(invoke_restore(&store, &restore_path, "fixture:restore", false).is_err());
+        drop(held);
+        let published = invoke_restore(&store, &restore_path, "fixture:restore", false).unwrap();
+        verify_restore(&store, &published, &destination);
+        assert_eq!(
+            invoke_restore(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:restore",
+                false
+            )
+            .unwrap(),
+            published
+        );
+
+        // Interrupt the original physical worktree creation before Store
+        // publication, then use the exact configured recovery route.
+        let interrupted_layout = layout(&interrupted);
+        let interrupted_config = restore_config(&store, &interrupted);
+        fs::write(
+            &restore_path,
+            serde_json::to_vec(&interrupted_config).unwrap(),
+        )
+        .unwrap();
+        let pending = store
+            .checkpoint_prepare_restore(
+                &actor,
+                &restore_request,
+                &interrupted_layout,
+                "fixture:restore-interrupted",
+                "local",
+                |prepare_id, _, anchors| {
+                    let [anchor] = anchors.anchors.as_slice() else {
+                        panic!("expected exact captured source")
+                    };
+                    let anchor = GitSourceAnchor::try_from(anchor)?;
+                    let selected = GitRestoreLocation {
+                        name: location.name.clone(),
+                        repository: location.repository.clone(),
+                        repository_identity: location.repository_identity,
+                        target: interrupted.join("code"),
+                        parent_identity: DirectoryIdentity::open(&interrupted)?.identity()?,
+                    };
+                    Ok(PreparedSourceSet {
+                        prepare_id: prepare_id.to_owned(),
+                        operation: SourceOperationKind::Restore,
+                        sources: vec![NamedPreparedSource {
+                            name: location.name.clone(),
+                            prepared: driver
+                                .plan_restore_approved(&selected, &anchor, prepare_id)?,
+                        }],
+                    })
+                },
+            )
+            .unwrap();
+        let candidate = pending.prepare_id().to_owned();
+        let candidate_sandbox = pending.sandbox_ref().to_owned();
+        pending.revalidate(&interrupted_layout).unwrap();
+        driver
+            .execute_restore(&pending.sources().sources[0].prepared)
+            .unwrap();
+        pending.mark_unknown().unwrap();
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        assert!(
+            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", false).is_err()
+        );
+        let mut wrong_layout = interrupted_layout.clone();
+        wrong_layout.model_hint = "different model".into();
+        assert!(store
+            .checkpoint_inspect_captured_restore_exact(
+                &actor,
+                &restore_request,
+                &wrong_layout,
+                "fixture:restore-interrupted",
+                |_, _, _| panic!("wrong layout reached driver inspection")
+            )
+            .is_err());
+        let wrong_request = CheckpointRestoreRequest {
+            title: Some("Different title".into()),
+            ..restore_request.clone()
+        };
+        assert!(store
+            .checkpoint_inspect_captured_restore_exact(
+                &actor,
+                &wrong_request,
+                &interrupted_layout,
+                "fixture:restore-interrupted",
+                |_, _, _| panic!("wrong request reached driver inspection")
+            )
+            .is_err());
+        let mut wrong_config = interrupted_config.clone();
+        wrong_config["binding"] = json!(wrong_layout);
+        fs::write(&restore_path, serde_json::to_vec(&wrong_config).unwrap()).unwrap();
+        assert!(
+            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).is_err()
+        );
+        fs::write(
+            &restore_path,
+            serde_json::to_vec(&interrupted_config).unwrap(),
+        )
+        .unwrap();
+        fs::write(interrupted.join("foreign"), b"keep").unwrap();
+        assert!(
+            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).is_err()
+        );
+        assert_eq!(fs::read(interrupted.join("foreign")).unwrap(), b"keep");
+        fs::remove_file(interrupted.join("foreign")).unwrap();
+        let recovered =
+            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).unwrap();
+        verify_restore(&store, &recovered, &interrupted);
+        assert_eq!(
+            recovered.agent.history_content_digest,
+            published.agent.history_content_digest
+        );
+        assert_eq!(
+            recovered.agent.sandbox_ref.as_deref(),
+            Some(candidate_sandbox.as_str())
+        );
+        assert_eq!(
+            store
+                .agent_execution_binding(&actor, &recovered.agent.canonical_ref)
+                .unwrap()
+                .session_id(),
+            candidate
+        );
+        assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
+        assert_eq!(
+            store.sandbox_grant_status(&actor, agent_ref).unwrap(),
+            grant_before
+        );
+
         let reference = format!("refs/aw/checkpoints/{}/code", capture.id);
         let captured = git(&executable, &repo, &["rev-parse", &reference]);
         assert_ne!(captured, head);
@@ -525,6 +719,16 @@ mod tests {
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            invoke_restore(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:restore-interrupted",
+                true
+            )
+            .unwrap(),
+            recovered
+        );
         assert_eq!(
             invoke(
                 &store,

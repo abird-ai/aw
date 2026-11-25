@@ -19,7 +19,78 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: configured offline Git checkpoint capture and exact recovery
+## Latest local implementation delta — 2026-11-25: independently approved captured Git restore and exact recovery
+
+Parent: `c99ff5478d657a56f61cebe50fdef01dfff90ac7` (configured offline
+Git checkpoint capture), signature verified. Original Agent/Turn journal
+and resource CLI owners remain occupied; independent offline restore slice,
+L5 only.
+
+- Production workspace-feature `aw checkpoint-restore --state-dir <state>
+  <approval.json> <checkpoint> <request-id>` with optional `--session-title`
+  and `--agent-recover`. Taskless, same source Project, private history access,
+  explicit local OS principal, existing exclusive Store owner. Uses original
+  captured-source Git Prepared/execute/inspect/publish and original history,
+  fresh Sandbox and Agent owners. Destination Agent remains held; no task,
+  activation, inherited grant or credentials, or inferred destination profile.
+- The restore approval is a separate independent physical/administrative
+  decision, not native filesystem access or retained-source cleanup authority.
+  Strict v1 private JSON (max 1 MiB) fields: `version`, `store_directory`,
+  `store_id`, `store_generation`, `manager`, `checkpoint`, `binding` (the
+  existing full non-secret SessionBinding, explicitly supplied by the host),
+  `destination_identity:[volume,object]`, `repositories` (each `{name,
+  repository,repository_identity:[volume,object]}`). The binding's tool_root
+  and working_directory must equal the exact existing canonical private
+  destination parent, disjoint from approval/Store/origin state. Every
+  captured named Git anchor must match the exact selected repository and
+  checkpoint; targets are direct children named by the SourceName, never
+  arbitrary caller/descriptor locators. Fresh parent must be empty; recovery
+  admits only original named directory entries, with exact driver marker,
+  content and parent identity verification. Independent ordinary private
+  origin checkout roots only, not linked/separate Git administration.
+- Reuse the original offline Git approval lease, typed bounded private file
+  loader, Store scope validation and checkout pins across restore/retention.
+  The live host must independently exclude external writers, aliases,
+  mounts, other Stores and retention users through settlement. Cooperating
+  configuration writers must honor the held advisory lease on the same
+  inode. This is not kernel isolation or automatic physical authority.
+- Applied restore replay precedes configuration/driver/layout inspection;
+  stable `cli:checkpoint-restore:<request-id>` namespace. Explicit recovery
+  checks original semantic request fingerprint AND SessionBinding digest
+  (no alternate baseline) before reclaiming the existing receipt/hazard set
+  or probing a physical location. It inspects and publishes only the
+  original completed restore; incomplete or ambiguous effects remain
+  Unknown. Original generic restore recovery remains compatible. Corrected
+  host recovery to keep the acquired fence alive through failed inspection's
+  Unknown settlement as well as successful publication. No new schema,
+  recovery descriptor, replay ledger or source registry.
+
+Validation (L5, Rust 1.95.0): grouped real offline Git/SQLite
+capture/restore/retention lifecycle 1/1, Store checkpoint owner 4/4,
+Host source-checkpoint lifecycle 1/1. Grouped regression verifies exact
+fresh and recovered worktree content, same retained history with fresh
+local roots, held admission and empty queue, no new grants, refusal of
+foreign destination entries and occupied approval, original candidate
+identity across restart, wrong request/layout refused before inspection,
+terminal replay without the approval/driver, unchanged source HEAD/index/
+worktree and unrelated retention. Initial fixture expected a parent-Agent
+link instead of a fresh history root; corrected to the existing contract.
+Strict Store/Host/CLI all-target/all-feature Clippy, durable lib and minimal
+all-target checks, full binary build, restore/capture/retention help and
+required restore arguments smoke passed. Existing feature-specific warnings
+remain. Unchanged driver/Process groups, broad CLI inventory discrepancy
+and pinned Nix/native-platform qualification not rerun. Only isolated
+fixture worktrees materialized; no real user restore or publication.
+
+Next: exact live source-aware Actor/Turn admission if original owners are
+free; otherwise original incomplete-capture/restore reconciliation and
+remaining independent authority paths. Offline restore does not expose
+source-bearing Actor admission, task-bearing/cross-Project restore, native
+policy/grant publication, general physical containment, protected source
+metadata or abandonment/cleanup CLI. Retain original source/driver custody
+until exact proof; no blind retry or broad prune.
+
+## Previous local implementation delta — 2026-11-25: configured offline Git checkpoint capture and exact recovery
 
 Parent: `0c9eab3e8566fb9fc3fddc6a7a708f9b2dbd05ed` (offline Git retention
 reconciliation), signature verified. Agent/Turn journal and resource CLI

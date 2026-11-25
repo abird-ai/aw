@@ -5,6 +5,8 @@ mod awnet;
 #[cfg(feature = "workspace")]
 mod checkpoint_capture;
 #[cfg(feature = "workspace")]
+mod checkpoint_restore;
+#[cfg(feature = "workspace")]
 mod checkpoint_retention;
 #[cfg(all(feature = "device", target_os = "linux"))]
 mod device;
@@ -118,6 +120,12 @@ enum TopCommand {
     CheckpointCapture {
         #[command(flatten)]
         args: checkpoint_capture::Args,
+    },
+    /// Restore an exact captured Git checkpoint into a fresh private layout.
+    #[cfg(feature = "workspace")]
+    CheckpointRestore {
+        #[command(flatten)]
+        args: checkpoint_restore::Args,
     },
     /// Offline Git retention reconciliation for one retired checkpoint.
     #[cfg(feature = "workspace")]
@@ -1677,6 +1685,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::CheckpointRetention { approval } => checkpoint_retention::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
+        #[cfg(feature = "workspace")]
+        TopCommand::CheckpointRestore { args } => checkpoint_restore::run(args),
         TopCommand::Session { command } => match command {
             resources_cli::SessionCommand::Open { session, run } => {
                 let mut run = run.into_run(None);
