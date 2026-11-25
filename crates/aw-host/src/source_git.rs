@@ -2,7 +2,10 @@
 //! supplied by the authority owner; a stored SandboxGrant is never a grant
 //! to probe or mount arbitrary Git materialization locators.
 use crate::{
-    source_approval::{NativeSourceApproval, NativeSourceApprovalGuard},
+    source_approval::{
+        NativeSourceApproval, NativeSourceApprovalGuard, NativeSourceApprovalSpec,
+        NativeSourceDirectorySpec,
+    },
     source_filesystem::{
         ApprovedSourceLayout, NativeFilesystemDriver, NativeSourceAdmission, NativeSourceRoot,
         SourceFilesystemRoute,
@@ -13,14 +16,14 @@ use aw_agent_core::{
     SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext, ToolEffect,
     ToolSourceEvidence,
 };
-use aw_git::source_driver::{GitSourceDriver, GitSourceFreeLayout};
+use aw_git::source_driver::{GitSourceDriver, GitSourceFreeLayout, GitSourceLocation};
 use aw_store::{
     SandboxEffectAuthority, SandboxEffectOutcome, SandboxGrantStatus, SandboxSnapshot,
     SandboxToolRecovery, SessionStore, VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
 use aw_tools_adapter::{
-    native_filesystem::{reopen_source_artifacts, ExclusionSpec, GrantIdentity},
+    native_filesystem::{reopen_source_artifacts, ExclusionSpec, GrantIdentity, GrantSpec},
     LocalToolOptions,
 };
 use std::{
@@ -64,6 +67,16 @@ pub fn detach_final_source<F: crate::source_checkpoint::GitSourceFence>(
     })
 }
 
+/// A trusted host's independently authorized source selection. The
+/// observed binding revision, exact physical location and ceiling must
+/// come from the host's current authority, not persisted grant evidence.
+#[derive(Clone, Debug)]
+pub struct GitSourceApprovalDirectory {
+    pub location: GitSourceLocation,
+    pub binding_rev: u64,
+    pub access: SourceAccess,
+}
+
 /// Reuse the driver actually registered in the Store. No additional
 /// registry, provider lookup, credential owner or host policy publication.
 pub struct GitNativeSourceResolver {
@@ -75,6 +88,129 @@ impl GitNativeSourceResolver {
     pub fn new(store: SessionStore, driver: SourceDriverHandle<GitSourceDriver>) -> Result<Self> {
         store.source_driver(&driver)?;
         Ok(Self { store, driver })
+    }
+
+    /// Provision a live native approval from explicit, independently
+    /// authorized physical sources. The trusted host transfers its
+    /// approval decision to the returned owner (withdraw with revoke);
+    /// it must exclude aliases/mounts and protect artifact state. Never
+    /// infer this approval from a stored SandboxGrant or a model path.
+    /// Only durable artifact namespaces are provisioned, no source effect.
+    /// Grant publication is a separate existing CAS operation.
+    pub fn provision_approval(
+        &self,
+        manager: &PrincipalId,
+        expected_sandbox_rev: u64,
+        mut spec: NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
+        state_root: &Path,
+    ) -> Result<NativeSourceApproval> {
+        self.store
+            .source_set_limit()
+            .admit(spec.directories.len())?;
+        spec.directories
+            .sort_unstable_by(|a, b| a.location.name.as_str().cmp(b.location.name.as_str()));
+        let names = spec
+            .directories
+            .iter()
+            .map(|directory| directory.location.name.clone())
+            .collect::<Vec<_>>();
+        let (sandbox, sources) = self.store.sandbox_grant_sources(
+            manager,
+            &spec.actor,
+            &spec.agent_ref,
+            expected_sandbox_rev,
+            &names,
+        )?;
+        if sandbox.tool_root != spec.base
+            || (spec.directories.len() == 1
+                && spec.directories[0].location.repository == spec.base
+                && sandbox.sources.len() != 1)
+        {
+            return Err(Error::Denied(
+                "native source approval differs from Sandbox layout",
+            ));
+        }
+        let driver = self.store.source_driver(&self.driver)?;
+        let mut repos = Vec::with_capacity(sources.len());
+        // Verify the entire selected set before creating artifact state.
+        for (source, directory) in sources.iter().zip(&spec.directories) {
+            let location = &directory.location;
+            crate::source_filesystem::require_named_root(
+                &spec.base,
+                &location.name,
+                &location.repository,
+                names.len(),
+            )?;
+            if source.binding.name != location.name
+                || source.binding_rev != directory.binding_rev
+                || !source.binding.access.permits(directory.access)
+                || &source.binding.driver != self.driver.driver()
+            {
+                return Err(Error::Denied("approved native source binding changed"));
+            }
+            repos.push(driver.verify_materialization(
+                &source.binding,
+                &location.repository,
+                location.repository_identity,
+            )?);
+        }
+        let directories = sources
+            .iter()
+            .zip(&spec.directories)
+            .map(|(source, directory)| {
+                let grant = match directory.access {
+                    SourceAccess::ReadOnly => GrantSpec::read(&directory.location.repository),
+                    SourceAccess::ReadWrite => {
+                        GrantSpec::read_write(&directory.location.repository)
+                    }
+                };
+                NativeSourceDirectorySpec::durable(source.clone(), grant, state_root)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let approval = NativeSourceApproval::pin(
+            self.store.clone(),
+            NativeSourceApprovalSpec {
+                agent_ref: spec.agent_ref,
+                actor: spec.actor,
+                policy_ref: spec.policy_ref,
+                authority_ref: spec.authority_ref,
+                authority_generation: spec.authority_generation,
+                base: spec.base,
+                directories,
+            },
+        )?;
+        {
+            let guard = approval.read()?;
+            for (root, directory) in guard.roots().iter().zip(&spec.directories) {
+                let location = &directory.location;
+                if root.physical.path != location.repository
+                    || (root.physical.volume, root.physical.object) != location.repository_identity
+                {
+                    return Err(Error::Conflict(
+                        "approved native source changed during pinning",
+                    ));
+                }
+            }
+            // No stale metadata can silently follow a name during setup.
+            // The existing grant CAS rechecks the exact binding pins again.
+            let (current, current_sources) = self.store.sandbox_grant_sources(
+                manager,
+                &guard.policy().actor,
+                &guard.policy().agent_ref,
+                expected_sandbox_rev,
+                &names,
+            )?;
+            if current != sandbox
+                || current_sources != sources
+                || guard.policy().sandbox_ref != sandbox.canonical_ref
+            {
+                return Err(Error::Conflict(
+                    "native source approval changed during provisioning",
+                ));
+            }
+        }
+        drop(repos);
+        Ok(approval)
     }
 
     /// Blocking, read-only preparation. Called by the native route on a

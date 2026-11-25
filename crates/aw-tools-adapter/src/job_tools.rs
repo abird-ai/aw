@@ -2503,10 +2503,20 @@ mod tests {
             .execute(ctx.clone(), &json!({"ref":node}))
             .await
             .unwrap();
-        assert!(finished.content.starts_with("j:"));
-        assert!(finished
-            .content
-            .ends_with(" unchanged ack=all released=true"));
+        let (receipt, provenance) = finished.content.split_once(" provenance=").unwrap();
+        assert!(receipt.starts_with("j:"));
+        assert!(receipt.ends_with(" unchanged ack=all released=true"));
+        let provenance: serde_json::Value = serde_json::from_str(provenance).unwrap();
+        let expected = host.finite_job_provenance(&id).unwrap();
+        assert_eq!(
+            provenance,
+            json!({
+                "job": expected.canonical_job_ref,
+                "agent": expected.original_agent_ref,
+                "turn": expected.original_turn,
+                "actor": expected.initiating_actor,
+            })
+        );
         let again = ack
             .execute(ctx.clone(), &json!({"ref":node}))
             .await

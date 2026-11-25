@@ -55,7 +55,8 @@ projection, interrupted source-effect custody recovery and worker-owned native
 and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
 source detachment, independently approved multi-source native filesystem
-realization and durable native artifact custody/recovery are implemented locally.
+realization, durable native artifact custody/recovery and exact Store-backed Git
+native approval provisioning are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2539,11 +2540,45 @@ failure pre-existing or the adapter suite fully green. Previously recorded Store
 failures not rerun. This does not claim a real process crash at every boundary or
 production Bubblewrap containment.
 
+Trusted Git native approval provisioning now resolves the original current Store
+bindings rather than requiring a copied complete binding payload or a prior grant.
+`sandbox_grant_sources` checks Project writer, exact canonical open Agent/Sandbox,
+actor Submit, exact expected Sandbox rev, bounded nonempty unique named selection
+and live SourceDriver compatibility in one read transaction. This is trusted host
+input only; caller must already independently authorize source metadata. No raw
+locators added to ordinary metadata responses and no grant written. The generic
+`NativeSourceApprovalSpec<D>` reuses the original subject/generation/base fields;
+`GitSourceApprovalDirectory` carries independently approved exact location,
+binding revision and access. `GitNativeSourceResolver::provision_approval` verifies
+complete selected bindings, exact named layout, modes, registered Git implementation
+and physical identities before provisioning durable artifact namespaces. It retains
+Git pins through original NativeSourceApproval construction, checks the actual pins
+and rereads the exact current Store observation before returning the live revocable
+approval. The caller transfers independent host authority into that approval, not a
+copy of persisted grant evidence. Existing explicit grant CAS remains the only
+publication owner and revalidates actor and binding generations. No auto-activation,
+new registry, persistence, or physical source mutation. Host must still independently
+exclude mounts/aliases/external writers and own the decision; no automatic discovery
+of authority or public protected metadata endpoint. Grouped existing Store/Host
+regressions cover denied manager, stale revision, duplicate selection, wrong physical
+pin, no artifact state on these refusals, actual two-source approval and subsequent
+ordinary grant/route/recovery. Generic non-Git approval API remains usable.
+Final Sandbox **4/4**, non-Git native **1/1**, Host **16/16**, strict Store/Adapter/Host
+all-target/all-feature Clippy and Host source-effects-only Clippy, workspace
+all-target/all-feature check and scoped fmt/diff passed.
+
+The prior adapter failure was a stale test assertion: finite-Job ACK receipts append
+the canonical provenance suffix. The grouped skipped-node test now checks the exact
+ACK portion and parses/verifies the existing provenance fields; idempotent ACK and
+nonexistent explicit stream refusal remain unchanged. No Job runtime change.
+Isolated ACK regression and complete adapter library **255/255** passed. Previous
+Store-wide legacy failures were not rerun.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
-host approval provisioning, other effectful baseline materialization, broader Run-hazard
+production host policy/physical authority configuration, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, remaining production physical authority/cleanup, effectful
 final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider

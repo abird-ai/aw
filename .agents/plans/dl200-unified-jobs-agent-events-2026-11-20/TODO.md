@@ -1051,11 +1051,27 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Clippy (including Host source-effects-only), workspace and scoped fmt/diff
       passed. Adapter broad **254/255**; unchanged `skipped_node_read_does_not_wait_for_sibling`
       acknowledgement assertion fails isolated rerun too; parent not rerun, no
-      full adapter green or proven pre-existing failure claim.
+      full adapter green or proven pre-existing failure claim at that checkpoint.
+      **Exact Store-backed native approval provisioning landed:** trusted read of
+      exact named bindings from original owner, Project writer + actor Submit + open
+      canonical Agent/Sandbox + rev + registered schemas; independent host must
+      authorize metadata and exact physical location/revision/modes. Git resolver
+      checks whole selection before durable artifact provisioning, pins through live
+      approval creation, verifies actual roots and exact current Store observation.
+      Existing grant publication CAS remains separate and revalidates the actual
+      source/actor pins. No raw public metadata, implicit grant, new persistence or
+      admission. Original generic approval spec reused; no separate policy registry.
+      Existing Store/Host regressions cover wrong manager, stale/duplicate selection,
+      wrong physical pin, no state on refusal, actual two-source grant and recovery.
+      Previous Job ACK failure was an obsolete suffix assertion; corrected to verify
+      ACK and canonical provenance together, with no runtime change. Final adapter
+      **255/255**, Sandbox **4/4**, non-Git native **1/1**, Host **16/16**, strict
+      affected Clippy (both Host feature variants), workspace check and scoped
+      fmt/diff passed. Earlier Store-wide legacy failures not rerun.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
-      Production approval provisioning, complete Job/Process containment/dispatch,
+      Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
       effectful final-source removal/structural mutation, remaining Vault broker/socket/file/other env,

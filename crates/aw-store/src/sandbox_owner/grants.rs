@@ -311,6 +311,45 @@ fn grant_audit(
 }
 
 impl SessionStore {
+    /// Trusted host input to a new independent source approval, not a
+    /// grant or model-facing metadata API. The caller must independently
+    /// authorize the exact selected sources and metadata before use.
+    /// No current SandboxGrant is required or consulted; its eventual
+    /// publication still revalidates every binding pin and actor.
+    pub fn sandbox_grant_sources(
+        &self,
+        manager: &PrincipalId,
+        actor: &PrincipalId,
+        agent_ref: &str,
+        expected_sandbox_rev: u64,
+        names: &[SourceName],
+    ) -> Result<(super::SandboxSnapshot, Vec<VersionedSourceBinding>)> {
+        label(agent_ref, 2048)?;
+        if names.is_empty() {
+            return Err(Error::Denied("source approval requires a named selection"));
+        }
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let (session, branch) = agent_owner::key_for_ref(&tx, agent_ref)?;
+        let key = AgentKey::new(&session, &branch);
+        let sandbox = binding_in(&tx, key)?;
+        authorize_project(&tx, manager, &parse_sandbox_ref(&sandbox)?.project, true)?;
+        agent_owner::authorize_permission(&tx, actor, key, AgentPermission::Submit)?;
+        require_open_binding_in(&tx, key, &sandbox)?;
+        if agent_owner::canonical_ref(&tx, key)? != agent_ref {
+            return Err(Error::Denied(
+                "source approval requires the exact Agent reference",
+            ));
+        }
+        let current = super::snapshot_with_sources(&tx, &sandbox)?;
+        if current.rev != expected_sandbox_rev {
+            return Err(Error::Conflict("Sandbox changed before source approval"));
+        }
+        let sources = selected_bindings(self, &tx, &sandbox, names)?;
+        db(tx.commit())?;
+        Ok((current, sources))
+    }
+
     /// Trusted host only: the caller must independently authorize the
     /// policy, exact actor and every source ceiling. Project creation/manage
     /// authority alone cannot manufacture that policy. None revokes, and
@@ -708,6 +747,46 @@ mod tests {
         }
         let before = store.agent_get(&owner, &reference).unwrap();
         let before_sandbox = store.sandbox_get(&owner, &sandbox).unwrap();
+        // Protected inputs for a new independent approval come from the
+        // original owner, not from an already-published grant. Selection
+        // is exact and canonical, never widened to a whole layout.
+        let names = [sources[1].name.clone(), sources[0].name.clone()];
+        let (layout, selected) = store
+            .sandbox_grant_sources(&owner, &owner, &reference, before_sandbox.rev, &names)
+            .unwrap();
+        assert_eq!(layout, before_sandbox);
+        assert_eq!(
+            selected,
+            sources
+                .iter()
+                .cloned()
+                .map(|binding| VersionedSourceBinding {
+                    binding,
+                    binding_rev: 1,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(store
+            .sandbox_grant_sources(&participant, &owner, &reference, before_sandbox.rev, &names,)
+            .is_err());
+        assert!(store
+            .sandbox_grant_sources(&owner, &owner, &reference, before_sandbox.rev + 1, &names,)
+            .is_err());
+        assert!(store
+            .sandbox_grant_sources(
+                &owner,
+                &owner,
+                &reference,
+                before_sandbox.rev,
+                &[names[0].clone(), names[0].clone()],
+            )
+            .is_err());
+        assert!(
+            !store
+                .sandbox_grant_status(&owner, &reference)
+                .unwrap()
+                .active
+        );
         let mut policy = SandboxGrantPolicy {
             agent_ref: reference.clone(),
             sandbox_ref: sandbox.clone(),

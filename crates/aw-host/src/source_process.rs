@@ -1308,15 +1308,16 @@ mod tests {
 
     #[tokio::test]
     async fn native_source_route_uses_pinned_capability_and_original_receipt() {
-        use crate::source_approval::{
-            NativeSourceApproval, NativeSourceApprovalSpec, NativeSourceDirectorySpec,
-        };
+        use crate::source_approval::NativeSourceApprovalSpec;
+        #[cfg(not(feature = "git-source-effects"))]
+        use crate::source_approval::{NativeSourceApproval, NativeSourceDirectorySpec};
         #[cfg(not(feature = "git-source-effects"))]
         use crate::source_filesystem::{ApprovedSourceLayout, NativeSourceAdmission};
         use crate::source_filesystem::{NativeFilesystemDriver, SourceFilesystemRoute};
         #[cfg(feature = "git-source-effects")]
         use crate::source_git::{
-            GitNativeSourceHost, GitNativeSourceResolver, NativeSourceRecoveryTarget,
+            GitNativeSourceHost, GitNativeSourceResolver, GitSourceApprovalDirectory,
+            NativeSourceRecoveryTarget,
         };
         use aw_agent_core::{
             AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
@@ -1617,6 +1618,58 @@ mod tests {
             .create(&artifact_state)
             .unwrap();
         let artifact_state = artifact_state.canonicalize().unwrap();
+        #[cfg(feature = "git-source-effects")]
+        let resolver = GitNativeSourceResolver::new(store.clone(), git_handle.clone()).unwrap();
+        #[cfg(feature = "git-source-effects")]
+        let approval = {
+            use aw_git::source_driver::GitSourceLocation;
+            use std::os::unix::fs::MetadataExt;
+            let approved_directory = |name: &str, path: &std::path::Path, access| {
+                let meta = std::fs::metadata(path).unwrap();
+                GitSourceApprovalDirectory {
+                    location: GitSourceLocation {
+                        name: SourceName::new(name).unwrap(),
+                        repository: path.to_owned(),
+                        repository_identity: (meta.dev(), meta.ino()),
+                    },
+                    binding_rev: 1,
+                    access,
+                }
+            };
+            let spec = || NativeSourceApprovalSpec {
+                agent_ref: reference.clone(),
+                actor: actor.clone(),
+                policy_ref: "host:fixture-native".into(),
+                authority_ref: "host:fixture-native-authority".into(),
+                authority_generation: 1,
+                base: base.clone(),
+                // Reverse independent selection; exact Store bindings
+                // must be resolved and checked before any artifact state.
+                directories: vec![
+                    approved_directory("data", &data, SourceAccess::ReadOnly),
+                    approved_directory("code", &root, SourceAccess::ReadWrite),
+                ],
+            };
+            assert!(resolver
+                .provision_approval(&actor, sandbox.rev + 1, spec(), &artifact_state)
+                .is_err());
+            let mut wrong = spec();
+            wrong.directories[0].binding_rev += 1;
+            assert!(resolver
+                .provision_approval(&actor, sandbox.rev, wrong, &artifact_state)
+                .is_err());
+            let mut wrong = spec();
+            wrong.directories[0].location.repository_identity =
+                wrong.directories[1].location.repository_identity;
+            assert!(resolver
+                .provision_approval(&actor, sandbox.rev, wrong, &artifact_state)
+                .is_err());
+            assert_eq!(std::fs::read_dir(&artifact_state).unwrap().count(), 0);
+            resolver
+                .provision_approval(&actor, sandbox.rev, spec(), &artifact_state)
+                .unwrap()
+        };
+        #[cfg(not(feature = "git-source-effects"))]
         let approval = NativeSourceApproval::pin(
             store.clone(),
             NativeSourceApprovalSpec {
@@ -1674,8 +1727,6 @@ mod tests {
                 NativeFilesystemDriver,
             )
             .unwrap();
-        #[cfg(feature = "git-source-effects")]
-        let resolver = GitNativeSourceResolver::new(store.clone(), git_handle.clone()).unwrap();
         #[cfg(feature = "git-source-effects")]
         let host = GitNativeSourceHost::new(
             approval.clone(),

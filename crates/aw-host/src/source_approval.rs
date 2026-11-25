@@ -22,14 +22,14 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 /// Explicit trusted-host approval. None of these inputs are model arguments
 /// or reconstructed from a persisted SandboxGrant. The host owns the stable
 /// authority identity/generation and must not reuse a revoked generation.
-pub struct NativeSourceApprovalSpec {
+pub struct NativeSourceApprovalSpec<D = NativeSourceDirectorySpec> {
     pub agent_ref: String,
     pub actor: PrincipalId,
     pub policy_ref: String,
     pub authority_ref: String,
     pub authority_generation: u64,
     pub base: PathBuf,
-    pub directories: Vec<NativeSourceDirectorySpec>,
+    pub directories: Vec<D>,
 }
 
 pub struct NativeSourceDirectorySpec {
