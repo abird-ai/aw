@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: production Git SourceDriver owner-open registration (this local checkpoint; signed parent `def7bba2549567dce1c06877fd1d59857f7ea213`, trusted local shell containment). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: persistent signing Vault provisioning (this local checkpoint; signed parent `e2f3e667fd7438bb317f0fccb19e8e0dfcf48288`, production Git SourceDriver owner-open registration). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1263,6 +1263,18 @@ Current implementation: production Git SourceDriver owner-open registration (thi
       owner remains occupied, so its separate open paths still need composition.
       Original source-bearing admission stays held; no automatic recovery or
       physical authority from the installed definition.
+      **Persistent signing Vault provisioning landed:** explicit trusted
+      existing private config/key backend activation, no initialization or
+      secret copies. Reuses exact provider policy/registry/grants, broker and
+      Process projection. Configured keys remain with configuration owner;
+      live revoke does not delete them. Host must withdraw live authority
+      before editing persistent config. Fresh authority on explicit restart,
+      old grants stale, key-ref substitution denied at attach/use. No implicit
+      product startup/CLI grant, physical isolation or new schema. Signing
+      2/2, SecretStore 6/6, original source Process host 2/2, strict Store/Host
+      Clippy, full product check and scoped fmt/diff passed (L5 Rust 1.95.0;
+      pinned Nix and platform-native qualification not rerun). Journal and
+      resource-CLI owners remain occupied. Source-bearing admission held.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

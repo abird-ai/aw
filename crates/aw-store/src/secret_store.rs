@@ -104,7 +104,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(out)
 }
 
-fn read_private_file(path: &Path, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_private_file(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut file = aw_platform::open_private_existing(path, false).map_err(Error::Io)?;
     let mut bytes = Vec::new();
     (&mut file).take(max as u64 + 1).read_to_end(&mut bytes)?;
@@ -172,8 +172,37 @@ impl LocalSecretStore {
             }
             Err(error) => return Err(error),
         });
+        Self::from_master(state_dir, items, &master)
+    }
+
+    /// Open an existing encrypted backend without initializing directories or
+    /// generating a replacement master key. For explicit provider activation.
+    pub fn open_existing(state_dir: &Path) -> Result<Self> {
+        if !aw_platform::secure_private_files_supported() {
+            return Err(Error::Denied(
+                "local encrypted SecretStore requires platform-verified owner-only private files",
+            ));
+        }
+        let root = state_dir.join("secrets");
+        let items = root.join("items");
+        for directory in [state_dir, root.as_path(), items.as_path()] {
+            aw_platform::validate_private_dir(directory).map_err(Error::Io)?;
+        }
+        let master = Zeroizing::new(
+            read_private_file(&root.join("master.key"), MASTER_KEY_LEN)?
+                .try_into()
+                .map_err(|_| Error::Storage("SecretStore master key has invalid length"))?,
+        );
+        Self::from_master(state_dir, items, &master)
+    }
+
+    fn from_master(
+        state_dir: &Path,
+        items: PathBuf,
+        master: &[u8; MASTER_KEY_LEN],
+    ) -> Result<Self> {
         let key = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, master.as_ref())
+            UnboundKey::new(&CHACHA20_POLY1305, master)
                 .map_err(|_| Error::Storage("cannot initialize SecretStore cipher"))?,
         );
         Ok(Self {

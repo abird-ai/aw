@@ -18,7 +18,66 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: install production Git SourceDriver at owner open
+## Latest local implementation delta — 2026-11-25: persistent signing Vault provisioning
+
+Parent: `e2f3e667fd7438bb317f0fccb19e8e0dfcf48288` (production Git SourceDriver
+owner-open registration). Parent signature and clean owned paths verified.
+The original Agent/Turn journal owners and resource CLI remain occupied; this
+cut consumes the existing VaultProvider, VaultGrant and Process projection
+primitives independently without promoting source-bearing admission.
+
+- `LocalSecretStore::open_existing` is a reusable no-initialization open of an
+  existing private encrypted backend. Missing directories/master never cause
+  creation or replacement. Normal `open` retains its existing initialization
+  contract; both paths share the same cipher construction.
+- `SigningVaultProvider::open_configured(store, root)` explicitly loads an
+  existing owner-private `root/signing.json` and dedicated encrypted backend.
+  Requires an exclusive durable Store owner, canonical private provider root
+  separate from the Store's canonical directory, bounded v1 config (1 MiB,
+  1024 entries), distinct entry IDs/key refs, and exact registered subjects,
+  scopes, supported projections and valid signing keys. No partial provider is
+  returned on failure. The host registers the result in the existing
+  `VaultProviderRegistry`; no implicit discovery, Agent grant, secret copy or
+  new database. No provider config or raw key bytes belong in Agent state.
+- Host configuration shape: `version: 1`, `provider: DriverKey`, `entries`;
+  each entry contains `entry`, `key_ref` (existing opaque SecretStore version),
+  `agent_ref`, `name`, `projection` (broker/env), `scope`, `actor`, `manager`.
+  `provider` uses the existing DriverKey JSON representation. The config owner
+  provisions the dedicated key via the existing SecretStore before activation.
+  The provider root and its ancestors must be independently protected from
+  Agent access and other writers; the lexical Store-root check is not physical
+  mount/alias containment. No automatic product/CLI activation or file watcher.
+- Configured mode retains external key-version custody; dynamic `provision`
+  is refused, live `revoke` removes the decision without deleting configured
+  key material. Withdraw live authority before changing persistent config;
+  durable withdrawal requires the host to remove the entry from config as
+  well. Explicit reactivation mints fresh provider authority; old Agent grants
+  remain stale until current manager explicitly attaches again. There is no
+  automatic config reload or regrant. This is not retroactive erasure of
+  already materialized Process proofs.
+- Both managed and configured signing use the same entry policy construction,
+  provider-held live guard and key retrieval. In-memory key digest rejects
+  delete/reuse of a key ref with changed bytes at attachment and actual
+  broker/Process proof generation. No digest persisted or publicly projected.
+  Rotation/revocation stays with the original provider owner.
+
+Validation on L5, installed Rust 1.95.0: signing Vault **2/2** (new real
+configured backend/restart plus existing managed-provider regression),
+SecretStore **6/6**, original source Process host **2/2**, strict Store/Host
+all-target/all-feature Clippy, full product all-target/all-feature check,
+scoped fmt/diff passed. No pinned Nix 1.98.1 or Windows/Bubblewrap qualification
+claimed; unchanged broad suites not rerun. Shared checkout builds include
+concurrent dependency changes; commit tree includes exact owned paths only.
+Store v60, Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+ownership is available. Resource CLI still needs startup composition with its
+owner. Otherwise choose one actual independent physical-authority/provisioning
+or containment consumer; do not treat configured provider or installed driver
+as source execution authority. Remaining Vault projections/host integration
+and public surface remain held pending actual authority.
+
+## Previous local implementation delta — 2026-11-25: install production Git SourceDriver at owner open
 
 Parent: `def7bba2549567dce1c06877fd1d59857f7ea213` (trusted local shell
 containment). Verified the previous signed checkpoint and clean owned paths.

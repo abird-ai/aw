@@ -7,18 +7,49 @@ use crate::{
     VaultGrantTarget,
 };
 use aw_agent_core::{
-    DriverKey, PrincipalId, SourceName, VaultProjection, VaultProviderHandle,
+    DriverKey, PrincipalId, SourceName, VaultEntryRef, VaultProjection, VaultProviderHandle,
     VaultProviderRegistry, VaultProviderRegistryReader,
 };
 use ring::hmac;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::RwLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::RwLock,
+};
+
+const MAX_ENTRIES: usize = 1024;
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+// Host-only provider configuration; no secret bytes or model-selected paths.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SigningConfig {
+    version: u16,
+    provider: DriverKey,
+    entries: Vec<ConfiguredEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredEntry {
+    entry: String,
+    key_ref: String,
+    agent_ref: String,
+    name: SourceName,
+    projection: VaultProjection,
+    scope: String,
+    actor: PrincipalId,
+    manager: PrincipalId,
+}
 
 struct Entry {
     policy: VaultGrantPolicy,
     manager: PrincipalId,
     manager_user: String,
     key_ref: String,
+    key_digest: [u8; 32],
 }
 
 #[derive(Default)]
@@ -36,6 +67,7 @@ pub struct SigningVaultProvider<S = LocalSecretStore> {
     provider: DriverKey,
     authority_ref: String,
     keys: S,
+    managed_keys: bool,
     state: RwLock<State>,
 }
 
@@ -60,6 +92,86 @@ impl VaultGrantAuthority for Authority<'_> {
     }
 }
 
+impl SigningVaultProvider<LocalSecretStore> {
+    /// Explicit trusted host activation from a dedicated, existing provider
+    /// directory. `signing.json` selects exact entries, actors, managers and
+    /// immutable SecretStore key versions; no key material in configuration.
+    ///
+    /// The configuration owner must protect this directory and its ancestors
+    /// from Agent access and external writers. Editing configuration is not a
+    /// live revocation: withdraw the live provider decision first, then update
+    /// configuration and explicitly activate a new provider. Restart always
+    /// creates a new authority identity; previous Agent grants stay stale.
+    pub fn open_configured(store: &SessionStore, root: &Path) -> Result<Self> {
+        if store.inner.mode != crate::StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "configured signing Vault requires an exclusive Store owner",
+            ));
+        }
+        let state = store.directory().ok_or(Error::Denied(
+            "configured signing Vault requires durable state",
+        ))?;
+        if !root.is_absolute() || root.canonicalize()? != root {
+            return Err(Error::Denied(
+                "configured signing Vault requires its exact canonical provider directory",
+            ));
+        }
+        if root.starts_with(state) || state.starts_with(root) {
+            return Err(Error::Denied(
+                "signing Vault requires separate provider key custody",
+            ));
+        }
+        aw_platform::validate_private_dir(root)?;
+        let config: SigningConfig = serde_json::from_slice(
+            &crate::secret_store::read_private_file(&root.join("signing.json"), MAX_CONFIG_BYTES)?,
+        )
+        .map_err(|_| Error::Config("invalid signing Vault configuration".into()))?;
+        if config.version != 1 || config.entries.len() > MAX_ENTRIES {
+            return Err(Error::Config(
+                "unsupported or oversized signing Vault configuration".into(),
+            ));
+        }
+        let keys = LocalSecretStore::open_existing(root)?;
+        let mut provider = Self::new(config.provider, keys)?;
+        provider.managed_keys = false;
+        let mut state = State::default();
+        let mut key_refs = BTreeSet::new();
+        for entry in config.entries {
+            if state.entries.contains_key(&entry.entry) || !key_refs.insert(entry.key_ref.clone()) {
+                return Err(Error::Conflict(
+                    "duplicate configured signing entry or key version",
+                ));
+            }
+            let key = provider.keys.get(&entry.key_ref)?;
+            let target = VaultGrantTarget {
+                agent_ref: entry.agent_ref,
+                name: entry.name,
+                entry: VaultEntryRef {
+                    provider: provider.provider.clone(),
+                    entry: entry.entry,
+                },
+                projection: entry.projection,
+                scope: entry.scope,
+                actor: entry.actor,
+            };
+            state.generation += 1;
+            let prepared = provider.prepare_entry(
+                store,
+                &entry.manager,
+                target,
+                state.generation,
+                entry.key_ref,
+                &key,
+            )?;
+            state
+                .entries
+                .insert(prepared.policy.target.entry.entry.clone(), prepared);
+        }
+        provider.state = RwLock::new(state);
+        Ok(provider)
+    }
+}
+
 impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     pub fn new(provider: DriverKey, keys: S) -> Result<Self> {
         provider.validate()?;
@@ -67,6 +179,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             provider,
             authority_ref: id("vault-authority")?,
             keys,
+            managed_keys: true,
             state: RwLock::new(State::default()),
         })
     }
@@ -77,6 +190,52 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             vec![VaultProjection::Broker, VaultProjection::Env],
             self,
         )
+    }
+
+    fn prepare_entry(
+        &self,
+        store: &SessionStore,
+        manager: &PrincipalId,
+        target: VaultGrantTarget,
+        generation: u64,
+        key_ref: String,
+        key: &[u8],
+    ) -> Result<Entry> {
+        if target.entry.provider != self.provider
+            || !matches!(
+                target.projection,
+                VaultProjection::Broker | VaultProjection::Env
+            )
+            || !(32..=128).contains(&key.len())
+        {
+            return Err(Error::Denied(
+                "signing Vault requires a dedicated 32..128 byte signing key",
+            ));
+        }
+        let policy = store.vault_policy(target, self.authority_ref.clone(), generation)?;
+        let manager_user = {
+            let connection = store.connection()?;
+            user_for_principal(&connection, manager)?
+                .ok_or(Error::Denied("Vault provider manager unavailable"))?
+        };
+        Ok(Entry {
+            policy,
+            manager: manager.clone(),
+            manager_user,
+            key_ref,
+            key_digest: Sha256::digest(key).into(),
+        })
+    }
+
+    // The provider owns this exact version. A deleted/reused backend ref may
+    // not silently rotate an already authorized signing key.
+    fn signing_key(&self, entry: &Entry) -> Result<hmac::Key> {
+        let key = self.keys.get(&entry.key_ref)?;
+        let digest: [u8; 32] = Sha256::digest(&key).into();
+        if digest != entry.key_digest {
+            return Err(Error::Denied("Vault signing key version changed"));
+        }
+        Ok(hmac::Key::new(hmac::HMAC_SHA256, &key))
     }
 
     /// Install or rotate a dedicated signing key and exact grant ceiling.
@@ -90,15 +249,9 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         target: VaultGrantTarget,
         key: &[u8],
     ) -> Result<()> {
-        if target.entry.provider != self.provider
-            || !matches!(
-                target.projection,
-                VaultProjection::Broker | VaultProjection::Env
-            )
-            || !(32..=128).contains(&key.len())
-        {
+        if !self.managed_keys {
             return Err(Error::Denied(
-                "signing Vault requires a dedicated 32..128 byte signing key",
+                "configured signing keys remain with their configuration owner",
             ));
         }
         let mut state = self
@@ -110,31 +263,18 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             .checked_add(1)
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(Error::Limit("Vault authority generation exhausted"))?;
-        if !state.entries.contains_key(&target.entry.entry) && state.entries.len() >= 1024 {
+        if !state.entries.contains_key(&target.entry.entry) && state.entries.len() >= MAX_ENTRIES {
             return Err(Error::Limit("too many signing Vault entries"));
         }
-        let policy = store.vault_policy(target, self.authority_ref.clone(), generation)?;
-        let manager_user = {
-            let connection = store.connection()?;
-            user_for_principal(&connection, manager)?
-                .ok_or(Error::Denied("Vault provider manager unavailable"))?
-        };
         let mut hash = Sha256::new();
         hash.update(b"aw-vault-signing-key-v1\0");
         hash.update(self.authority_ref.as_bytes());
         hash.update(generation.to_be_bytes());
         let key_ref = format!("sec_{:x}", hash.finalize());
-        self.keys.put(&key_ref, key)?;
-        let name = policy.target.entry.entry.clone();
-        let previous = state.entries.insert(
-            name,
-            Entry {
-                policy,
-                manager: manager.clone(),
-                manager_user,
-                key_ref,
-            },
-        );
+        let entry = self.prepare_entry(store, manager, target, generation, key_ref, key)?;
+        self.keys.put(&entry.key_ref, key)?;
+        let name = entry.policy.target.entry.entry.clone();
+        let previous = state.entries.insert(name, entry);
         state.generation = generation;
         drop(state);
         if let Some(previous) = previous {
@@ -152,8 +292,10 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             .map_err(|_| Error::Storage("Vault authority poisoned"))?
             .entries
             .remove(entry);
-        if let Some(entry) = removed {
-            self.keys.delete(&entry.key_ref)?;
+        if self.managed_keys {
+            if let Some(entry) = removed {
+                self.keys.delete(&entry.key_ref)?;
+            }
         }
         Ok(())
     }
@@ -219,8 +361,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             }
             let effect = launch.effect_id().to_owned();
             launch.with_vault_projection(source, registry, &authority, selection.grant_rev, || {
-                let key = provider.keys.get(&authority.entry.key_ref)?;
-                let signing_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+                let signing_key = provider.signing_key(authority.entry)?;
                 let mut mac = hmac::Context::with_key(&signing_key);
                 mac.update(b"aw-vault-process-proof-v1\0");
                 for part in [
@@ -260,6 +401,7 @@ impl SessionStore {
     ) -> Result<u64> {
         let provider = registry.get(handle)?;
         provider.with_entry(entry, |authority| {
+            provider.signing_key(authority.entry)?;
             self.agent_vault_set(
                 manager,
                 reference,
@@ -301,8 +443,7 @@ impl SessionStore {
                 return Err(Error::Denied("Vault signing scope or subject changed"));
             }
             self.with_vault_broker(actor, registry, &authority, expected_grant_rev, || {
-                let key = provider.keys.get(&authority.entry.key_ref)?;
-                let signing_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+                let signing_key = provider.signing_key(authority.entry)?;
                 let mut mac = hmac::Context::with_key(&signing_key);
                 mac.update(b"aw-vault-signing-broker-v1\0");
                 mac.update(&(scope.len() as u64).to_be_bytes());
@@ -327,7 +468,6 @@ mod tests {
         AgentAdmission, AgentHistoryForkAccess, AgentPermissions, CheckpointRestoreRequest,
         SessionBinding, VaultGrantStatus,
     };
-    use aw_agent_core::VaultEntryRef;
     use rusqlite::Connection;
     use std::path::PathBuf;
 
@@ -336,6 +476,160 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn configured_signing_provider_reopens_existing_keys_without_reviving_grants() {
+        use std::io::Write;
+
+        let temp = Temp(std::env::temp_dir().join(id("aw-configured-vault").unwrap()));
+        aw_platform::ensure_private_dir(&temp.0).unwrap();
+        let state = temp.0.join("state");
+        let root = temp.0.canonicalize().unwrap().join("provider");
+        let workspace = temp.0.join("workspace");
+        aw_platform::ensure_private_dir(&root).unwrap();
+        aw_platform::ensure_private_dir(&workspace).unwrap();
+        let store = SessionStore::open(&state).unwrap();
+        let actor = PrincipalId::new("internal:fixture:configured-signing").unwrap();
+        let (session, branch) = store
+            .create(
+                &actor,
+                "signing",
+                SessionBinding {
+                    working_directory: workspace.clone(),
+                    tool_root: workspace,
+                    system_prompt: "fixture".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "fixture".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let reference = agent_owner::canonical_ref(
+            &store.connection().unwrap(),
+            AgentKey::new(&session.id, &branch.id),
+        )
+        .unwrap();
+        let provider_key = DriverKey::builtin("configured-signing").unwrap();
+        let name = SourceName::new("signing").unwrap();
+        let key_ref = format!("sec_{}", "1".repeat(64));
+        let entry = "dedicated-signing";
+        let scope = "configured-proof";
+        let entry_config = serde_json::json!({
+            "entry": entry, "key_ref": key_ref, "agent_ref": reference,
+            "name": name, "projection": "broker", "scope": scope,
+            "actor": actor, "manager": actor,
+        });
+        let config = |entries| serde_json::json!({"version": 1, "provider": provider_key, "entries": entries});
+        let config_path = root.join("signing.json");
+        let mut file = aw_platform::open_private_new(&config_path).unwrap();
+        file.write_all(&serde_json::to_vec(&config(vec![entry_config.clone()])).unwrap())
+            .unwrap();
+        drop(file);
+        assert!(SigningVaultProvider::open_configured(&store, &root).is_err());
+        assert!(
+            !root.join("secrets").exists(),
+            "activation must not initialize a backend"
+        );
+        assert!(SigningVaultProvider::open_configured(&store, store.directory().unwrap()).is_err());
+
+        let keys = LocalSecretStore::open(&root).unwrap();
+        let original_key = [41u8; 32];
+        keys.put(&key_ref, &original_key).unwrap();
+        // A malformed/duplicate set cannot produce a partly registered provider.
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config(vec![entry_config.clone(), entry_config.clone()])).unwrap(),
+        )
+        .unwrap();
+        assert!(SigningVaultProvider::open_configured(&store, &root).is_err());
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config(vec![entry_config])).unwrap(),
+        )
+        .unwrap();
+        let registry = VaultProviderRegistry::new();
+        let handle = SigningVaultProvider::open_configured(&store, &root)
+            .unwrap()
+            .register(&registry)
+            .unwrap();
+        let reader = registry.reader().unwrap();
+        let provider = reader.get(&handle).unwrap();
+        let attach = |store: &SessionStore,
+                      reader: &VaultProviderRegistryReader,
+                      handle: &VaultProviderHandle<SigningVaultProvider>,
+                      rev| {
+            store.agent_vault_attach_signing(&actor, &reference, &name, rev, reader, handle, entry)
+        };
+        let sign = |store: &SessionStore,
+                    reader: &VaultProviderRegistryReader,
+                    handle: &VaultProviderHandle<SigningVaultProvider>,
+                    rev| {
+            store.vault_sign(
+                &actor,
+                &reference,
+                &name,
+                rev,
+                scope,
+                reader,
+                handle,
+                entry,
+                b"challenge",
+            )
+        };
+        let original_rev = store.agent_get(&actor, &reference).unwrap().rev;
+        assert!(sign(&store, &reader, &handle, original_rev).is_err());
+        let rev = attach(&store, &reader, &handle, original_rev).unwrap();
+        let proof = sign(&store, &reader, &handle, rev).unwrap();
+        let target = VaultGrantTarget {
+            agent_ref: reference.clone(),
+            name: name.clone(),
+            entry: VaultEntryRef {
+                provider: provider_key,
+                entry: entry.into(),
+            },
+            projection: VaultProjection::Broker,
+            scope: scope.into(),
+            actor: actor.clone(),
+        };
+        assert!(provider
+            .provision(&store, &actor, target, &[99; 32])
+            .is_err());
+
+        // The original version cannot be silently replaced under a live grant.
+        keys.delete(&key_ref).unwrap();
+        keys.put(&key_ref, &[73; 32]).unwrap();
+        assert!(sign(&store, &reader, &handle, rev).is_err());
+        assert!(attach(&store, &reader, &handle, rev).is_err());
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev);
+        provider.revoke(entry).unwrap();
+        assert_eq!(keys.get(&key_ref).unwrap().as_slice(), &[73; 32]);
+        assert!(sign(&store, &reader, &handle, rev).is_err());
+        drop(store);
+
+        // A trusted explicit reactivation loads a fresh authority, not a saved
+        // grant. The persisted key remains under its configuration owner.
+        let store = SessionStore::open(&state).unwrap();
+        let restarted = VaultProviderRegistry::new();
+        let restarted_handle = SigningVaultProvider::open_configured(&store, &root)
+            .unwrap()
+            .register(&restarted)
+            .unwrap();
+        let restarted_reader = restarted.reader().unwrap();
+        assert!(sign(&store, &restarted_reader, &restarted_handle, rev).is_err());
+        let new_rev = attach(&store, &restarted_reader, &restarted_handle, rev).unwrap();
+        assert_eq!(new_rev, rev + 1);
+        assert_ne!(
+            sign(&store, &restarted_reader, &restarted_handle, new_rev).unwrap(),
+            proof
+        );
+        assert!(!crate::json(
+            &store
+                .agent_vault_list(&actor, &reference, |_, _| Ok(()))
+                .unwrap()
+        )
+        .unwrap()
+        .contains(&key_ref));
     }
 
     #[test]
