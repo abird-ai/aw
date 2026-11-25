@@ -2,10 +2,10 @@
 //! No Agent activation, ambient repository discovery or client RPC authority.
 use crate::git_maintenance::{
     open_private_approval, overlaps, pin_private_checkout, require_existing_store,
-    require_store_scope,
+    require_store_scope, validate_named_locations,
 };
 use aw::{Error, PrincipalId, Result};
-use aw_agent_core::{validate_source_set_hard_limit, SourceSet};
+use aw_agent_core::SourceSet;
 use aw_git::source_driver::{GitSourceAnchor, GitSourceLocation};
 use aw_host::source_checkpoint::{reconcile_retired_git, GitSourceFence};
 use aw_platform::DirectoryIdentity;
@@ -60,25 +60,7 @@ impl Approval {
                 "retention approval differs from host manager or checkpoint",
             ));
         }
-        validate_source_set_hard_limit(config.repositories.len())?;
-        for repository in &config.repositories {
-            repository.name.validate()?;
-            if !repository.repository.is_absolute() || repository.repository.parent().is_none() {
-                return Err(Error::Denied(
-                    "retention approval requires exact checkout roots",
-                ));
-            }
-        }
-        config
-            .repositories
-            .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        if config
-            .repositories
-            .windows(2)
-            .any(|pair| pair[0].name == pair[1].name)
-        {
-            return Err(Error::Denied("duplicate retention approval source name"));
-        }
+        validate_named_locations(&mut config.repositories)?;
         if overlaps(parent, &config.store_directory) {
             return Err(Error::Denied(
                 "retention approval must be outside Store state",
@@ -782,7 +764,8 @@ mod tests {
             &repo,
             &["update-ref", &reference, &captured, &head],
         );
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         Approval::open(&path, &actor)
             .unwrap()
             .reconcile(&store)
@@ -809,13 +792,113 @@ mod tests {
                 .unwrap(),
             before
         );
+        // Retire only a logically closed, originally managed Sandbox. The
+        // fixture owns every non-Store effect; the production cleanup command
+        // never requests or fabricates Agent/Sandbox closure.
+        let sandbox_ref = published.agent.sandbox_ref.as_deref().unwrap();
+        let open_sandbox = store.sandbox_get(&actor, sandbox_ref).unwrap();
+        let sandbox_path = approvals.join("sandbox-retention.json");
+        let sandbox_config = json!({
+            "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":actor,"sandbox":sandbox_ref,"sandbox_rev":open_sandbox.rev + 1,
+            "destination_root":destination,
+            "destination_identity":DirectoryIdentity::open(&destination).unwrap().identity().unwrap(),
+            "repositories":[location],
+        });
+        let mut sandbox_file = aw_platform::open_private_new(&sandbox_path).unwrap();
+        sandbox_file
+            .write_all(&serde_json::to_vec(&sandbox_config).unwrap())
+            .unwrap();
+        drop(sandbox_file);
+        let reconcile_sandbox = |store: &SessionStore| {
+            crate::sandbox_retention::Approval::open(&sandbox_path, &actor)?.reconcile(store)
+        };
+        assert!(reconcile_sandbox(&store).is_err());
+        assert!(destination.join("code").exists());
+        store
+            .agent_request_close(&actor, &published.agent.canonical_ref, None)
+            .unwrap();
+        let closed_agent = store
+            .agent_finish_close(&actor, &published.agent.canonical_ref)
+            .unwrap();
+        let closed = store
+            .sandbox_close(&actor, sandbox_ref, Some(open_sandbox.rev))
+            .unwrap();
+        assert_eq!(closed.rev, open_sandbox.rev + 1);
+        let mut stale = sandbox_config.clone();
+        stale["sandbox_rev"] = json!(closed.rev + 1);
+        fs::write(&sandbox_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(reconcile_sandbox(&store).is_err());
+        fs::write(&sandbox_path, serde_json::to_vec(&sandbox_config).unwrap()).unwrap();
+        let foreign = destination.join("foreign");
+        fs::write(&foreign, b"keep").unwrap();
+        assert!(reconcile_sandbox(&store).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        assert_eq!(store.sandbox_get(&actor, sandbox_ref).unwrap(), closed);
+        store
+            .acquire_source_mutation_barrier(
+                &mutations,
+                "fixture:closed-sandbox-preflight-no-hazard",
+            )
+            .unwrap()
+            .settle(SourceMutationOutcome::Settled)
+            .unwrap();
+        fs::remove_file(&foreign).unwrap();
+        let edited = destination.join("code/tracked");
+        fs::write(&edited, b"new work").unwrap();
+        assert!(reconcile_sandbox(&store).is_err());
+        assert_eq!(fs::read(&edited).unwrap(), b"new work");
+        assert_eq!(store.sandbox_get(&actor, sandbox_ref).unwrap(), closed);
+        assert!(store
+            .acquire_source_mutation_barrier(&mutations, "fixture:closed-sandbox-still-unknown")
+            .is_err());
+        assert!(store
+            .create(&actor, "reserved layout", layout(&destination))
+            .is_err());
+        fs::write(&edited, b"dirty checkpoint").unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let released = reconcile_sandbox(&store).unwrap();
+        assert_eq!(released.lifecycle, aw_store::SandboxLifecycle::Closed);
+        assert_eq!(released.rev, closed.rev + 1);
+        assert!(released.sources.is_empty());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(
+            store
+                .agent_get(&actor, &published.agent.canonical_ref)
+                .unwrap(),
+            closed_agent
+        );
+        assert_eq!(reconcile_sandbox(&store).unwrap(), released);
+        assert!(store
+            .sandbox_reconcile_closed_sources_fenced(
+                &actor,
+                sandbox_ref,
+                Some(released.rev),
+                |_, _| -> aw::Result<()> { panic!("wrong release revision authorized") },
+                |_, _, _| panic!("wrong release revision reconciled")
+            )
+            .is_err());
+        verify_restore(&store, &recovered, &interrupted);
+        assert!(!git(
+            &executable,
+            &repo,
+            &[
+                "for-each-ref",
+                &format!("refs/aw/checkpoints/{}/code", fresh.id)
+            ]
+        )
+        .is_empty());
         assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&repo, root.join("moved-repo")).unwrap();
+        fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(reconcile_sandbox(&store).unwrap(), released);
         abandon_capture(
             &store,
             &root.join("absent-approval"),

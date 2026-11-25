@@ -16,6 +16,8 @@ mod resource_cli_args;
 mod resources_cli;
 #[cfg(feature = "routing")]
 mod routing_runtime;
+#[cfg(feature = "workspace")]
+mod sandbox_retention;
 mod skill_package;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
@@ -132,6 +134,13 @@ enum TopCommand {
     CheckpointRetention {
         /// Existing private host approval file; the operator must independently
         /// exclude all external Git writers, aliases and other retention users.
+        approval: PathBuf,
+    },
+    /// Offline reconciliation of exact managed Git sources in a closed Sandbox.
+    #[cfg(feature = "workspace")]
+    SandboxRetention {
+        /// Private host approval. Requires an already-closed Sandbox and
+        /// independent exclusion of all other layout and Git backing users.
         approval: PathBuf,
     },
     /// Inspect and navigate durable Sessions.
@@ -1683,6 +1692,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::Skill { command } => resources_cli::skill(command),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointRetention { approval } => checkpoint_retention::run(&approval),
+        #[cfg(feature = "workspace")]
+        TopCommand::SandboxRetention { approval } => sandbox_retention::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         #[cfg(feature = "workspace")]

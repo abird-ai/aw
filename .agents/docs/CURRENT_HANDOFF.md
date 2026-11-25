@@ -19,7 +19,81 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: exact offline capture/restore abandonment
+## Latest local implementation delta — 2026-11-25: exact closed Git Sandbox retention reconciliation
+
+Parent: `2291ac301201c00d09852ff3edf4637cfdcb8eff` (offline original
+capture/restore abandonment), signature verified. Original Agent/Turn journal
+and resource CLI owners remain occupied; independent closed-Sandbox physical
+reconciliation slice, L5 only.
+
+- Production workspace-feature command `aw sandbox-retention <approval.json>`
+  operates only on an already-closed Sandbox with exact original managed
+  Git materialization provenance. It never requests Agent or Sandbox closure,
+  activates an Agent, discards queue custody, changes a live binding, releases
+  checkpoint retention or prunes shared Git objects. Strict v1 private JSON
+  fields: `version`, `store_directory`, `store_id`, `store_generation`,
+  `manager`, `sandbox` (exact canonical ref), `sandbox_rev` (original
+  closed revision), `destination_root`, `destination_identity:[volume,object]`,
+  `repositories` (each `{name,repository,repository_identity:[volume,object]}`).
+  Existing private Store owner, local OS principal and Project writer
+  authority required. The first CLI cut accepts only a private named-child
+  layout with cwd equal to tool_root, ordinary private origin checkouts,
+  and independent approval of every retained source. It preserves the
+  containing destination directory. Whole-root and other host layouts
+  remain SDK-only or unsupported. Approval is distinct from native tool
+  access, restore and retired-checkpoint permission.
+- The original closed-source owner now exposes fenced read-only preflight
+  before claiming cleanup. Recheck exact closed snapshot, retained set,
+  quiescence, dependencies, registered binding schemas and current Project
+  authority in the claim transaction. Denial before claim creates no new
+  Unknown hazard. Existing generic trusted method delegates to the same
+  owner, preserving its returned-guard semantics. Git host verifies original
+  Applied per-binding descriptors, approved origins, exact named targets
+  and whole layout before claim; actual conditional release uses the existing
+  driver methods. Retain independent approval through failure and final
+  settlement. Failed/partial physical release keeps the complete original
+  closed set and reservation until exact reconciliation. No additional
+  retention owner, schema, registry, receipt or event.
+- Exact original closed revision is optional at the SDK boundary and
+  mandatory in the CLI approval. Fresh cleanup advances revision once
+  with the existing local sandbox.retention.released fact; terminal replay
+  requires that fact at the immediately following revision. It skips
+  Git lookup and physical layout inspection (the private approval and
+  current Store/Project authority are still required). An arbitrary closed
+  empty Sandbox or wrong revision is not a successful exact cleanup replay.
+- Share canonical named-location validation and private named-layout pinning
+  between restore and closed-Sandbox maintenance, reuse the bounded
+  approval loader/lease, exact Store scope and private checkout observations.
+  Independently exclude other layout/Git backing users, aliases, mounts,
+  other Stores and external writers for the entire operation; neither
+  advisory lease nor directory pins alone are physical isolation. Modified
+  or unrelated files, missing/incompatible driver, unproved provenance,
+  retained dependent children or ambiguous layout remain held.
+
+Validation (L5, Rust 1.95.0): grouped real offline Git/SQLite
+checkpoint/Sandbox lifecycle 1/1; Store checkpoint owner 4/4; Store
+Sandbox owner 4/4; Host source-checkpoint lifecycle 1/1. The grouped
+regression proves open/stale Sandbox refusal, foreign-file preservation
+and no new preflight hazard, modified managed checkout retention and
+Unknown custody, exact repair/restart release, preserved closed Agent
+identity and unrelated live sibling/retention, and terminal replay after
+the original layout and driver disappear. Strict all-feature/all-target
+Store/Host/CLI Clippy, durable lib and minimal all-target checks, full
+binary build, required-approval CLI smoke and scoped fmt/diff passed.
+Existing feature-specific warnings remain. Unchanged Git/Process suites,
+broad CLI inventory discrepancy and pinned Nix/native-platform
+qualification were not rerun. Only private fixture layouts reconciled;
+no real user cleanup or publication.
+
+Next: exact live source-aware Actor/Turn admission through original
+journal/queue/context owners if free. Otherwise proceed with independent
+protected source metadata or Vault/Process dispatch authority. Exact closed
+Sandbox managed Git maintenance is now an actual narrow host consumer;
+broader Sandbox structure mutation/cleanup, physical containment and
+source-bearing runtime admission remain held. Do not repeat offline
+lifecycle wiring or weaken authority to finish Phase 3.
+
+## Previous local implementation delta — 2026-11-25: exact offline capture/restore abandonment
 
 Parent: `5cfc6f632dce2f41a365fd131eb1dfc98bb1f59f` (captured Git
 restore), signature verified. Original Agent/Turn journal and resource CLI

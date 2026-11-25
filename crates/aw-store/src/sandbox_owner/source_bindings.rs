@@ -702,6 +702,48 @@ fn require_unshared_materializations_in(
     Ok(())
 }
 
+fn closed_cleanup_inputs_in(
+    store: &SessionStore,
+    c: &Connection,
+    actor: &PrincipalId,
+    key: &super::SandboxKey,
+    expected_rev: Option<u64>,
+) -> Result<(super::SandboxSnapshot, Vec<VersionedSourceBinding>)> {
+    super::authorize_project(c, actor, &key.project, true)?;
+    let (snapshot, bindings) = closed_retained_in(c, &key.canonical())?;
+    if let Some(expected) = expected_rev {
+        if bindings.is_empty() {
+            // An exact terminal replay is the original closed revision's
+            // factual release, not an arbitrary source-free closed Sandbox.
+            let released = expected.checked_add(1) == Some(snapshot.rev)
+                && db(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commit_log
+                     WHERE entity_type='sandbox' AND entity_id=?1
+                       AND kind='sandbox.retention.released'
+                       AND json_extract(payload_json,'$.rev')=?2)",
+                    params![snapshot.canonical_ref, snapshot.rev],
+                    |row| row.get::<_, bool>(0),
+                ))?;
+            if !released {
+                return Err(Error::Conflict(
+                    "no matching closed Sandbox retention release",
+                ));
+            }
+        } else if snapshot.rev != expected {
+            return Err(Error::Conflict("closed Sandbox revision changed"));
+        }
+    }
+    if !bindings.is_empty() {
+        super::require_close_quiescent_in(c, &snapshot, true)?;
+        require_unshared_materializations_in(c, &snapshot)?;
+        let registry = store.inner.source_drivers.reader()?;
+        for binding in &bindings {
+            registry.resolve(&binding.binding.pin()?)?;
+        }
+    }
+    Ok((snapshot, bindings))
+}
+
 impl SessionStore {
     /// Owner-private restore provenance for physical reconciliation. The
     /// trusted host independently authorizes source/provider metadata.
@@ -769,6 +811,38 @@ impl SessionStore {
         sandbox_ref: &str,
         reconcile: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding]) -> Result<F>,
     ) -> Result<super::SandboxSnapshot> {
+        self.reconcile_closed_sources_with(
+            actor,
+            sandbox_ref,
+            None,
+            |_, _| Ok(()),
+            |snapshot, bindings, _| reconcile(snapshot, bindings),
+        )
+    }
+
+    /// Read-only whole-layout authorization before the original cleanup
+    /// claim. Revalidate exact bindings and current writer authority before
+    /// claiming any effect; hold the independent guard through settlement.
+    /// The optional revision pins fresh cleanup and exact terminal replay.
+    pub fn sandbox_reconcile_closed_sources_fenced<F>(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+        expected_rev: Option<u64>,
+        authorize: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding]) -> Result<F>,
+        reconcile: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding], &F) -> Result<()>,
+    ) -> Result<super::SandboxSnapshot> {
+        self.reconcile_closed_sources_with(actor, sandbox_ref, expected_rev, authorize, reconcile)
+    }
+
+    fn reconcile_closed_sources_with<F, G>(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+        expected_rev: Option<u64>,
+        authorize: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding]) -> Result<F>,
+        reconcile: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding], &F) -> Result<G>,
+    ) -> Result<super::SandboxSnapshot> {
         if self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "Sandbox retention cleanup requires the exclusive Store owner",
@@ -776,35 +850,48 @@ impl SessionStore {
         }
         let key = super::parse_sandbox_ref(sandbox_ref)?;
         let sandbox = key.canonical();
+        if sandbox != sandbox_ref {
+            return Err(Error::Denied(
+                "retention cleanup requires exact canonical Sandbox",
+            ));
+        }
         let prepare_id = format!(
             "{RETENTION_CLEANUP_PREFIX}{:x}",
             Sha256::digest(sandbox.as_bytes())
         );
-        let (original, bindings, next_rev, barrier) = {
+        let (original, bindings) = {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction())?;
+            let observation = closed_cleanup_inputs_in(self, &tx, actor, &key, expected_rev)?;
+            db(tx.commit())?;
+            observation
+        };
+        if bindings.is_empty() {
+            return Ok(original);
+        }
+        let next_rev = original
+            .rev
+            .checked_add(1)
+            .filter(|r| *r <= i64::MAX as u64)
+            .ok_or(Error::Limit("Sandbox revision exhausted"))?;
+        let authority = authorize(&original, &bindings)?;
+        let barrier = {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            super::authorize_project(&tx, actor, &key.project, true)?;
-            let (original, bindings) = closed_retained_in(&tx, &sandbox)?;
-            if bindings.is_empty() {
-                return Ok(original);
+            let (current, retained) =
+                closed_cleanup_inputs_in(self, &tx, actor, &key, expected_rev)?;
+            if retained.is_empty() {
+                return Ok(current);
             }
-            let next_rev = original
-                .rev
-                .checked_add(1)
-                .filter(|r| *r <= i64::MAX as u64)
-                .ok_or(Error::Limit("Sandbox revision exhausted"))?;
-            super::require_close_quiescent_in(&tx, &original, true)?;
-            require_unshared_materializations_in(&tx, &original)?;
-            let registry = self.inner.source_drivers.reader()?;
-            for binding in &bindings {
-                registry.resolve(&binding.binding.pin()?)?;
+            if current != original || retained != bindings {
+                return Err(Error::Conflict("closed Sandbox changed before cleanup"));
             }
             let set = SourceMutationSet::from_binding_refs(bindings.iter().map(|b| &b.binding))?;
             let barrier = self.reconcile_retained_sources_in(&tx, &set, &prepare_id)?;
             db(tx.commit())?;
-            (original, bindings, next_rev, barrier)
+            barrier
         };
-        let fence = match reconcile(&original, &bindings) {
+        let fence = match reconcile(&original, &bindings, &authority) {
             Ok(fence) => fence,
             Err(error) => {
                 barrier.settle(crate::SourceMutationOutcome::Unknown)?;
@@ -857,6 +944,7 @@ impl SessionStore {
         }
         // Keep the independent provider/physical fence through publication.
         drop(fence);
+        drop(authority);
         finish
     }
 }

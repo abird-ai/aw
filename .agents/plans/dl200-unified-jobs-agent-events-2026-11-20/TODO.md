@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact offline capture/restore abandonment (this checkpoint; parent `5cfc6f632dce2f41a365fd131eb1dfc98bb1f59f`, captured Git restore). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact closed Git Sandbox retention reconciliation (this checkpoint; parent `2291ac301201c00d09852ff3edf4637cfdcb8eff`, offline capture/restore abandonment). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1442,6 +1442,21 @@ Current implementation: exact offline capture/restore abandonment (this checkpoi
       Grouped offline lifecycle 1/1, Store checkpoint 4/4, Host lifecycle 1/1;
       strict Store/Host/CLI Clippy, durable/minimal checks, full CLI build,
       actual mode-conflict smoke and scoped fmt/diff passed.
+      **Exact closed Git Sandbox retention reconciliation landed:** explicit
+      offline private named-child layout approval pins closed revision and
+      complete retained original Applied descriptors. Fenced authorization
+      before the original cleanup claim, exact whole-set/current authority
+      recheck before effect, same Git release and original custody settlement.
+      Refused preflight creates no new Unknown hazard; partial or uncertain
+      release retains the closed reservation. Exact terminal replay verifies
+      existing release fact/revision, skips driver/physical probes. Shared
+      named-layout validation with restore; no new durable owner or schema.
+      No automatic closure, shared object pruning, checkpoint release or
+      execution authority. Independent host exclusion remains mandatory.
+      Grouped offline lifecycle 1/1, Store checkpoint 4/4, Store Sandbox 4/4,
+      Host lifecycle 1/1; strict Store/Host/CLI Clippy, durable/minimal
+      checks, full CLI build, actual required-approval smoke and scoped
+      fmt/diff passed. See CURRENT_HANDOFF for remaining limitations.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1453,7 +1468,8 @@ Current implementation: exact offline capture/restore abandonment (this checkpoi
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
       activation/redacted local binding RPCs, offline Git capture/restore/exact
-      recovery/abandonment and narrow offline retention reconciliation are landed; do not repeat.
+      recovery/abandonment and narrow offline checkpoint/closed Sandbox
+      retention reconciliation are landed; do not repeat.
       Remaining Vault production broker/Process dispatch, socket/file/env projection integration, independent protected metadata
       disclosure, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,

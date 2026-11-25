@@ -1,11 +1,11 @@
 //! Offline captured-source restore under an independently selected Git
 //! administrative and destination-layout approval. Never activates an Agent.
 use crate::git_maintenance::{
-    canonical_private_directory, open_private_approval, overlaps, pin_private_checkout,
-    require_existing_store, require_store_scope,
+    open_private_approval, overlaps, pin_named_layout, require_existing_store, require_store_scope,
+    validate_named_locations,
 };
 use aw::{Error, PrincipalId, Result};
-use aw_agent_core::{validate_source_set_hard_limit, DriverKey, SourceSet};
+use aw_agent_core::{DriverKey, SourceSet};
 use aw_git::source_driver::{
     GitRestoreLocation, GitSourceAnchor, GitSourceDriver, GitSourceLocation,
 };
@@ -100,24 +100,11 @@ impl Approval {
                 "restore requires a disjoint private named layout",
             ));
         }
-        validate_source_set_hard_limit(config.repositories.len())?;
+        validate_named_locations(&mut config.repositories)?;
         if config.repositories.is_empty() {
             return Err(Error::Denied(
                 "captured restore requires approved Git sources",
             ));
-        }
-        for source in &config.repositories {
-            source.name.validate()?;
-        }
-        config
-            .repositories
-            .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        if config
-            .repositories
-            .windows(2)
-            .any(|pair| pair[0].name == pair[1].name)
-        {
-            return Err(Error::Denied("duplicate restore source approval"));
         }
         Ok(Self {
             config,
@@ -150,51 +137,13 @@ impl Approval {
                 ));
             }
         }
-        let root = &layout.tool_root;
-        canonical_private_directory(root)?;
-        let parent = DirectoryIdentity::open(root)?;
-        let identity = parent.identity()?;
-        if identity != c.destination_identity
-            || identity == DirectoryIdentity::open(&c.store_directory)?.identity()?
-            || identity == DirectoryIdentity::open(&self.directory)?.identity()?
-        {
-            return Err(Error::Conflict(
-                "approved restore destination changed or aliases host state",
-            ));
-        }
-        // All materializations are named direct children of this reserved
-        // parent. Fresh work requires emptiness; recovery only admits the
-        // original named entries, never unrelated files or symlink targets.
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
-            if !recover
-                || !entry.file_type()?.is_dir()
-                || !c
-                    .repositories
-                    .iter()
-                    .any(|source| entry.file_name() == source.name.as_str())
-            {
-                return Err(Error::Conflict(
-                    "restore destination contains unapproved entries",
-                ));
-            }
-        }
-        let mut pins = Vec::with_capacity(1 + c.repositories.len() * 3);
-        pins.push(parent);
-        let mut locations = Vec::with_capacity(c.repositories.len());
-        for source in &c.repositories {
-            pins.extend(pin_private_checkout(
-                source,
-                &[root, &c.store_directory, &self.directory],
-            )?);
-            locations.push(GitRestoreLocation {
-                name: source.name.clone(),
-                repository: source.repository.clone(),
-                repository_identity: source.repository_identity,
-                target: root.join(source.name.as_str()),
-                parent_identity: identity,
-            });
-        }
+        let (locations, pins) = pin_named_layout(
+            &layout.tool_root,
+            c.destination_identity,
+            &c.repositories,
+            &[&c.store_directory, &self.directory],
+            recover,
+        )?;
         Ok(Fence {
             _approval: self,
             locations,

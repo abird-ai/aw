@@ -1367,23 +1367,77 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             &[NamedPreparedSource],
         ) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
-        self.store
-            .sandbox_reconcile_closed_sources(actor, sandbox, |snapshot, bindings| {
-                let prepared = self
-                    .store
-                    .sandbox_materialization_preparations(actor, &snapshot.canonical_ref)?;
-                let fence = authorize(snapshot, bindings, &prepared)?;
-                let driver = self.store.source_driver(self.driver)?;
-                let layout = verify_managed_materializations(
-                    &driver, snapshot, bindings, &prepared, &fence,
-                )?;
-                for (binding, source) in bindings.iter().zip(&prepared) {
-                    driver.release_restored_materialization(&source.prepared, &binding.binding)?;
-                }
-                layout.require_released()?;
-                Ok(fence)
-            })
+        reconcile_closed_with(
+            self.store,
+            actor,
+            sandbox,
+            None,
+            || self.store.source_driver(self.driver),
+            authorize,
+        )
     }
+}
+
+/// Exact closed Sandbox cleanup using the installed driver only for live
+/// retained custody. No activation or source effect on settled replay.
+pub fn reconcile_closed_git_sandbox<F: GitRestoreFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    sandbox: &str,
+    expected_rev: u64,
+    authorize: impl FnOnce(
+        &SandboxSnapshot,
+        &[VersionedSourceBinding],
+        &[NamedPreparedSource],
+    ) -> Result<F>,
+) -> Result<SandboxSnapshot> {
+    reconcile_closed_with(
+        store,
+        actor,
+        sandbox,
+        Some(expected_rev),
+        || {
+            let handle = store.source_driver_handle::<GitSourceDriver>(
+                &aw_agent_core::DriverKey::builtin("git")?,
+            )?;
+            store.source_driver(&handle)
+        },
+        authorize,
+    )
+}
+
+fn reconcile_closed_with<F: GitRestoreFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    sandbox: &str,
+    expected_rev: Option<u64>,
+    resolve: impl FnOnce() -> Result<std::sync::Arc<GitSourceDriver>>,
+    authorize: impl FnOnce(
+        &SandboxSnapshot,
+        &[VersionedSourceBinding],
+        &[NamedPreparedSource],
+    ) -> Result<F>,
+) -> Result<SandboxSnapshot> {
+    store.sandbox_reconcile_closed_sources_fenced(
+        actor,
+        sandbox,
+        expected_rev,
+        |snapshot, bindings| {
+            let prepared =
+                store.sandbox_materialization_preparations(actor, &snapshot.canonical_ref)?;
+            let fence = authorize(snapshot, bindings, &prepared)?;
+            let driver = resolve()?;
+            verify_managed_materializations(&driver, snapshot, bindings, &prepared, &fence)?;
+            Ok((fence, driver, prepared))
+        },
+        |snapshot, bindings, (fence, driver, prepared)| {
+            let layout = ManagedGitLayout::check(snapshot, fence.locations())?;
+            for (binding, source) in bindings.iter().zip(prepared) {
+                driver.release_restored_materialization(&source.prepared, &binding.binding)?;
+            }
+            layout.require_released()
+        },
+    )
 }
 
 #[cfg(all(test, unix))]
