@@ -19,7 +19,95 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: exact provider-authorized Vault entry metadata
+## Latest local implementation delta — 2026-11-25: independent source identity metadata disclosure
+
+Parent: `bcd18323c83f33a7d609d5d11273f1031bc64216` (Vault entry metadata),
+signature verified. Original Agent/Turn journal and resource CLI owners
+still occupied; independent source metadata consumer, L5 only.
+
+- Close the protected identity portion of SPEC §§18.5 and 25.4 on
+  existing local stdio `sandbox_get`, `sandbox_sources_list`,
+  `checkpoint_get`, `checkpoint_list`. No new RPC method/selector,
+  model tool, source execution, driver call, grant, schema or resource
+  owner. `sandbox_list` remains its compact redacted summary page.
+  Default unconfigured responses remain unchanged; other resources/
+  named sources stay redacted. No extension Views or provider-specific
+  recovery fields disclosed.
+- Explicit local startup `--agent-source-metadata-approval <file>`
+  requires the original exact SQLite Actor-owner/stdio/tools-off binding.
+  Private bounded JSON v1: `{version:1,store_directory,policy:{store_id,
+  store_generation,actor,actor_user_id,project,sources:[...]}}`.
+  Each selection is either
+  `{kind:"binding",sandbox,sandbox_rev,binding_rev,source:{name,driver,
+  schema,source_ref}}` or `{kind:"anchor",checkpoint,source:{name,
+  driver,schema,source_ref,version}}`. The `version` is the exact
+  immutable SourceAnchor.identity, not a locator or caller assertion
+  of availability. Store generation is the original restore generation,
+  actor_user_id the original stable user. No wildcard, duplicate,
+  arbitrary provider fields, materialization/retention paths, or
+  new grant. Selection count bounded by existing hard source limit,
+  file 1 MiB. Host independently approves these exact metadata identities
+  for this subject/current Project, not merely because it can manage
+  a Sandbox or read history. Policy stays outside Store and execution
+  layout; host excludes other access, aliases, ancestor and external
+  writers. Existing private approval loader/lease extracted from Git
+  maintenance and reused, no second file-policy mechanism. File is
+  reread under its actual exclusive advisory lease per disclosure read
+  and held through complete Store snapshot, JSON projection and size
+  check. Cooperating policy writers honor same inode lease; no replacement
+  while leased. Policy edits/empty selection govern future reads without
+  a Store write. Invalid/missing/busy/stale-scope configured approval
+  fails closed; no previously approved metadata cached or replayed.
+- Reusable Store `SourceMetadataApproval` validates the exact typed
+  selection and bounded scope; `SourceMetadataView<T>` is deliberately
+  nonserializable and returns the original snapshot plus exact approved
+  identities. The Store checks current Project View or original
+  checkpoint source Agent View, stable principal/user and Store scope
+  inside the same read transaction; checkpoint pagination/cursor
+  semantics remain unchanged. Binding match includes exact open
+  Sandbox and binding revision, name/driver/schema/source identity;
+  anchor match includes live checkpoint identity and exact immutable
+  version. No extra provider lookup, no backing availability assertion.
+  Host output adds optional `source` (typed name/driver/schema/source_ref
+  and anchor version only) to the matching redacted source summary.
+  Closed Sandbox/retired checkpoints do not disclose retained private
+  custody. Reads remain meaningful with an unavailable driver/repository
+  when the independent metadata decision still covers the immutable
+  identity. No SourceRef use/materialize permission, raw locators or
+  secret bytes returned. No retroactive recall of prior disclosure.
+
+Validation (L5, Rust 1.95.0): grouped real Git/SQLite offline
+checkpoint/Sandbox lifecycle 1/1, actual configured stdio tests 2/2,
+Store checkpoint 4/4, Store Sandbox 4/4. Exact binding/version projection,
+default and stale-selection redaction, wrong stable-user scope denial,
+policy lease contention, no inherited checkpoint permission, explicit
+additional checkpoint selection and retired-anchor redaction, live
+immutable anchor disclosure after the driver/repository disappear,
+policy withdrawal and unchanged source grants/Agent revision are covered
+in existing grouped fixtures. Actual bound Host accepts explicit policy
+selection and refuses duplicate activation. Initial compile caught
+SourceName's intentionally unordered type as a BTreeMap key; corrected
+to existing name strings without changing core type semantics.
+Strict all-feature/all-target Store/Host/CLI Clippy, durable library
+and minimal all-target checks, full binary build, actual startup
+dependency smoke and scoped fmt/diff passed. Previous durable-only
+non-workspace binary blocker, feature-specific warnings and broad
+CLI inventory discrepancy remain. Unchanged Host physical/Process
+suites and pinned Nix/native-platform qualification not rerun.
+Only isolated fixture identities disclosed; no real user source
+disclosure, mutation or publication.
+
+Next: exact live source-aware Actor/Turn admission through original
+journal owners when available. Otherwise take another substantial
+independent boundary (actual physical recovery/containment or original
+Sandbox construction/attachment host composition). Both Vault and
+source identity metadata now have actual independent host consumers;
+do not repeat metadata or offline lifecycle wiring. Remaining
+provider-specific extension Views and broader metadata authority,
+production Process projection/containment and source-bearing admission
+remain held. Prior L5 strict Linux containment restriction unchanged.
+
+## Previous local implementation delta — 2026-11-25: exact provider-authorized Vault entry metadata
 
 Parent: `7f9a2f6116ef3eb0472412ad7e648c3b8d1fad69` (live signing broker),
 signature verified. Original Agent/Turn journal and resource CLI owners

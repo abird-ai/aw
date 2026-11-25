@@ -144,6 +144,23 @@ fn bindings_in(connection: &Connection, sandbox: &str) -> Result<Vec<StoredBindi
     Ok(bindings)
 }
 
+/// Shared durable binding decoder; only independently approved typed
+/// identities are projected. Never serialize materialization locators.
+pub(super) fn project_summaries(
+    connection: &Connection,
+    snapshot: &mut super::SandboxSnapshot,
+    approval: &crate::SourceMetadataApproval,
+) -> Result<Vec<crate::SourceMetadataRef>> {
+    let mut disclosed = Vec::new();
+    for stored in bindings_in(connection, &snapshot.canonical_ref)? {
+        if let Some(source) = approval.binding(snapshot, &stored.binding, stored.binding_rev) {
+            disclosed.push(source);
+        }
+        snapshot.sources.push(stored.summary());
+    }
+    Ok(disclosed)
+}
+
 /// All retained binding identities, including missing/incompatible drivers.
 /// Logical retirement is not a new source effect or source-set admission.
 pub(super) fn require_unleased_layout_in(

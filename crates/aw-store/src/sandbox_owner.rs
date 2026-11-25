@@ -147,6 +147,22 @@ fn parse_sandbox_ref(value: &str) -> Result<SandboxKey> {
     })
 }
 
+pub(crate) fn require_metadata_project_ref(project: &str, sandbox: Option<&str>) -> Result<()> {
+    let key = parse_project_ref(project)?;
+    if key.canonical() != project {
+        return Err(Error::Denied("source metadata requires canonical Project"));
+    }
+    if let Some(reference) = sandbox {
+        let sandbox = parse_sandbox_ref(reference)?;
+        if sandbox.project != key || sandbox.canonical() != reference {
+            return Err(Error::Denied(
+                "source metadata requires exact Project Sandbox",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn layout(binding: &SessionBinding) -> Result<Layout> {
     crate::validate_binding(binding)?;
     let working_directory = binding
@@ -918,6 +934,31 @@ impl SessionStore {
         let connection = self.connection()?;
         authorize_project(&connection, actor, &key.project, false)?;
         snapshot_with_sources(&connection, &key.canonical())
+    }
+
+    /// Current Project view and independent exact metadata approval in a
+    /// single read snapshot. Host retains its live disclosure guard.
+    pub fn sandbox_get_with_source_metadata(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        approval: &crate::SourceMetadataApproval,
+    ) -> Result<crate::SourceMetadataView<SandboxSnapshot>> {
+        let key = parse_sandbox_ref(canonical_ref)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        authorize_project(&tx, actor, &key.project, false)?;
+        approval.require_scope_in(&tx, actor)?;
+        let mut snapshot = snapshot_row(&tx, &key.canonical())?;
+        let mut disclosed = Vec::new();
+        if source_bindings::available(&tx)? {
+            disclosed = source_bindings::project_summaries(&tx, &mut snapshot, approval)?;
+        }
+        db(tx.commit())?;
+        Ok(crate::SourceMetadataView {
+            snapshot,
+            disclosed,
+        })
     }
 
     pub fn sandbox_list(

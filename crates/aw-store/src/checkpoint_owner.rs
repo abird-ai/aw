@@ -271,7 +271,17 @@ fn snapshot_in(
     actor: &PrincipalId,
     checkpoint: &str,
 ) -> Result<CheckpointSnapshot> {
+    Ok(snapshot_projected_in(connection, actor, checkpoint, None)?.snapshot)
+}
+
+fn snapshot_projected_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    checkpoint: &str,
+    approval: Option<&crate::SourceMetadataApproval>,
+) -> Result<crate::SourceMetadataView<CheckpointSnapshot>> {
     let mut row = row_in(connection, checkpoint)?;
+    let mut disclosed = Vec::new();
     let key = AgentKey::new(&row.session, &row.branch);
     agent_owner::authorize_permission(connection, actor, key, AgentPermission::View)?;
     if agent_owner::canonical_ref(connection, key)? != row.snapshot.source_agent_ref {
@@ -293,6 +303,11 @@ fn snapshot_in(
             .into_iter()
             .zip(compatibility)
             .map(|(anchor, compatibility)| {
+                if let Some(source) =
+                    approval.and_then(|approval| approval.anchor(&row.snapshot, &anchor))
+                {
+                    disclosed.push(source);
+                }
                 StoredSource {
                     anchor,
                     compatibility,
@@ -301,7 +316,10 @@ fn snapshot_in(
             })
             .collect();
     }
-    Ok(row.snapshot)
+    Ok(crate::SourceMetadataView {
+        snapshot: row.snapshot,
+        disclosed,
+    })
 }
 
 /// All fields belong to the one publication transaction. Source-bearing
@@ -626,6 +644,23 @@ impl SessionStore {
         let snapshot = snapshot_in(&tx, actor, checkpoint)?;
         db(tx.commit())?;
         Ok(snapshot)
+    }
+
+    /// Current history view and independent exact anchor disclosure in the
+    /// same SQLite read transaction. Never fetch or resolve backing data.
+    pub fn checkpoint_get_with_source_metadata(
+        &self,
+        actor: &PrincipalId,
+        checkpoint: &str,
+        approval: &crate::SourceMetadataApproval,
+    ) -> Result<crate::SourceMetadataView<CheckpointSnapshot>> {
+        label(checkpoint, 128)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        approval.require_scope_in(&tx, actor)?;
+        let view = snapshot_projected_in(&tx, actor, checkpoint, Some(approval))?;
+        db(tx.commit())?;
+        Ok(view)
     }
 }
 

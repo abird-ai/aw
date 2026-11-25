@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact provider-authorized Vault entry metadata (this checkpoint; parent `7f9a2f6116ef3eb0472412ad7e648c3b8d1fad69`, live signing broker). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: independent source identity metadata disclosure (this checkpoint; parent `bcd18323c83f33a7d609d5d11273f1031bc64216`, Vault entry metadata). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1486,6 +1486,20 @@ Current implementation: exact provider-authorized Vault entry metadata (this che
       Store Vault 2/2, real Host/stdio lifecycle 1/1, strict Store/CLI Clippy,
       durable library/minimal checks, full CLI/help and scoped fmt/diff
       passed; see CURRENT_HANDOFF for held boundaries.
+      **Protected source identity metadata landed:** explicit local stdio
+      private approval file selects exact Store scope/actor/stable user/Project
+      and named Sandbox binding revisions or immutable checkpoint anchor
+      versions. Reread actual policy under held private lease per read;
+      original current Project/Agent View + same snapshot/owner, exact
+      typed identity only, default unselected/stale redacted. No retention,
+      materialization, private descriptor or backing lookup; no new RPC,
+      schema or execution grant. Shared bounded approval loader with
+      previous Git maintenance. Unavailable driver/objects do not make
+      authorized metadata into a materialization proof.
+      Grouped offline lifecycle 1/1, actual stdio 2/2, Store checkpoint 4/4,
+      Store Sandbox 4/4; strict affected Clippy, durable library/minimal
+      checks, full CLI/startup dependency smoke and scoped fmt/diff passed.
+      See CURRENT_HANDOFF for scope and remaining limitations.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1496,12 +1510,12 @@ Current implementation: exact provider-authorized Vault entry metadata (this che
       and other structural removal cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
-      activation/local binding RPCs, provider-authorized Vault entry metadata
-      and explicit local signing broker, offline Git capture/restore/exact
+      activation/local binding RPCs, provider-authorized Vault entry metadata,
+      independent source identity metadata and explicit local signing broker,
+      offline Git capture/restore/exact
       recovery/abandonment and narrow offline checkpoint/closed Sandbox
       retention reconciliation are landed; do not repeat.
-      Remaining Vault production Process dispatch, socket/file/env projection integration, independent protected source/anchor metadata
-      disclosure, general physical retention authority/Project retention-admin authorization,
+      Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See current comprehensive handoff §5 for next cuts, limitations and acceptance. Schema v60.

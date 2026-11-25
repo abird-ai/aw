@@ -325,6 +325,138 @@ mod tests {
         );
         assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
 
+        // The existing metadata ports disclose only an independently approved
+        // exact source identity. No Git probe is part of a metadata read.
+        use aw::headless::{CheckpointReadPort, SandboxPort};
+        use std::sync::Arc;
+        let metadata_path = approvals.join("metadata.json");
+        let project = &agent_before.project_ref;
+        let fresh_version = git(
+            &executable,
+            &repo,
+            &[
+                "rev-parse",
+                &format!("refs/aw/checkpoints/{}/code", fresh.id),
+            ],
+        );
+        let binding_identity = json!({"name":binding.name,"driver":binding.driver,"schema":binding.binding_schema,
+            "source_ref":binding.source_ref});
+        let anchor_identity = json!({"name":binding.name,"driver":binding.driver,"schema":fresh.sources[0].anchor_schema,
+            "source_ref":binding.source_ref,"version":fresh_version});
+        let metadata_config = json!({"version":1,"store_directory":state,"policy":{
+            "store_id":store.store_id().unwrap(),"store_generation":store.local_process_info().unwrap().store_generation,
+            "actor":actor,"actor_user_id":store.current_user(&actor).unwrap().user_id,"project":project,
+            "sources":[{"kind":"binding","sandbox":sandbox.canonical_ref,"sandbox_rev":sandbox.rev,
+                "binding_rev":sandbox.sources[0].binding_rev,"source":binding_identity},
+                {"kind":"anchor","checkpoint":fresh.id,"source":anchor_identity}]
+        }});
+        let mut metadata_file = aw_platform::open_private_new(&metadata_path).unwrap();
+        metadata_file
+            .write_all(&serde_json::to_vec(&metadata_config).unwrap())
+            .unwrap();
+        drop(metadata_file);
+        let metadata = Arc::new(
+            crate::source_metadata::ApprovalFile::open(
+                &metadata_path,
+                &store,
+                &actor,
+                project,
+                &layout(&initial),
+            )
+            .unwrap(),
+        );
+        let metadata_sandbox = |store: &SessionStore, approval: bool, method: &str| {
+            crate::StdioSandboxPort {
+                store: store.clone(),
+                caller: actor.clone(),
+                current_project_ref: project.clone(),
+                source_metadata: approval.then(|| metadata.clone()),
+            }
+            .apply(method, json!({"ref":sandbox.canonical_ref}))
+        };
+        let metadata_checkpoint =
+            |store: &SessionStore, approval: bool, method: &str, params: serde_json::Value| {
+                CheckpointReadPort::apply(
+                    &crate::StdioAgentStatePort {
+                        store: store.clone(),
+                        caller: actor.clone(),
+                        current_project_ref: project.clone(),
+                        current_agent_ref: agent_ref.clone(),
+                        source_metadata: approval.then(|| metadata.clone()),
+                    },
+                    method,
+                    params,
+                )
+            };
+        let get_checkpoint = |store: &SessionStore, approval: bool, id: &str| {
+            metadata_checkpoint(store, approval, "checkpoint_get", json!({"id":id}))
+        };
+        let redacted = metadata_sandbox(&store, false, "sandbox_get").unwrap();
+        assert!(redacted["sources"][0].get("source").is_none());
+        let visible = metadata_sandbox(&store, true, "sandbox_sources_list").unwrap();
+        assert_eq!(visible["sources"][0]["source"], binding_identity);
+        assert_eq!(
+            metadata_sandbox(&store, true, "sandbox_get").unwrap()["sources"],
+            visible["sources"]
+        );
+        assert!(
+            get_checkpoint(&store, false, &fresh.id).unwrap()["sources"][0]
+                .get("source")
+                .is_none()
+        );
+        assert_eq!(
+            get_checkpoint(&store, true, &fresh.id).unwrap()["sources"][0]["source"],
+            anchor_identity
+        );
+        let page =
+            metadata_checkpoint(&store, true, "checkpoint_list", json!({"limit":16})).unwrap();
+        assert_eq!(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == fresh.id)
+                .unwrap()["sources"][0]["source"],
+            anchor_identity
+        );
+        for value in [visible, get_checkpoint(&store, true, &fresh.id).unwrap()] {
+            let encoded = value.to_string();
+            assert!(!encoded.contains(&binding.materialization));
+            assert!(!encoded.contains("refs/aw/checkpoints/"));
+            assert!(!encoded.contains("layout_digest"));
+        }
+        let mut wrong = metadata_config.clone();
+        wrong["policy"]["sources"][0]["binding_rev"] = json!(sandbox.sources[0].binding_rev + 1);
+        wrong["policy"]["sources"][1]["source"]["version"] = json!(head);
+        fs::write(&metadata_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(
+            metadata_sandbox(&store, true, "sandbox_get").unwrap()["sources"][0]
+                .get("source")
+                .is_none()
+        );
+        assert!(
+            get_checkpoint(&store, true, &fresh.id).unwrap()["sources"][0]
+                .get("source")
+                .is_none()
+        );
+        let mut wrong = metadata_config.clone();
+        wrong["policy"]["actor_user_id"] = json!("another-user");
+        fs::write(&metadata_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(get_checkpoint(&store, true, &fresh.id).is_err());
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata_config).unwrap(),
+        )
+        .unwrap();
+        let held = lock_private_approval(&metadata_path).unwrap();
+        assert!(metadata_sandbox(&store, true, "sandbox_get").is_err());
+        drop(held);
+        assert_eq!(
+            store.sandbox_grant_status(&actor, agent_ref).unwrap(),
+            grant_before
+        );
+        assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
+
         // Interrupt a real prepared capture after retention creation, before
         // publication, then reopen and recover through the configured path.
         let driver = store.source_driver(&handle).unwrap();
@@ -705,6 +837,29 @@ mod tests {
         let reference = format!("refs/aw/checkpoints/{}/code", capture.id);
         let captured = git(&executable, &repo, &["rev-parse", &reference]);
         assert_ne!(captured, head);
+        assert!(
+            get_checkpoint(&store, true, &capture.id).unwrap()["sources"][0]
+                .get("source")
+                .is_none()
+        );
+        let mut metadata_config = metadata_config;
+        let mut capture_identity = anchor_identity.clone();
+        capture_identity["version"] = json!(captured);
+        metadata_config["policy"]["sources"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind":"anchor","checkpoint":capture.id,"source":capture_identity,
+            }));
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata_config).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_checkpoint(&store, true, &capture.id).unwrap()["sources"][0]["source"],
+            capture_identity
+        );
         let config = json!({"version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
             "store_generation":store.local_process_info().unwrap().store_generation,"manager":actor,
             "checkpoint":capture.id,"repositories":[location]});
@@ -720,6 +875,10 @@ mod tests {
             "live checkpoint must not release"
         );
         store.checkpoint_delete(&actor, &capture.id).unwrap();
+        assert_eq!(
+            get_checkpoint(&store, true, &capture.id).unwrap()["sources"],
+            json!([])
+        );
         let before = store
             .agent_get(&actor, &restored.agent.canonical_ref)
             .unwrap();
@@ -898,6 +1057,27 @@ mod tests {
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        // Metadata of the still-live exact immutable anchor remains readable
+        // without the driver or physical checkout, unlike a source effect.
+        assert_eq!(
+            get_checkpoint(&store, true, &fresh.id).unwrap()["sources"][0]["source"],
+            anchor_identity
+        );
+        assert_eq!(
+            get_checkpoint(&store, true, &capture.id).unwrap()["sources"],
+            json!([])
+        );
+        metadata_config["policy"]["sources"] = json!([]);
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata_config).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            get_checkpoint(&store, true, &fresh.id).unwrap()["sources"][0]
+                .get("source")
+                .is_none()
+        );
         assert_eq!(reconcile_sandbox(&store).unwrap(), released);
         abandon_capture(
             &store,

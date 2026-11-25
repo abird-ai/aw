@@ -1,7 +1,8 @@
 //! Logical retirement and exact retained-anchor reconciliation.
 //! The retired row + immutable anchors own cleanup intent, not a new ledger.
 use super::{
-    row_in, snapshot_in, sources_in, CheckpointLifecycle, CheckpointRow, CheckpointSnapshot,
+    row_in, snapshot_projected_in, sources_in, CheckpointLifecycle, CheckpointRow,
+    CheckpointSnapshot,
 };
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
@@ -170,12 +171,40 @@ impl SessionStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CheckpointSnapshot>> {
+        self.checkpoint_list_projected(actor, reference, after, limit, None, |view| view.snapshot)
+    }
+
+    /// Same bounded original page, with independently approved immutable
+    /// source identities from the very same read snapshot.
+    pub fn checkpoint_list_with_source_metadata(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        after: Option<&str>,
+        limit: usize,
+        approval: &crate::SourceMetadataApproval,
+    ) -> Result<Vec<crate::SourceMetadataView<CheckpointSnapshot>>> {
+        self.checkpoint_list_projected(actor, reference, after, limit, Some(approval), |view| view)
+    }
+
+    fn checkpoint_list_projected<T>(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        after: Option<&str>,
+        limit: usize,
+        approval: Option<&crate::SourceMetadataApproval>,
+        project: impl Fn(crate::SourceMetadataView<CheckpointSnapshot>) -> T,
+    ) -> Result<Vec<T>> {
         if !(1..=256).contains(&limit) {
             return Err(Error::Limit("invalid checkpoint list limit"));
         }
         label(reference, 2048)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction())?;
+        if let Some(approval) = approval {
+            approval.require_scope_in(&tx, actor)?;
+        }
         let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
         let source = AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, actor, source, AgentPermission::View)?;
@@ -211,7 +240,12 @@ impl SessionStore {
             ]))?;
             let mut result = Vec::new();
             while let Some(row) = db(rows.next())? {
-                result.push(snapshot_in(&tx, actor, &db(row.get::<_, String>(0))?)?);
+                result.push(project(snapshot_projected_in(
+                    &tx,
+                    actor,
+                    &db(row.get::<_, String>(0))?,
+                    approval,
+                )?));
             }
             result
         };

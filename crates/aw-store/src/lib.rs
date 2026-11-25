@@ -83,6 +83,7 @@ mod secret_store;
 mod session_participation;
 mod source_barrier;
 mod source_compatibility;
+mod source_metadata;
 mod store_scope;
 mod subagents;
 #[cfg(feature = "pipelines")]
@@ -230,6 +231,10 @@ pub use session_participation::{
 use sha2::{Digest, Sha256};
 pub use source_barrier::{SourceMutationBarrier, SourceMutationOutcome, SourceMutationSet};
 pub use source_compatibility::SourceCompatibility;
+pub use source_metadata::{
+    SourceMetadataApproval, SourceMetadataRef, SourceMetadataSelection, SourceMetadataSpec,
+    SourceMetadataView,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},

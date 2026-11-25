@@ -12,6 +12,7 @@ mod checkpoint_retention;
 mod device;
 #[cfg(feature = "workspace")]
 mod git_maintenance;
+mod private_approval;
 mod resource_cli_args;
 mod resources_cli;
 #[cfg(feature = "routing")]
@@ -19,6 +20,7 @@ mod routing_runtime;
 #[cfg(feature = "workspace")]
 mod sandbox_retention;
 mod skill_package;
+mod source_metadata;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
 // Opt-in host-only Actor/child services. 9C gates authenticated stdio
@@ -926,6 +928,10 @@ struct RpcCommandCliArgs {
     /// owner. Never authorizes physical source retention cleanup.
     #[arg(long = "checkpoint-delete", requires = "rpc_actor_owner")]
     rpc_checkpoint_delete: bool,
+    /// Independent, private, exact source-metadata disclosure policy.
+    /// Never authorizes materialization, capture, restore or execution.
+    #[arg(long = "source-metadata-approval", requires = "rpc_actor_owner")]
+    rpc_source_metadata_approval: Option<PathBuf>,
     /// Activate an existing private signing Vault and authorize binding
     /// management for this exact local Actor. Entry refs require explicit
     /// provider metadata approval. Host must independently
@@ -1024,6 +1030,7 @@ pub(crate) struct RunArgs {
     rpc_checkpoint_create: bool,
     rpc_checkpoint_restore_root: Option<PathBuf>,
     rpc_checkpoint_delete: bool,
+    rpc_source_metadata_approval: Option<PathBuf>,
     rpc_signing_vault_root: Option<PathBuf>,
     rpc_signing_broker_entry: Option<String>,
     #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1162,6 +1169,7 @@ impl RunArgs {
             rpc_checkpoint_create: false,
             rpc_checkpoint_restore_root: None,
             rpc_checkpoint_delete: false,
+            rpc_source_metadata_approval: None,
             rpc_signing_vault_root: None,
             rpc_signing_broker_entry: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1608,6 +1616,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_checkpoint_create = args.rpc_checkpoint_create;
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
+            run.rpc_source_metadata_approval = args.rpc_source_metadata_approval;
             run.rpc_signing_vault_root = args.rpc_signing_vault_root;
             run.rpc_signing_broker_entry = args.rpc_signing_broker_entry;
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -3138,6 +3147,9 @@ fn run_agent_with_shell_containment(
             host.checkpoint_create_enabled = args.rpc_checkpoint_create;
             host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             host.checkpoint_delete_enabled = args.rpc_checkpoint_delete;
+            if let Some(path) = args.rpc_source_metadata_approval {
+                host.attach_rpc_source_metadata(&path)?;
+            }
             if let Some(root) = args.rpc_signing_vault_root {
                 host.attach_rpc_signing_vault(&root, args.rpc_signing_broker_entry.as_deref())?;
             }
@@ -3530,11 +3542,13 @@ struct StdioAgentCreatePort {
     router: std::sync::Arc<aw::agent_jobs::Router>,
 }
 
+#[derive(Clone)]
 struct StdioAgentStatePort {
     store: SessionStore,
     caller: aw::PrincipalId,
     current_agent_ref: String,
     current_project_ref: String,
+    source_metadata: Option<std::sync::Arc<source_metadata::ApprovalFile>>,
 }
 
 /// One explicitly activated, exact-Agent host capability. The registered
@@ -3712,10 +3726,12 @@ struct StdioAgentInputsPort {
     inner: std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>,
 }
 
+#[derive(Clone)]
 struct StdioSandboxPort {
     store: SessionStore,
     caller: aw::PrincipalId,
     current_project_ref: String,
+    source_metadata: Option<std::sync::Arc<source_metadata::ApprovalFile>>,
 }
 
 fn agent_ref_text<'a>(
@@ -4062,6 +4078,34 @@ fn source_access_value(access: aw_agent_core::SourceAccess) -> &'static str {
     }
 }
 
+fn enrich_source_metadata(
+    value: &mut serde_json::Value,
+    disclosed: &[aw_store::SourceMetadataRef],
+) -> Result<()> {
+    // The Store returns name-ordered exact selections from the same snapshot.
+    // No raw snapshot/driver fields are serialized as an authority shortcut.
+    let sources = value["sources"]
+        .as_array_mut()
+        .ok_or(Error::Storage("source metadata projection missing"))?;
+    let mut selected = disclosed.iter().peekable();
+    for source in sources {
+        if selected
+            .peek()
+            .is_some_and(|entry| source["name"].as_str() == Some(entry.name.as_str()))
+        {
+            let entry = selected.next().expect("selected source");
+            source["source"] = serde_json::to_value(entry)
+                .map_err(|_| Error::Protocol("source reference encoding failed"))?;
+        }
+    }
+    if selected.next().is_some() {
+        return Err(Error::Storage(
+            "source metadata projection differs from snapshot",
+        ));
+    }
+    Ok(())
+}
+
 fn sandbox_sources_value(snapshot: &aw_store::SandboxSnapshot) -> Vec<serde_json::Value> {
     snapshot
         .sources
@@ -4123,6 +4167,11 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
             }
             Ok(())
         };
+        let approval = self
+            .source_metadata
+            .as_ref()
+            .map(|file| file.read(&self.store, &self.caller, &self.current_project_ref))
+            .transpose()?;
         let value = match method {
             "checkpoint_list" => {
                 let reference = self.current_or_canonical_ref(&params, false)?;
@@ -4143,15 +4192,35 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
                             .ok_or(Error::Protocol("checkpoint cursor must be a string"))
                     })
                     .transpose()?;
-                let snapshots =
+                let items = if let Some(approval) = &approval {
                     self.store
-                        .checkpoint_list_metadata(&self.caller, &reference, cursor, limit)?;
-                let next_cursor = (snapshots.len() == limit)
-                    .then(|| snapshots.last().map(|item| item.id.clone()))
+                        .checkpoint_list_with_source_metadata(
+                            &self.caller,
+                            &reference,
+                            cursor,
+                            limit,
+                            approval.policy(),
+                        )?
+                        .into_iter()
+                        .map(|view| {
+                            let mut value = checkpoint_snapshot_value(&view.snapshot);
+                            enrich_source_metadata(&mut value, &view.disclosed)?;
+                            Ok(value)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    self.store
+                        .checkpoint_list_metadata(&self.caller, &reference, cursor, limit)?
+                        .iter()
+                        .map(checkpoint_snapshot_value)
+                        .collect()
+                };
+                let next_cursor = (items.len() == limit)
+                    .then(|| items.last().and_then(|item| item["id"].as_str()))
                     .flatten();
                 serde_json::json!({
                     "ref": reference,
-                    "items": snapshots.iter().map(checkpoint_snapshot_value).collect::<Vec<_>>(),
+                    "items": items,
                     "next_cursor": next_cursor,
                 })
             }
@@ -4167,9 +4236,21 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or(Error::Protocol("checkpoint_get id must be a string"))?;
-                let snapshot = self.store.checkpoint_get_metadata(&self.caller, id)?;
-                require_project(&snapshot.source_agent_ref)?;
-                checkpoint_snapshot_value(&snapshot)
+                if let Some(approval) = &approval {
+                    let view = self.store.checkpoint_get_with_source_metadata(
+                        &self.caller,
+                        id,
+                        approval.policy(),
+                    )?;
+                    require_project(&view.snapshot.source_agent_ref)?;
+                    let mut value = checkpoint_snapshot_value(&view.snapshot);
+                    enrich_source_metadata(&mut value, &view.disclosed)?;
+                    value
+                } else {
+                    let snapshot = self.store.checkpoint_get_metadata(&self.caller, id)?;
+                    require_project(&snapshot.source_agent_ref)?;
+                    checkpoint_snapshot_value(&snapshot)
+                }
             }
             _ => return Err(Error::Protocol("unsupported checkpoint metadata operation")),
         };
@@ -4353,13 +4434,28 @@ impl aw::headless::SandboxPort for StdioSandboxPort {
                         }
                     }
                 };
-                let snapshot = self.store.sandbox_get(&self.caller, reference)?;
+                let approval = self
+                    .source_metadata
+                    .as_ref()
+                    .map(|file| file.read(&self.store, &self.caller, &self.current_project_ref))
+                    .transpose()?;
+                let (snapshot, disclosed) = if let Some(approval) = &approval {
+                    let view = self.store.sandbox_get_with_source_metadata(
+                        &self.caller,
+                        reference,
+                        approval.policy(),
+                    )?;
+                    (view.snapshot, view.disclosed)
+                } else {
+                    (self.store.sandbox_get(&self.caller, reference)?, Vec::new())
+                };
                 self.require_current_project(&snapshot)?;
-                let value = if method == "sandbox_sources_list" {
+                let mut value = if method == "sandbox_sources_list" {
                     serde_json::json!({"ref":snapshot.canonical_ref, "rev":snapshot.rev, "sources":sandbox_sources_value(&snapshot)})
                 } else {
                     sandbox_snapshot_value(&snapshot, true)
                 };
+                enrich_source_metadata(&mut value, &disclosed)?;
                 bounded_source_metadata(value)
             }
             "sandbox_close" => {
@@ -4797,6 +4893,35 @@ impl Host {
         )?;
         owner.verify_rpc_agent(agent)?;
         self.actor_owner = Some(owner);
+        Ok(())
+    }
+
+    fn attach_rpc_source_metadata(&mut self, path: &std::path::Path) -> Result<()> {
+        let owner = self.actor_owner.as_ref().ok_or(Error::Denied(
+            "source metadata requires the local Actor owner",
+        ))?;
+        owner.verify_rpc_state()?;
+        let state = self.agent_state_port.as_mut().ok_or(Error::Denied(
+            "source metadata requires the exact Agent state owner",
+        ))?;
+        let sandbox = self.sandbox_owner.as_mut().ok_or(Error::Denied(
+            "source metadata requires the Project Sandbox owner",
+        ))?;
+        let creator = self.agent_create_owner.as_ref().ok_or(Error::Denied(
+            "source metadata requires the original execution layout",
+        ))?;
+        if state.source_metadata.is_some() || sandbox.source_metadata.is_some() {
+            return Err(Error::Conflict("source metadata policy already selected"));
+        }
+        let approval = std::sync::Arc::new(source_metadata::ApprovalFile::open(
+            path,
+            &state.store,
+            &state.caller,
+            &state.current_project_ref,
+            &creator.binding,
+        )?);
+        std::sync::Arc::make_mut(state).source_metadata = Some(approval.clone());
+        std::sync::Arc::make_mut(sandbox).source_metadata = Some(approval);
         Ok(())
     }
 
@@ -5661,11 +5786,13 @@ impl Host {
                     caller: persistent.actor.clone(),
                     current_agent_ref: canonical.clone(),
                     current_project_ref: current_project_ref.clone(),
+                    source_metadata: None,
                 }));
                 self.sandbox_owner = Some(Arc::new(StdioSandboxPort {
                     store: persistent.store.clone(),
                     caller: persistent.actor.clone(),
                     current_project_ref,
+                    source_metadata: None,
                 }));
                 self.agent_create_owner = Some(Arc::new(StdioAgentCreatePort {
                     store: persistent.store.clone(),
@@ -8082,6 +8209,7 @@ mod phase54_cli_tests {
                 caller: caller.clone(),
                 current_agent_ref: target.into(),
                 current_project_ref: project.clone(),
+                source_metadata: None,
             })
         };
         let open = |store: &SessionStore, target: &str| {
@@ -8159,6 +8287,19 @@ mod phase54_cli_tests {
         assert!(host.agent.as_ref().unwrap().tool_specs().is_empty());
         assert!(host.attach_rpc_signing_vault(&root, Some(entry)).is_err());
         host.attach_rpc_actor_owner().unwrap();
+        // The same actual local host can independently enable a bounded,
+        // source-metadata-only policy; it grants no source or tool authority.
+        let metadata_dir = temp.0.join("metadata");
+        aw_platform::ensure_private_dir(&metadata_dir).unwrap();
+        let metadata_path = metadata_dir.join("approval.json");
+        let mut metadata_file = aw_platform::open_private_new(&metadata_path).unwrap();
+        metadata_file.write_all(&serde_json::to_vec(&json!({"version":1,"store_directory":state_dir,
+            "policy":{"store_id":store.store_id().unwrap(),"store_generation":store.local_process_info().unwrap().store_generation,
+                "actor":actor,"actor_user_id":store.current_user(&actor).unwrap().user_id,"project":project,"sources":[]}
+        })).unwrap()).unwrap();
+        drop(metadata_file);
+        host.attach_rpc_source_metadata(&metadata_path).unwrap();
+        assert!(host.attach_rpc_source_metadata(&metadata_path).is_err());
         assert!(aw::headless::Driver::agent_vault_port(&host).is_none());
         assert!(!aw::headless::Driver::can_signing_broker(&host));
         assert!(host
@@ -8242,6 +8383,7 @@ mod phase54_cli_tests {
         target_override["params"]["entry"] = json!("other");
         let requests = [
             json!({"v":1,"id":"list","method":"agent_vault_list","params":{}}),
+            json!({"v":1,"id":"metadata-list","method":"checkpoint_list","params":{}}),
             json!({"v":1,"id":"early","method":"signing_broker_sign","params":{"grant_rev":rev,"message":"challenge"}}),
             json!({"v":1,"id":"attach","method":"agent_vault_set","params":request}),
             json!({"v":1,"id":"approved-list","method":"agent_vault_list","params":{}}),
@@ -8271,6 +8413,7 @@ mod phase54_cli_tests {
         );
         let frame = |id: &str| frames.iter().find(|frame| frame["id"] == id).unwrap();
         assert_eq!(frame("list")["data"]["items"], json!([]));
+        assert_eq!(frame("metadata-list")["data"]["items"], json!([]));
         assert_eq!(frame("early")["type"], "error");
         assert_eq!(frame("override")["data"]["code"], "invalid_parameters");
         assert_eq!(frame("stale")["type"], "error");
@@ -8497,6 +8640,7 @@ mod phase54_cli_tests {
             store: store.clone(),
             caller: actor.clone(),
             current_project_ref: project.clone(),
+            source_metadata: None,
         };
         let snapshot = sandbox_port
             .apply("sandbox_get", json!({"ref": sandbox.canonical_ref}))
@@ -8547,6 +8691,7 @@ mod phase54_cli_tests {
             caller: actor.clone(),
             current_agent_ref: reference.clone(),
             current_project_ref: project.clone(),
+            source_metadata: None,
         };
         let page = CheckpointReadPort::apply(&port, "checkpoint_list", json!({"limit":1})).unwrap();
         let next = page["next_cursor"].as_str().unwrap();
@@ -8575,6 +8720,7 @@ mod phase54_cli_tests {
             caller: aw::PrincipalId::new("internal:fixture:metadata-outsider").unwrap(),
             current_agent_ref: reference.clone(),
             current_project_ref: project.clone(),
+            source_metadata: None,
         };
         assert!(
             CheckpointReadPort::apply(&denied, "checkpoint_get", json!({"id":first.id})).is_err()
@@ -8585,6 +8731,7 @@ mod phase54_cli_tests {
             caller: actor.clone(),
             current_agent_ref: reference,
             current_project_ref: "/d:d/i:i/p:other".into(),
+            source_metadata: None,
         };
         assert!(CheckpointReadPort::apply(
             &foreign_project,
@@ -8766,6 +8913,7 @@ mod phase54_cli_tests {
             caller: actor.clone(),
             current_agent_ref: other_ref,
             current_project_ref: project.clone(),
+            source_metadata: None,
         };
         assert_eq!(
             rebound
