@@ -124,6 +124,18 @@ pub struct VaultGrantSummary {
     pub status: VaultGrantStatus,
 }
 
+/// Metadata-only view: the redacted binding summary is always present;
+/// an entry reference requires a separate, live provider disclosure decision.
+/// Scope, authority locator, backend/key locator and credential bytes are
+/// deliberately not part of this representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VaultGrantView {
+    #[serde(flatten)]
+    pub summary: VaultGrantSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<VaultEntryRef>,
+}
+
 #[derive(PartialEq, Eq)]
 struct Grant {
     policy: VaultGrantPolicy,
@@ -608,12 +620,29 @@ impl SessionStore {
         reference: &str,
         authorize_metadata: impl FnOnce(&PrincipalId, &str) -> Result<F>,
     ) -> Result<Vec<VaultGrantSummary>> {
+        self.agent_vault_list_projected(manager, reference, authorize_metadata, |_, _, summary| {
+            Ok(summary)
+        })
+    }
+
+    /// The common bounded metadata read. Provider-specific projections
+    /// supply their actual live authority outside this read transaction.
+    /// The projection callback is synchronous and metadata-only.
+    pub(crate) fn agent_vault_list_projected<F, T>(
+        &self,
+        manager: &PrincipalId,
+        reference: &str,
+        authorize_metadata: impl FnOnce(&PrincipalId, &str) -> Result<F>,
+        mut project: impl FnMut(&str, &VaultGrantPolicy, VaultGrantSummary) -> Result<T>,
+    ) -> Result<Vec<T>> {
         let fence = authorize_metadata(manager, reference)?;
         let mut c = self.connection()?;
         let tx = db(c.transaction())?;
         let (session, branch) = exact_key(&tx, reference)?;
         let key = AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, manager, key, AgentPermission::Manage)?;
+        let manager_user = user_for_principal(&tx, manager)?
+            .ok_or(Error::Denied("Vault metadata manager unavailable"))?;
         let names = {
             let mut q = db(tx.prepare_cached(
                 "SELECT name FROM agent_vault_grants_current
@@ -644,12 +673,16 @@ impl SessionStore {
             } else {
                 VaultGrantStatus::Stale
             };
-            result.push(VaultGrantSummary {
-                name,
-                projection: grant.policy.target.projection,
-                grant_rev: grant.rev,
-                status,
-            });
+            result.push(project(
+                &manager_user,
+                &grant.policy,
+                VaultGrantSummary {
+                    name,
+                    projection: grant.policy.target.projection,
+                    grant_rev: grant.rev,
+                    status,
+                },
+            )?);
         }
         db(tx.commit())?;
         drop(fence);

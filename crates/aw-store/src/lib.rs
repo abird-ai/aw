@@ -245,7 +245,7 @@ pub use teams::*;
 pub use types::*;
 pub use vault_grants::{
     VaultBindingSelection, VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus,
-    VaultGrantSummary, VaultGrantTarget, VaultSetOutcome, VaultSetRequest,
+    VaultGrantSummary, VaultGrantTarget, VaultGrantView, VaultSetOutcome, VaultSetRequest,
 };
 pub use vault_signing::{
     SigningBroker, SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV,

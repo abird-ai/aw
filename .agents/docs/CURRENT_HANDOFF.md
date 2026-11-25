@@ -19,7 +19,75 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: explicitly selected live signing broker
+## Latest local implementation delta — 2026-11-25: exact provider-authorized Vault entry metadata
+
+Parent: `7f9a2f6116ef3eb0472412ad7e648c3b8d1fad69` (live signing broker),
+signature verified. Original Agent/Turn journal and resource CLI owners
+still occupied; independent protected Vault metadata consumer, L5 only.
+
+- Production Process dispatch was not promoted: existing source Process
+  consumes original journaled ToolStarted and source custody; no live
+  source-aware Actor admission without the original journal owners. Actual
+  L5 execution environment has cgroup v2 mounted read-only, no effective
+  capabilities, NoNewPrivs=1; no independently qualified closed-descendant
+  Linux scope. Existing direct Unix scope remains best-effort; strict
+  containment continues to refuse. Frozen dotlink Sandbox is untouched.
+- Close the corresponding VaultProvider metadata portion of SPEC §28.10
+  on the existing authenticated `agent_vault_list` stdio surface. No new
+  RPC method, selector, capability registry or flag. Existing configured
+  signing.json v1 entry gains optional boolean `disclose_entry_ref`
+  (default false; managed provisioning also defaults false). This is a
+  separate provider-owned disclosure decision for that entry's configured
+  exact manager, not inferred from the attach/use grant or broker startup
+  capability. Existing configs and unapproved entries retain the original
+  redacted output. The existing explicit local provider activation grants
+  redacted binding metadata for its exact current Agent; the provider
+  must independently approve each additional entry reference.
+- Reuse the original bounded Store list, exact canonical Agent and current
+  Manage check, same SQLite snapshot, actor/Store scope and access-generation
+  revalidation. `VaultGrantView` contains the original flattened summary
+  plus optional typed `entry: VaultEntryRef` (provider ID and opaque entry
+  ID), omitted when unauthorized. `agent_vault_list_signing_metadata`
+  obtains the real registered provider, holds its read guard through the
+  Store snapshot and projection, and matches exact live policy, manager
+  principal AND stable user, current grant, lifecycle and supported
+  projection. Revoked/rotated, stale ACL, wrong manager/provider and
+  old-provider-after-restart grants stay redacted; no key read or entry
+  enumeration. Base summary's revalidation_required still describes the
+  Store observation, not live provider-use authority. Reattach is still
+  an explicit independent mutation. No scopes, authority/secret/backend
+  locators, key bytes, history/ACL inheritance, or new persistence.
+  Redacted generic SDK `agent_vault_list` remains compatible.
+- Metadata disclosure does not authorize execution, and the host's provider
+  configuration exclusion contract still applies. Changing configuration
+  requires the existing live withdrawal and explicit activation; already
+  disclosed metadata cannot be recalled.
+
+Validation (L5, Rust 1.95.0): Store Vault signing 2/2 and actual
+configured Host/stdio Vault lifecycle 1/1. Existing grouped fixtures
+prove default-redacted legacy config, opt-in exact typed entry projection,
+separate host metadata denial, ACL broadening/regrant and Manage-only
+peer redaction, provider withdrawal, restart without regrant, and
+current exact reattachment; no protected scope/key/authority locator or
+revision fanout. Initial fixture moved a borrowed provider key; corrected
+with a clone. Strict Store/CLI all-feature/all-target Clippy, durable
+library and minimal all-target checks, full binary build, real CLI help
+and scoped fmt/diff passed. Unchanged Process and headless suites not
+rerun this slice. Prior durable-only non-workspace binary field blocker,
+feature-specific warnings and broad inventory discrepancy remain;
+pinned Nix/native-platform qualification not rerun. Only private test
+provider entries used; no real user Vault disclosure or publication.
+
+Next: exact live source-aware Actor/Turn admission if the original journal
+owners are free. Otherwise protected SourceBinding/checkpoint anchor
+metadata under an independent exact disclosure decision, remaining
+physical recovery or actual Process projection/containment only when
+its authority can be established. The configured signing broker and
+provider-authorized Vault binding metadata are now actual consumers;
+do not repeat their wiring or enable unsupported Process execution.
+Socket/file/env production dispatch remains held.
+
+## Previous local implementation delta — 2026-11-25: explicitly selected live signing broker
 
 Parent: `29e4d4d9c60ac8d762607305a68f5968d62b3e4e` (closed Git Sandbox
 retention), signature verified. Original Agent/Turn journal and resource CLI

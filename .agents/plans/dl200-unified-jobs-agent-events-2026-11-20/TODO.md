@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: explicitly selected live signing broker (this checkpoint; parent `29e4d4d9c60ac8d762607305a68f5968d62b3e4e`, closed Git Sandbox retention). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact provider-authorized Vault entry metadata (this checkpoint; parent `7f9a2f6116ef3eb0472412ad7e648c3b8d1fad69`, live signing broker). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1473,6 +1473,19 @@ Current implementation: explicitly selected live signing broker (this checkpoint
       full CLI and startup dependency smoke passed. Expanded durable-only
       binary check blocked by existing non-workspace subagent field error;
       see CURRENT_HANDOFF for qualification and corrections.
+      **Provider-authorized Vault entry metadata landed:** existing configured
+      signing provider per-entry disclose_entry_ref defaults false; distinct
+      from grant attach/use and binding metadata authority. Existing stdio
+      list uses original Store Manage/bounded snapshot and actual provider
+      read guard, current exact policy, stable manager and grant generation.
+      Optional typed entry ref only when approved, default/stale/revoked/
+      wrong manager stays redacted; no secret/backend/scope disclosure,
+      new RPC/registry/schema or execution admission. Real L5 cgroup v2
+      read-only/no effective capabilities; strict closed-descendant Process
+      remains unsupported, original journal paths occupied.
+      Store Vault 2/2, real Host/stdio lifecycle 1/1, strict Store/CLI Clippy,
+      durable library/minimal checks, full CLI/help and scoped fmt/diff
+      passed; see CURRENT_HANDOFF for held boundaries.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1483,10 +1496,11 @@ Current implementation: explicitly selected live signing broker (this checkpoint
       and other structural removal cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
-      activation/redacted local binding RPCs and explicit local signing broker, offline Git capture/restore/exact
+      activation/local binding RPCs, provider-authorized Vault entry metadata
+      and explicit local signing broker, offline Git capture/restore/exact
       recovery/abandonment and narrow offline checkpoint/closed Sandbox
       retention reconciliation are landed; do not repeat.
-      Remaining Vault production Process dispatch, socket/file/env projection integration, independent protected metadata
+      Remaining Vault production Process dispatch, socket/file/env projection integration, independent protected source/anchor metadata
       disclosure, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.

@@ -4,7 +4,7 @@
 use crate::{
     id, user_for_principal, Error, LocalSecretStore, Result, SandboxEffectAuthority,
     SandboxEffectLaunch, SecretStore, SessionStore, VaultGrantAuthority, VaultGrantPolicy,
-    VaultGrantTarget, VaultSetOutcome, VaultSetRequest,
+    VaultGrantStatus, VaultGrantTarget, VaultGrantView, VaultSetOutcome, VaultSetRequest,
 };
 use aw_agent_core::{
     DriverKey, PrincipalId, SourceName, VaultEntryRef, VaultProjection, VaultProviderHandle,
@@ -42,6 +42,9 @@ struct ConfiguredEntry {
     scope: String,
     actor: PrincipalId,
     manager: PrincipalId,
+    // Separate provider metadata decision, not implied by attach/use.
+    #[serde(default)]
+    disclose_entry_ref: bool,
 }
 
 struct Entry {
@@ -50,6 +53,7 @@ struct Entry {
     manager_user: String,
     key_ref: String,
     key_digest: [u8; 32],
+    disclose_entry_ref: bool,
 }
 
 #[derive(Default)]
@@ -155,7 +159,7 @@ impl SigningVaultProvider<LocalSecretStore> {
                 actor: entry.actor,
             };
             state.generation += 1;
-            let prepared = provider.prepare_entry(
+            let mut prepared = provider.prepare_entry(
                 store,
                 &entry.manager,
                 target,
@@ -163,6 +167,7 @@ impl SigningVaultProvider<LocalSecretStore> {
                 entry.key_ref,
                 &key,
             )?;
+            prepared.disclose_entry_ref = entry.disclose_entry_ref;
             state
                 .entries
                 .insert(prepared.policy.target.entry.entry.clone(), prepared);
@@ -224,6 +229,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
             manager_user,
             key_ref,
             key_digest: Sha256::digest(key).into(),
+            disclose_entry_ref: false,
         })
     }
 
@@ -516,6 +522,54 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
 }
 
 impl SessionStore {
+    /// The same bounded Agent Manage + independent binding-metadata read,
+    /// enriched only by this provider's explicit per-entry live disclosure
+    /// decision. No entry enumeration or credential/backend reads. The
+    /// provider read guard survives the complete Store snapshot/projection.
+    /// Stale, revoked, unrelated or unapproved entries stay redacted.
+    pub fn agent_vault_list_signing_metadata<S: SecretStore + 'static, F>(
+        &self,
+        manager: &PrincipalId,
+        reference: &str,
+        registry: &VaultProviderRegistryReader,
+        handle: &VaultProviderHandle<SigningVaultProvider<S>>,
+        authorize_metadata: impl FnOnce(&PrincipalId, &str) -> Result<F>,
+    ) -> Result<Vec<VaultGrantView>> {
+        // Acquire independent host metadata authority before provider
+        // lookup; it remains held across the same exact Store read.
+        let fence = authorize_metadata(manager, reference)?;
+        let provider = registry.get(handle)?;
+        let state = provider
+            .state
+            .read()
+            .map_err(|_| Error::Storage("Vault authority poisoned"))?;
+        let result = self.agent_vault_list_projected(
+            manager,
+            reference,
+            |_, _| Ok(&fence),
+            |manager_user, policy, summary| {
+                let target = &policy.target;
+                let entry = if summary.status == VaultGrantStatus::RevalidationRequired
+                    && target.entry.provider == provider.provider
+                    && state.entries.get(&target.entry.entry).is_some_and(|entry| {
+                        entry.disclose_entry_ref
+                            && entry.policy == *policy
+                            && &entry.manager == manager
+                            && entry.manager_user == manager_user
+                    }) {
+                    registry.require_projection(&target.entry, target.projection)?;
+                    Some(target.entry.clone())
+                } else {
+                    None
+                };
+                Ok(VaultGrantView { summary, entry })
+            },
+        );
+        drop(state);
+        drop(fence);
+        result
+    }
+
     /// Trusted host composition, not an RPC. The actual registered provider
     /// supplies its independent exact attachment decision.
     pub fn agent_vault_attach_signing<S: SecretStore + 'static>(
@@ -632,7 +686,7 @@ mod tests {
     use crate::{
         agent_owner::{self, AgentKey},
         AgentAdmission, AgentHistoryForkAccess, AgentPermissions, CheckpointRestoreRequest,
-        SessionBinding, VaultGrantStatus,
+        SessionBinding,
     };
     use rusqlite::Connection;
     use std::path::PathBuf;
@@ -711,7 +765,7 @@ mod tests {
         assert!(SigningVaultProvider::open_configured(&store, &root).is_err());
         std::fs::write(
             &config_path,
-            serde_json::to_vec(&config(vec![entry_config])).unwrap(),
+            serde_json::to_vec(&config(vec![entry_config.clone()])).unwrap(),
         )
         .unwrap();
         let registry = VaultProviderRegistry::new();
@@ -747,11 +801,23 @@ mod tests {
         assert!(sign(&store, &reader, &handle, original_rev).is_err());
         let rev = attach(&store, &reader, &handle, original_rev).unwrap();
         let proof = sign(&store, &reader, &handle, rev).unwrap();
+        let metadata = |store: &SessionStore,
+                        manager: &PrincipalId,
+                        reader: &VaultProviderRegistryReader,
+                        handle: &VaultProviderHandle<SigningVaultProvider>| {
+            store.agent_vault_list_signing_metadata(manager, &reference, reader, handle, |_, _| {
+                Ok(())
+            })
+        };
+        // Old configs never imply provider metadata permission from attach.
+        assert!(metadata(&store, &actor, &reader, &handle).unwrap()[0]
+            .entry
+            .is_none());
         let target = VaultGrantTarget {
             agent_ref: reference.clone(),
             name: name.clone(),
             entry: VaultEntryRef {
-                provider: provider_key,
+                provider: provider_key.clone(),
                 entry: entry.into(),
             },
             projection: VaultProjection::Broker,
@@ -776,6 +842,14 @@ mod tests {
         // A trusted explicit reactivation loads a fresh authority, not a saved
         // grant. The persisted key remains under its configuration owner.
         let store = SessionStore::open(&state).unwrap();
+        // Explicit provider metadata decision, separate from attachment.
+        let mut approved_config = entry_config;
+        approved_config["disclose_entry_ref"] = serde_json::json!(true);
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config(vec![approved_config])).unwrap(),
+        )
+        .unwrap();
         let restarted = VaultProviderRegistry::new();
         let restarted_handle = SigningVaultProvider::open_configured(&store, &root)
             .unwrap()
@@ -783,6 +857,11 @@ mod tests {
             .unwrap();
         let restarted_reader = restarted.reader().unwrap();
         assert!(sign(&store, &restarted_reader, &restarted_handle, rev).is_err());
+        assert!(
+            metadata(&store, &actor, &restarted_reader, &restarted_handle).unwrap()[0]
+                .entry
+                .is_none()
+        );
         let new_rev = attach(&store, &restarted_reader, &restarted_handle, rev).unwrap();
         assert_eq!(new_rev, rev + 1);
         assert_ne!(
@@ -796,6 +875,73 @@ mod tests {
         )
         .unwrap()
         .contains(&key_ref));
+        let view = metadata(&store, &actor, &restarted_reader, &restarted_handle).unwrap();
+        assert_eq!(view[0].entry.as_ref().unwrap().entry, entry);
+        assert_eq!(view[0].summary.grant_rev, new_rev);
+        let encoded = crate::json(&view).unwrap();
+        for protected in [
+            &key_ref,
+            scope,
+            &restarted_reader
+                .get(&restarted_handle)
+                .unwrap()
+                .authority_ref,
+        ] {
+            assert!(!encoded.contains(protected));
+        }
+        assert!(store
+            .agent_vault_list_signing_metadata::<_, ()>(
+                &actor,
+                &reference,
+                &restarted_reader,
+                &restarted_handle,
+                |_, _| Err(Error::Denied("no binding metadata authority"))
+            )
+            .is_err());
+        // Manage alone does not confer the provider's independent decision.
+        let peer = PrincipalId::new("internal:fixture:configured-signing-peer").unwrap();
+        let peer_user =
+            crate::ensure_user_for_principal(&store.connection().unwrap(), &peer).unwrap();
+        let domain = reference.split("/i:").next().unwrap();
+        let broadened = store
+            .agent_access_set_ref(
+                &actor,
+                &reference,
+                &format!("{domain}/i:{peer_user}"),
+                Some(AgentPermissions::ALL),
+                new_rev,
+            )
+            .unwrap();
+        assert!(
+            metadata(&store, &actor, &restarted_reader, &restarted_handle).unwrap()[0]
+                .entry
+                .is_none()
+        );
+        let current = attach(&store, &restarted_reader, &restarted_handle, broadened.rev).unwrap();
+        assert!(
+            metadata(&store, &peer, &restarted_reader, &restarted_handle).unwrap()[0]
+                .entry
+                .is_none()
+        );
+        assert_eq!(
+            metadata(&store, &actor, &restarted_reader, &restarted_handle).unwrap()[0]
+                .entry
+                .as_ref()
+                .unwrap()
+                .entry,
+            entry
+        );
+        restarted_reader
+            .get(&restarted_handle)
+            .unwrap()
+            .revoke(entry)
+            .unwrap();
+        assert!(
+            metadata(&store, &actor, &restarted_reader, &restarted_handle).unwrap()[0]
+                .entry
+                .is_none()
+        );
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, current);
     }
 
     #[test]

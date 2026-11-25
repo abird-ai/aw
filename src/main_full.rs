@@ -926,8 +926,9 @@ struct RpcCommandCliArgs {
     /// owner. Never authorizes physical source retention cleanup.
     #[arg(long = "checkpoint-delete", requires = "rpc_actor_owner")]
     rpc_checkpoint_delete: bool,
-    /// Activate an existing private signing Vault and authorize redacted
-    /// binding management for this exact local Actor. Host must independently
+    /// Activate an existing private signing Vault and authorize binding
+    /// management for this exact local Actor. Entry refs require explicit
+    /// provider metadata approval. Host must independently
     /// exclude Agent access and other writers to the provider directory.
     #[arg(long = "signing-vault-root", requires = "rpc_actor_owner")]
     rpc_signing_vault_root: Option<PathBuf>,
@@ -3538,7 +3539,8 @@ struct StdioAgentStatePort {
 
 /// One explicitly activated, exact-Agent host capability. The registered
 /// signing provider owns every attach decision; the host independently grants
-/// redacted binding metadata (never provider/key/entry metadata).
+/// binding metadata; only explicit provider entry-disclosure decisions
+/// may enrich the redacted view. Never key or backend metadata.
 struct StdioVaultPort {
     state: std::sync::Arc<StdioAgentStatePort>,
     registry: aw_agent_core::VaultProviderRegistry,
@@ -3612,12 +3614,15 @@ impl aw::headless::AgentVaultPort for StdioVaultPort {
         let state = &self.state;
         match method {
             "agent_vault_list" => {
-                let items = state.store.agent_vault_list(
+                let items = state.store.agent_vault_list_signing_metadata(
                     &state.caller,
                     &state.current_agent_ref,
+                    &self.registry.reader()?,
+                    &self.handle,
                     |manager, target| {
-                        // The explicit startup capability is the independent host
-                        // decision for redacted metadata of just this Agent.
+                        // The explicit startup capability grants binding
+                        // metadata of this Agent, not entry disclosure.
+                        // The provider independently checks each entry.
                         if manager != &state.caller
                             || target != state.current_agent_ref
                             || (reference != "." && reference != target)
@@ -8105,7 +8110,8 @@ mod phase54_cli_tests {
         let name = SourceName::new("signing").unwrap();
         let config = json!({"version":1,"provider":provider,"entries":[{
             "entry":entry,"key_ref":key_ref,"agent_ref":reference,"name":name,
-            "projection":"broker","scope":scope,"actor":actor,"manager":actor
+            "projection":"broker","scope":scope,"actor":actor,"manager":actor,
+            "disclose_entry_ref":true
         }]});
         let mut file = aw_platform::open_private_new(&root.join("signing.json")).unwrap();
         file.write_all(&serde_json::to_vec(&config).unwrap())
@@ -8238,6 +8244,7 @@ mod phase54_cli_tests {
             json!({"v":1,"id":"list","method":"agent_vault_list","params":{}}),
             json!({"v":1,"id":"early","method":"signing_broker_sign","params":{"grant_rev":rev,"message":"challenge"}}),
             json!({"v":1,"id":"attach","method":"agent_vault_set","params":request}),
+            json!({"v":1,"id":"approved-list","method":"agent_vault_list","params":{}}),
             target_override,
             request_tag.clone(),
             request_tag,
@@ -8294,11 +8301,21 @@ mod phase54_cli_tests {
         mismatch["ref"] = json!(reference);
         assert!(set(&port, "attach", mismatch).is_err());
         let metadata = list(&port);
+        let redacted = json!([{"name":"signing","projection":"broker","grant_rev":rev,"status":"revalidation_required"}]);
+        let visible = json!([{"name":"signing","projection":"broker","grant_rev":rev,"status":"revalidation_required",
+            "entry":{"provider":provider,"entry":entry}}]);
+        assert_eq!(metadata["items"], visible);
+        assert_eq!(frame("approved-list")["data"], metadata);
         assert_eq!(
-            metadata["items"],
-            json!([{"name":"signing","projection":"broker","grant_rev":rev,"status":"revalidation_required"}])
+            serde_json::to_value(
+                store
+                    .agent_vault_list(&actor, &reference, |_, _| Ok(()))
+                    .unwrap()
+            )
+            .unwrap(),
+            redacted
         );
-        for protected in ["fixture-private-signing", entry, scope, &key_ref] {
+        for protected in [scope, &key_ref] {
             assert!(!metadata.to_string().contains(protected));
         }
         port.registry
@@ -8309,6 +8326,7 @@ mod phase54_cli_tests {
             .revoke(entry)
             .unwrap();
         assert!(sign(&port, rev).is_err());
+        assert_eq!(list(&port)["items"], redacted);
         assert!(aw::headless::Driver::signing_broker_sign(&host, rev, b"challenge").is_err());
         assert_eq!(set(&port, "attach", request.clone()).unwrap(), attached);
         let mut fresh = request.clone();
@@ -8351,10 +8369,15 @@ mod phase54_cli_tests {
         );
         assert!(sign(&restarted, rev).is_err());
         assert!(broker.sign(rev, b"challenge").is_err());
+        assert_eq!(list(&restarted)["items"], redacted);
         let reattached = set(&restarted, "regrant", fresh).unwrap();
         assert_eq!(reattached, json!({"status":"applied","rev":rev+1}));
         assert_eq!(sign(&restarted, rev + 1).unwrap(), proof);
         assert_eq!(broker.sign(rev + 1, b"challenge").unwrap(), proof);
+        assert_eq!(
+            list(&restarted)["items"][0]["entry"],
+            json!({"provider":provider,"entry":entry})
+        );
         let held = store
             .agent_admission(
                 &actor,
