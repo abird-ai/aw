@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: replay-safe empty-baseline checkpoint restore (this local checkpoint; signed parent `077ac07803d9fa19db9743393cc4e68f2a6f4676`, replay-safe history checkpoint construction). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: replay-safe empty-baseline checkpoint restore at `ffa8fc940fd82468925be3505adf7aa6082399b4` (signed; parent `077ac07803d9fa19db9743393cc4e68f2a6f4676`), followed by this comprehensive documentation refresh. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1358,12 +1358,18 @@ Current implementation: replay-safe empty-baseline checkpoint restore (this loca
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
-      Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
-      broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
-      unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      bound-Agent mutation and other structural removal cases, remaining Vault broker/socket/file/other env,
-      persistent provider configuration, protected metadata and host RPCs remain.
-      Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
+      Production activation of configured Git/signing owners and independent physical authority,
+      complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
+      general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and
+      non-exact partial checkout cleanup, physical authority/production cleanup, bound-Agent mutation
+      and other structural removal cases remain. Configured signing and Git approval loaders, local
+      shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
+      empty-baseline task-less restore are landed; do not repeat. Remaining Vault broker/socket/file/
+      env and product activation, independent protected metadata disclosure, checkpoint retirement/
+      task-bearing/captured-source capture and restore and remaining Sandbox/Vault host RPCs held.
+      See current comprehensive handoff §5 for next cuts, limitations and acceptance. Schema v60.
+      AW remote main last verified at 4ddeed8; 19 subsequent first-parent commits at implementation
+      tip are local, plus documentation refresh. No new remote verification or publication.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
