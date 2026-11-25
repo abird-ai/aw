@@ -10,16 +10,23 @@ use crate::{
 };
 use aw_agent_core::{
     AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
-    SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext,
+    SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext, ToolEffect,
+    ToolSourceEvidence,
 };
 use aw_git::source_driver::{GitSourceDriver, GitSourceFreeLayout};
 use aw_store::{
-    SandboxEffectAuthority, SandboxGrantStatus, SandboxSnapshot, SessionStore,
-    VersionedSourceBinding,
+    SandboxEffectAuthority, SandboxEffectOutcome, SandboxGrantStatus, SandboxSnapshot,
+    SandboxToolRecovery, SessionStore, VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
-use aw_tools_adapter::{native_filesystem::ExclusionSpec, LocalToolOptions};
-use std::{path::Path, sync::Arc};
+use aw_tools_adapter::{
+    native_filesystem::{reopen_source_artifacts, ExclusionSpec, GrantIdentity},
+    LocalToolOptions,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// Trusted metadata-only final detach, using the original Sandbox source
 /// mutation owner. The host independently authorizes the exact old source
@@ -114,14 +121,9 @@ impl GitNativeSourceResolver {
         {
             return Err(Error::Denied("Git native mutation has no writable source"));
         }
-        let driver = self.store.source_driver(&self.driver)?;
         let mut selected = Vec::with_capacity(roots.len());
-        let mut repos = Vec::with_capacity(roots.len());
-        let mut exclusions = Vec::new();
         for (mut source, root) in observation.sources.into_iter().zip(roots) {
-            if source.binding != root.source.binding
-                || &source.binding.binding.driver != self.driver.driver()
-            {
+            if source.binding != root.source.binding {
                 return Err(Error::Denied(
                     "Git source identity differs from independent approval",
                 ));
@@ -129,9 +131,33 @@ impl GitNativeSourceResolver {
             if !write {
                 source.access = SourceAccess::ReadOnly;
             }
+            selected.push(NativeSourceRoot {
+                source,
+                physical: root.physical.clone(),
+                private_artifacts: root.private_artifacts.clone(),
+            });
+        }
+        self.pin_layout(base, selected, false)
+    }
+
+    fn pin_layout(
+        &self,
+        base: &Path,
+        roots: Vec<NativeSourceRoot>,
+        recover: bool,
+    ) -> Result<ApprovedSourceLayout> {
+        let driver = self.store.source_driver(&self.driver)?;
+        let mut repos = Vec::with_capacity(roots.len());
+        let mut exclusions = Vec::new();
+        for root in &roots {
+            if &root.source.binding.binding.driver != self.driver.driver() {
+                return Err(Error::Denied(
+                    "Git source identity differs from registered driver",
+                ));
+            }
             let physical = &root.physical;
             let repo = driver.verify_materialization(
-                &source.binding.binding,
+                &root.source.binding.binding,
                 &physical.path,
                 (physical.volume, physical.object),
             )?;
@@ -158,17 +184,163 @@ impl GitNativeSourceResolver {
                 }
             }
             repos.push(repo);
-            selected.push(NativeSourceRoot {
-                source,
-                physical: physical.clone(),
-                private_artifacts: root.private_artifacts.clone(),
-            });
         }
-        let layout = ApprovedSourceLayout::pin(base, selected, exclusions)?;
+        if recover {
+            // The lower artifact owner reconciles exact records using
+            // descriptor-relative paths. Its cleanup is not a model
+            // filesystem operation; reject any record outside the
+            // original writable source or overlapping Git exclusions.
+            for root in &roots {
+                for record in root
+                    .private_artifacts
+                    .records()
+                    .map_err(|_| Error::Conflict("native artifact records unavailable"))?
+                {
+                    let valid_parent = record.parent_path.is_empty()
+                        || (aw_tools::filesystem::path::validate(&record.parent_path).is_ok()
+                            && !aw_tools::filesystem::path::is_absolute(&record.parent_path)
+                            && !aw_tools::filesystem::path::is_unc(&record.parent_path));
+                    if root.source.access != SourceAccess::ReadWrite
+                        || !valid_parent
+                        || aw_tools::filesystem::path::validate(&record.name).is_err()
+                        || record.name == "."
+                        || record.name.contains('/')
+                        || aw_tools::filesystem::path::is_absolute(&record.name)
+                    {
+                        return Err(Error::Conflict(
+                            "artifact record exceeds original native custody",
+                        ));
+                    }
+                    let parent = if record.parent_path == "." {
+                        ""
+                    } else {
+                        &record.parent_path
+                    };
+                    let path = root.physical.path.join(parent).join(&record.name);
+                    if exclusions.iter().any(|excluded| {
+                        path.starts_with(&excluded.path) || excluded.path.starts_with(&path)
+                    }) {
+                        return Err(Error::Conflict(
+                            "artifact recovery overlaps protected Git administration",
+                        ));
+                    }
+                }
+            }
+        }
+        let layout = ApprovedSourceLayout::pin(base, roots, exclusions)?;
         // Retain every checkout pin through actual capability preparation.
         drop(repos);
         Ok(layout)
     }
+
+    /// Recover an original native tool only. Independent authorization must
+    /// guarantee permanent quiescence of the original native worker, exact
+    /// source/destination and original durable artifact namespace custody,
+    /// excluding surviving or external writers and aliases through release.
+    /// An empty registry is not proof. This never repeats the tool or
+    /// changes its terminal result or broader Run hazard.
+    pub fn recover<F: crate::source_checkpoint::GitSourceFence>(
+        &self,
+        registry: &SandboxDriverRegistry,
+        native: &SandboxDriverHandle<NativeFilesystemDriver>,
+        manager: &PrincipalId,
+        target: NativeSourceRecoveryTarget<'_>,
+        authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
+    ) -> Result<SandboxEffectOutcome> {
+        let mut held = None;
+        let mut physical = None;
+        let result = self.store.sandbox_recover_tool_source_effect(
+            manager,
+            target.agent_ref,
+            target.turn_id,
+            target.call_id,
+            |recovery| {
+                registry.reader()?.get(native)?;
+                let tool = FsTool::from_name(&recovery.original.call.name).ok_or(Error::Denied(
+                    "original effect is not a native filesystem tool",
+                ))?;
+                let effect = if tool.action() == Action::Read {
+                    ToolEffect::Read
+                } else {
+                    ToolEffect::Write
+                };
+                if recovery.driver != native.descriptor().driver
+                    || recovery.original.effect != effect
+                    || recovery.source != ToolSourceEvidence::trusted_host()
+                    || tool == FsTool::Remove
+                {
+                    return Err(Error::Denied(
+                        "original effect is not owned by this native driver",
+                    ));
+                }
+                let (fence, state_root) = authorize(recovery)?;
+                held = Some(fence);
+                let locations = held
+                    .as_ref()
+                    .expect("live native recovery fence")
+                    .locations();
+                if locations.len() != recovery.sources.len() || locations.is_empty() {
+                    return Err(Error::Conflict(
+                        "native recovery requires exact original source set",
+                    ));
+                }
+                let sandbox = self.store.sandbox_get(manager, &recovery.sandbox_ref)?;
+                if locations.len() == 1
+                    && locations[0].repository == sandbox.tool_root
+                    && sandbox.sources.len() != 1
+                {
+                    return Err(Error::Denied(
+                        "native recovery cannot grant a multi-source parent",
+                    ));
+                }
+                let mut roots = Vec::with_capacity(locations.len());
+                for (source, location) in recovery.sources.iter().zip(locations) {
+                    if source.binding.binding.name != location.name {
+                        return Err(Error::Conflict("native recovery source selection changed"));
+                    }
+                    crate::source_filesystem::require_named_root(
+                        &sandbox.tool_root,
+                        &location.name,
+                        &location.repository,
+                        locations.len(),
+                    )?;
+                    roots.push(NativeSourceRoot {
+                        source: source.clone(),
+                        physical: GrantIdentity {
+                            path: location.repository.clone(),
+                            volume: location.repository_identity.0,
+                            object: location.repository_identity.1,
+                            read: true,
+                            write: source.access == SourceAccess::ReadWrite,
+                        },
+                        private_artifacts: reopen_source_artifacts(
+                            &location.repository,
+                            &state_root,
+                        )?,
+                    });
+                }
+                let layout = self.pin_layout(&sandbox.tool_root, roots, true)?;
+                physical = Some(layout);
+                physical
+                    .as_ref()
+                    .expect("pinned native recovery layout")
+                    .reconcile_private_artifacts()?;
+                Ok(SandboxEffectOutcome::Settled)
+            },
+        );
+        // Keep the independent authority and physical pins through the
+        // original source owner settlement (also on failure).
+        drop(physical);
+        drop(held);
+        result
+    }
+}
+
+/// Original journal identity, not a new recovery operation ID.
+pub struct NativeSourceRecoveryTarget<'a> {
+    pub agent_ref: &'a str,
+    pub turn_id: u64,
+    pub call_id: &'a str,
 }
 
 /// Explicit native-only host composition for independently approved named

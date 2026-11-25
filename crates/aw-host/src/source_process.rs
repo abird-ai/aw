@@ -1315,63 +1315,46 @@ mod tests {
         use crate::source_filesystem::{ApprovedSourceLayout, NativeSourceAdmission};
         use crate::source_filesystem::{NativeFilesystemDriver, SourceFilesystemRoute};
         #[cfg(feature = "git-source-effects")]
-        use crate::source_git::GitNativeSourceHost;
+        use crate::source_git::{
+            GitNativeSourceHost, GitNativeSourceResolver, NativeSourceRecoveryTarget,
+        };
         use aw_agent_core::{
             AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
         };
         use aw_tools::{
-            filesystem::{private_artifact, schema::Tool as FsTool},
+            filesystem::{backend::SecuredFilesystem, schema::Tool as FsTool},
             OperationId,
         };
         use aw_tools_adapter::{
-            native_filesystem::{GrantSpec, PrivateArtifactRegistry},
+            native_filesystem::{reopen_source_artifacts, CapabilitySet, GrantSpec, PreparedGrant},
             operation_router::OperationRouter,
         };
+        use std::os::unix::fs::DirBuilderExt;
 
-        // Pause exactly one real staged write inside its existing artifact
-        // reservation boundary, so losing the awaiter is deterministic.
-        struct StagePause {
-            started: tokio::sync::oneshot::Sender<()>,
-            resume: std::sync::mpsc::Receiver<()>,
-        }
-        #[derive(Default)]
-        struct PausedArtifacts(std::sync::Mutex<Option<StagePause>>);
-        impl private_artifact::Store for PausedArtifacts {
-            fn durable(&self) -> bool {
-                false
-            }
-            fn load(
-                &self,
-            ) -> std::result::Result<Vec<private_artifact::Record>, private_artifact::Error>
-            {
-                Ok(Vec::new())
-            }
-            fn reserve(
-                &self,
-                _: &private_artifact::Record,
-            ) -> std::result::Result<(), private_artifact::Error> {
-                if let Some(pause) = self.0.lock().unwrap().take() {
-                    let _ = pause.started.send(());
-                    pause
-                        .resume
-                        .recv()
-                        .map_err(|_| private_artifact::Error::Conflict)?;
+        // Observe the original claim while an existing filesystem
+        // mutation lock prevents the worker from completing.
+        async fn wait_claim(database: &std::path::Path, call_id: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let claimed: bool = Connection::open(database)
+                        .unwrap()
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM commit_log l JOIN run_events e
+                         ON l.entity_id='source-tool:'||e.seq
+                         WHERE l.entity_type='source_effect' AND l.kind='source.effect.claimed'
+                           AND json_extract(e.payload,'$.record.call.id')=?1)",
+                            [call_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    if claimed {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Ok(())
-            }
-            fn finalize(
-                &self,
-                _: &private_artifact::Record,
-                _: &private_artifact::Record,
-            ) -> std::result::Result<(), private_artifact::Error> {
-                Ok(())
-            }
-            fn retire(
-                &self,
-                _: &private_artifact::Record,
-            ) -> std::result::Result<(), private_artifact::Error> {
-                Ok(())
-            }
+            })
+            .await
+            .unwrap();
         }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1563,13 +1546,20 @@ mod tests {
                 serde_json::json!({"path":path}),
             ));
         }
+        records.push((
+            "native:data-write",
+            FsTool::Write,
+            ToolEffect::Write,
+            serde_json::json!({"path":"data/code","content":"must not write"}),
+        ));
+        #[cfg(feature = "git-source-effects")]
+        records.push((
+            "native:artifact",
+            FsTool::Write,
+            ToolEffect::Write,
+            serde_json::json!({"path":"code/code","content":"artifact boundary"}),
+        ));
         records.extend([
-            (
-                "native:data-write",
-                FsTool::Write,
-                ToolEffect::Write,
-                serde_json::json!({"path":"data/code","content":"must not write"}),
-            ),
             (
                 "native:write",
                 FsTool::Write,
@@ -1621,7 +1611,12 @@ mod tests {
             c.execute("UPDATE agent_state_current SET sandbox_id=?1,admission='held' WHERE session_id=?2 AND branch_id=?3",
                 params![sandbox.canonical_ref, session.id, branch.id]).unwrap();
         }
-        let artifacts = Arc::new(PausedArtifacts::default());
+        let artifact_state = temp.0.join("artifact-state");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&artifact_state)
+            .unwrap();
+        let artifact_state = artifact_state.canonicalize().unwrap();
         let approval = NativeSourceApproval::pin(
             store.clone(),
             NativeSourceApprovalSpec {
@@ -1634,27 +1629,39 @@ mod tests {
                 // Reverse input order deliberately; the policy uses canonical
                 // name order and retains each original artifact owner.
                 directories: vec![
-                    NativeSourceDirectorySpec {
-                        source: VersionedSourceBinding {
+                    NativeSourceDirectorySpec::durable(
+                        VersionedSourceBinding {
                             binding: bindings[1].clone(),
                             binding_rev: 1,
                         },
-                        directory: GrantSpec::read(&data),
-                        private_artifacts: PrivateArtifactRegistry::memory(),
-                    },
-                    NativeSourceDirectorySpec {
-                        source: VersionedSourceBinding {
+                        GrantSpec::read(&data),
+                        &artifact_state,
+                    )
+                    .unwrap(),
+                    NativeSourceDirectorySpec::durable(
+                        VersionedSourceBinding {
                             binding: bindings[0].clone(),
                             binding_rev: 1,
                         },
-                        directory: GrantSpec::read_write(&root),
-                        private_artifacts: PrivateArtifactRegistry::open(artifacts.clone())
-                            .unwrap(),
-                    },
+                        GrantSpec::read_write(&root),
+                        &artifact_state,
+                    )
+                    .unwrap(),
                 ],
             },
         )
         .unwrap();
+        let artifact_registry = reopen_source_artifacts(&root, &artifact_state).unwrap();
+        let fixture_backend = CapabilitySet::open_prepared(
+            &base,
+            [PreparedGrant::new(
+                GrantSpec::read_write(&root),
+                artifact_registry.clone(),
+            )],
+        )
+        .unwrap();
+        let database = temp.0.join("sessions.sqlite3");
+        let artifact_revision = u64::from(cfg!(feature = "git-source-effects"));
         let set = SourceMutationSet::from_bindings(&bindings).unwrap();
         let agent_binding =
             AgentExecutionBinding::from_trusted_host(&reference, &session.id, &branch.id).unwrap();
@@ -1667,6 +1674,8 @@ mod tests {
                 NativeFilesystemDriver,
             )
             .unwrap();
+        #[cfg(feature = "git-source-effects")]
+        let resolver = GitNativeSourceResolver::new(store.clone(), git_handle.clone()).unwrap();
         #[cfg(feature = "git-source-effects")]
         let host = GitNativeSourceHost::new(
             approval.clone(),
@@ -1760,8 +1769,8 @@ mod tests {
             SourceFilesystemRoute::new(
                 store.clone(),
                 agent_binding.clone(),
-                drivers,
-                handle,
+                drivers.clone(),
+                handle.clone(),
                 builder.tool_binding_authority(),
                 options.limits,
                 resolve,
@@ -1816,7 +1825,7 @@ mod tests {
                         .sandbox_get(&actor, &sandbox.canonical_ref)
                         .unwrap()
                         .rev,
-                    sandbox.rev + 1
+                    sandbox.rev + 1 + artifact_revision
                 );
                 assert_eq!(
                     store
@@ -1831,17 +1840,14 @@ mod tests {
                     SandboxEffectOutcome::Settled
                 );
 
-                let (started, entered) = tokio::sync::oneshot::channel();
-                let (resume, wait) = std::sync::mpsc::channel();
-                *artifacts.0.lock().unwrap() = Some(StagePause {
-                    started,
-                    resume: wait,
-                });
+                let lock = fixture_backend
+                    .lock(&["code/code".into()], &|| false)
+                    .unwrap();
                 let mut pending =
                     route.execute(op, ctx, &record.call.arguments, Arc::new(NoFallback));
                 tokio::select! {
                     result = &mut pending => panic!("native worker finished before pause: {result:?}"),
-                    entered = tokio::time::timeout(Duration::from_secs(5), entered) => entered.unwrap().unwrap(),
+                    _ = wait_claim(&database, &id) => {},
                 }
                 drop(pending);
                 assert_eq!(std::fs::read(root.join("code")).unwrap(), b"native changed");
@@ -1862,7 +1868,7 @@ mod tests {
                     _ = std::future::ready(()) => {},
                 }
                 assert!(approval.read().is_err());
-                resume.send(()).unwrap();
+                drop(lock);
                 assert!(tokio::time::timeout(Duration::from_secs(5), &mut revoke)
                     .await
                     .unwrap());
@@ -1884,10 +1890,52 @@ mod tests {
                 final_records.push(record);
                 continue;
             }
-            let output = route
-                .execute(op, ctx, &record.call.arguments, Arc::new(NoFallback))
-                .await
-                .unwrap();
+            let lock = (id == "native:artifact").then(|| {
+                fixture_backend
+                    .lock(&["code/code".into()], &|| false)
+                    .unwrap()
+            });
+            let mut pending = route.execute(op, ctx, &record.call.arguments, Arc::new(NoFallback));
+            if let Some(lock) = lock {
+                tokio::select! {
+                    result = &mut pending => panic!("native worker finished before artifact boundary: {result:?}"),
+                    _ = wait_claim(&database, &id) => {},
+                }
+                // Simulate loss at the real durable Stage reservation /
+                // finalization boundary while original source custody is
+                // held. Keep the actual private file and its exact record.
+                use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity};
+                use std::{
+                    io::Write,
+                    os::unix::fs::{MetadataExt, OpenOptionsExt},
+                };
+                let identity = |path: &std::path::Path| {
+                    let meta = std::fs::symlink_metadata(path).unwrap();
+                    ObjectIdentity {
+                        volume: meta.dev(),
+                        object: meta.ino(),
+                    }
+                };
+                let name = ".aw-stage-recovery-fixture.tmp";
+                let mut reservation = artifact_registry
+                    .reserve_name(Kind::Stage, String::new(), identity(&root), name.into())
+                    .unwrap();
+                let path = root.join(name);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                let lease = reservation.finalize(identity(&path)).unwrap();
+                file.write_all(b"unpublished private bytes").unwrap();
+                file.sync_all().unwrap();
+                drop(file);
+                drop(lease);
+                std::fs::write(root.join(".aw-stage-unowned-fixture.tmp"), b"keep").unwrap();
+                drop(lock);
+            }
+            let output = pending.await.unwrap();
             match id.as_str() {
                 "native:read" => assert!(output.content.contains("initial") && !output.is_error),
                 "native:data-read" => {
@@ -1907,6 +1955,10 @@ mod tests {
                 "native:git-private" | "native:data-private" => {
                     assert!(output.is_error && !output.content.contains("repositoryformatversion"))
                 }
+                "native:artifact" => assert!(
+                    !output.is_error
+                        && std::fs::read(root.join("code")).unwrap() == b"artifact boundary"
+                ),
                 "native:write" => assert!(
                     !output.is_error
                         && std::fs::read(root.join("code")).unwrap() == b"native changed"
@@ -1939,6 +1991,118 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "git-source-effects")]
+            if id == "native:artifact" {
+                use aw_git::source_driver::GitSourceLocation;
+                use std::os::unix::fs::MetadataExt;
+                struct RecoveryFence<'a> {
+                    locations: Vec<GitSourceLocation>,
+                    _guard: std::sync::RwLockReadGuard<'a, ()>,
+                }
+                impl crate::source_checkpoint::GitSourceFence for RecoveryFence<'_> {
+                    fn locations(&self) -> &[GitSourceLocation] {
+                        &self.locations
+                    }
+                }
+                // All fixture writers have completed. This independent
+                // fixture owner protects both the original source set and
+                // its persistent artifact namespace through settlement.
+                let authority = std::sync::RwLock::new(());
+                let authorize = |recovery: &aw_store::SandboxToolRecovery, state: PathBuf| {
+                    assert_eq!(recovery.original.call.id, id);
+                    assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
+                    let locations = [("code", &root), ("data", &data)]
+                        .map(|(name, path)| {
+                            let meta = std::fs::metadata(path).unwrap();
+                            GitSourceLocation {
+                                name: SourceName::new(name).unwrap(),
+                                repository: path.clone(),
+                                repository_identity: (meta.dev(), meta.ino()),
+                            }
+                        })
+                        .to_vec();
+                    Ok((
+                        RecoveryFence {
+                            locations,
+                            _guard: authority.read().unwrap(),
+                        },
+                        state,
+                    ))
+                };
+                assert_eq!(
+                    store
+                        .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, &id)
+                        .unwrap(),
+                    None
+                );
+                assert!(root.join(".aw-stage-recovery-fixture.tmp").is_file());
+                let wrong_state = temp.0.join("unprovisioned-artifact-state");
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&wrong_state)
+                    .unwrap();
+                assert!(resolver
+                    .recover(
+                        &drivers,
+                        &handle,
+                        &actor,
+                        NativeSourceRecoveryTarget {
+                            agent_ref: &reference,
+                            turn_id: 1,
+                            call_id: &id
+                        },
+                        |recovery| authorize(recovery, wrong_state.canonicalize().unwrap()),
+                    )
+                    .is_err());
+                assert!(root.join(".aw-stage-recovery-fixture.tmp").is_file());
+                assert!(store
+                    .acquire_source_mutation_barrier(&set, "host:unresolved-artifact")
+                    .is_err());
+                assert_eq!(
+                    resolver
+                        .recover(
+                            &drivers,
+                            &handle,
+                            &actor,
+                            NativeSourceRecoveryTarget {
+                                agent_ref: &reference,
+                                turn_id: 1,
+                                call_id: &id
+                            },
+                            |recovery| authorize(recovery, artifact_state.clone()),
+                        )
+                        .unwrap(),
+                    SandboxEffectOutcome::Settled
+                );
+                assert!(!root.join(".aw-stage-recovery-fixture.tmp").exists());
+                assert!(artifact_registry.records().unwrap().is_empty());
+                assert_eq!(
+                    std::fs::read(root.join(".aw-stage-unowned-fixture.tmp")).unwrap(),
+                    b"keep"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("code")).unwrap(),
+                    b"artifact boundary"
+                );
+                assert_eq!(
+                    resolver
+                        .recover(
+                            &drivers,
+                            &handle,
+                            &actor,
+                            NativeSourceRecoveryTarget {
+                                agent_ref: &reference,
+                                turn_id: 1,
+                                call_id: &id
+                            },
+                            |_| -> Result<(RecoveryFence<'_>, PathBuf)> {
+                                panic!("released original effect cannot inspect again")
+                            },
+                        )
+                        .unwrap(),
+                    SandboxEffectOutcome::Settled
+                );
+            }
             if id != "native:write" {
                 // Real original post-journal hook; no extra execution or
                 // model-visible result projection.
@@ -1974,7 +2138,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 2
+            sandbox.rev + 2 + artifact_revision
         );
         assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
         assert!(approval.read().is_err());
@@ -1995,6 +2159,10 @@ mod tests {
         drop(agent);
         drop(options);
         drop(route);
+        drop(fixture_backend);
+        drop(artifact_registry);
+        #[cfg(feature = "git-source-effects")]
+        drop(resolver);
         #[cfg(feature = "git-source-effects")]
         drop(host);
         drop(approval);
@@ -2035,7 +2203,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 3
+            sandbox.rev + 3 + artifact_revision
         );
         assert!(store.activate(&actor, &session.id, &branch.id).is_err());
     }

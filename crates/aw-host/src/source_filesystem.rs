@@ -60,6 +60,7 @@ pub struct ApprovedSourceLayout {
     sources: Vec<EffectiveSourceBinding>,
     root_granted: bool,
     capability: CapabilitySet,
+    writable_artifacts: Vec<Arc<PrivateArtifactRegistry>>,
 }
 
 impl ApprovedSourceLayout {
@@ -142,11 +143,38 @@ impl ApprovedSourceLayout {
             }
         }
         let root_granted = roots[0].physical.path == base;
+        let writable_artifacts = roots
+            .iter()
+            .filter(|root| root.source.access == SourceAccess::ReadWrite)
+            .map(|root| root.private_artifacts.clone())
+            .collect();
         Ok(Self {
             sources: roots.into_iter().map(|root| root.source).collect(),
             root_granted,
             capability,
+            writable_artifacts,
         })
+    }
+
+    /// A successful tool result is not proof that its mutation-private
+    /// objects were retired. No record scan on read-only effects.
+    fn artifacts_retired(&self) -> bool {
+        self.writable_artifacts
+            .iter()
+            .all(|registry| registry.records().is_ok_and(|records| records.is_empty()))
+    }
+
+    #[cfg(feature = "git-source-effects")]
+    pub(crate) fn reconcile_private_artifacts(&self) -> Result<()> {
+        self.capability
+            .reconcile_private_artifacts()
+            .map_err(|_| Error::Conflict("native private artifact cleanup unresolved"))?;
+        if !self.artifacts_retired() {
+            return Err(Error::Conflict(
+                "native private artifact custody remains unresolved",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -159,7 +187,7 @@ impl NativeFilesystemDriver {
         &self,
         plan: &SandboxEffectPlan,
         layout: ApprovedSourceLayout,
-    ) -> Result<CapabilitySet> {
+    ) -> Result<ApprovedSourceLayout> {
         if layout.sources != plan.grant.sources
             || layout.capability.base() != plan.sandbox.tool_root
             || (layout.root_granted && plan.sandbox.sources.len() != 1)
@@ -168,7 +196,7 @@ impl NativeFilesystemDriver {
                 "native source layout differs from authorized Sandbox",
             ));
         }
-        Ok(layout.capability)
+        Ok(layout)
     }
 }
 
@@ -342,7 +370,7 @@ where
             |driver, plan, _| Ok((driver.prepare(plan, layout)?, request)),
         )?;
         let live = prepared.authority().tool.clone();
-        let ((capability, request), authority, lease) = prepared.admit_with_authority()?;
+        let ((layout, request), authority, lease) = prepared.admit_with_authority()?;
         // The actual worker owns the Store lease as well as the pinned
         // directory and live policy. A dropped awaiter must not lose a
         // factual completion or release the original Store owner.
@@ -351,10 +379,10 @@ where
                 (Err(Error::Cancelled), SandboxEffectOutcome::NotStarted)
             } else {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    request.execute(&capability, &|| cancellation.is_cancelled())
+                    request.execute(&layout.capability, &|| cancellation.is_cancelled())
                 })) {
                     Ok(result) => {
-                        let outcome = if result.is_ok() {
+                        let outcome = if result.is_ok() && layout.artifacts_retired() {
                             SandboxEffectOutcome::Settled
                         } else {
                             SandboxEffectOutcome::Unknown
@@ -369,7 +397,7 @@ where
                     ),
                 }
             };
-            drop(capability);
+            drop(layout);
             // Persist positive quiescence (or Unknown) while the worker
             // still holds its independent authority, before any result
             // can reach the original ToolFinished owner.

@@ -21,7 +21,43 @@ struct NamespaceKey {
     root: PathBuf,
 }
 
-static REGISTRIES: OnceLock<Mutex<HashMap<NamespaceKey, Weak<Registry>>>> = OnceLock::new();
+struct CachedRegistry {
+    registry: Weak<Registry>,
+    source_owned: bool,
+}
+static REGISTRIES: OnceLock<Mutex<HashMap<NamespaceKey, CachedRegistry>>> = OnceLock::new();
+
+fn with_registry<T>(
+    key: NamespaceKey,
+    source_owned: bool,
+    create: impl FnOnce() -> Result<Arc<Registry>>,
+    open: impl FnOnce(Arc<Registry>, bool) -> Result<T>,
+) -> Result<T> {
+    let cache = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| Error::Protocol("private artifact registry cache poisoned"))?;
+    if let Some(entry) = cache.get(&key) {
+        if let Some(registry) = entry.registry.upgrade() {
+            if entry.source_owned != source_owned {
+                return Err(Error::Conflict(
+                    "private artifact namespace belongs to another recovery owner",
+                ));
+            }
+            return open(registry, false);
+        }
+    }
+    let registry = create()?;
+    let result = open(registry.clone(), true)?;
+    cache.insert(
+        key,
+        CachedRegistry {
+            registry: Arc::downgrade(&registry),
+            source_owned,
+        },
+    );
+    Ok(result)
+}
 
 #[cfg(unix)]
 fn artifact_error(error: ArtifactError) -> Error {
@@ -45,15 +81,88 @@ fn root_digest(root: &Path) -> String {
 #[cfg(unix)]
 struct FileStore {
     dir: PathBuf,
+    source_owned: bool,
 }
 #[cfg(unix)]
 impl FileStore {
-    fn new(state_root: &Path, root: &Path) -> Result<Self> {
-        let dir = state_root
+    // This marker selects the existing registry's recovery owner, not
+    // physical quiescence or an effect receipt. A legacy ambient opener
+    // must never automatically clean source-owned records after restart.
+    const SOURCE_OWNER: &'static str = ".source-owned-v1";
+    const SOURCE_OWNER_BYTES: &'static [u8] = b"aw-source-artifacts-v1\n";
+
+    fn directory(state_root: &Path, root: &Path) -> PathBuf {
+        state_root
             .join("tool-private-artifacts")
-            .join(root_digest(root));
+            .join(root_digest(root))
+    }
+
+    fn new(state_root: &Path, root: &Path) -> Result<Self> {
+        let dir = Self::directory(state_root, root);
         aw_platform::ensure_private_dir(&dir).map_err(Error::Io)?;
-        Ok(Self { dir })
+        let store = Self {
+            dir,
+            source_owned: false,
+        };
+        store.require_owner()?;
+        Ok(store)
+    }
+
+    fn source(state_root: &Path, root: &Path, create: bool) -> Result<Self> {
+        let dir = Self::directory(state_root, root);
+        if create {
+            aw_platform::ensure_private_dir(&dir)?;
+        } else {
+            aw_platform::validate_private_dir(&dir)?;
+        }
+        let store = Self {
+            dir,
+            source_owned: true,
+        };
+        let marker = store.dir.join(Self::SOURCE_OWNER);
+        match std::fs::symlink_metadata(&marker) {
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::read_dir(&store.dir)?.next().transpose()?.is_some() {
+                    return Err(Error::Conflict(
+                        "cannot adopt ambient private artifact records",
+                    ));
+                }
+                use std::io::Write;
+                let mut file = aw_platform::open_private_new(&marker)?;
+                file.write_all(Self::SOURCE_OWNER_BYTES)?;
+                file.sync_all()?;
+                aw_platform::sync_parent(&marker)?;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        store.require_owner()?;
+        Ok(store)
+    }
+
+    fn require_owner(&self) -> Result<()> {
+        let marker = self.dir.join(Self::SOURCE_OWNER);
+        if self.source_owned {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            aw_platform::open_private_existing(&marker, false)?
+                .take((Self::SOURCE_OWNER_BYTES.len() + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes != Self::SOURCE_OWNER_BYTES {
+                return Err(Error::Conflict("invalid source artifact namespace owner"));
+            }
+        } else {
+            match std::fs::symlink_metadata(&marker) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(Error::Conflict(
+                        "source artifact namespace requires original source recovery owner",
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     fn record_path(&self, record: &Record) -> Result<PathBuf> {
@@ -133,7 +242,13 @@ impl FileStore {
 #[cfg(unix)]
 impl Store for FileStore {
     fn load(&self) -> std::result::Result<Vec<Record>, ArtifactError> {
-        aw_platform::ensure_private_dir(&self.dir)
+        if self.source_owned {
+            aw_platform::validate_private_dir(&self.dir)
+        } else {
+            aw_platform::ensure_private_dir(&self.dir)
+        }
+        .map_err(|error| ArtifactError::Store(error.to_string()))?;
+        self.require_owner()
             .map_err(|error| ArtifactError::Store(error.to_string()))?;
         let mut records = BTreeMap::<
             (
@@ -152,6 +267,9 @@ impl Store for FileStore {
                     "non-UTF8 private artifact record filename".into(),
                 ));
             };
+            if self.source_owned && name == Self::SOURCE_OWNER {
+                continue;
+            }
             if Self::is_pending_name(name) {
                 self.reclaim_pending_record(&item.path())?;
                 continue;
@@ -192,7 +310,15 @@ impl Store for FileStore {
 
     fn reserve(&self, record: &Record) -> std::result::Result<(), ArtifactError> {
         use std::io::Write as _;
-        aw_platform::ensure_private_dir(&self.dir)
+        // A source-owned namespace cannot be silently recreated after
+        // loss of its durable state or recovery-owner marker.
+        if self.source_owned {
+            aw_platform::validate_private_dir(&self.dir)
+        } else {
+            aw_platform::ensure_private_dir(&self.dir)
+        }
+        .map_err(|error| ArtifactError::Store(error.to_string()))?;
+        self.require_owner()
             .map_err(|error| ArtifactError::Store(error.to_string()))?;
         let path = self
             .record_path(record)
@@ -255,6 +381,8 @@ impl Store for FileStore {
     }
 
     fn retire(&self, record: &Record) -> std::result::Result<(), ArtifactError> {
+        self.require_owner()
+            .map_err(|error| ArtifactError::Store(error.to_string()))?;
         let path = self
             .record_path(record)
             .map_err(|error| ArtifactError::Store(error.to_string()))?;
@@ -290,33 +418,77 @@ pub(crate) fn open_root(
         let _ = state_root;
         None
     };
-    let key = namespace_key(&canonical, durable_state.as_deref());
-    let cache = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .map_err(|_| Error::Protocol("private artifact registry cache poisoned"))?;
-    if let Some(registry) = cache.get(&key).and_then(Weak::upgrade) {
-        return crate::platform_fs(aw_platform::scoped_fs::Root::open_with_private_artifacts(
-            &canonical, registry,
+    with_registry(
+        namespace_key(&canonical, durable_state.as_deref()),
+        false,
+        || {
+            #[cfg(unix)]
+            if let Some(state_root) = durable_state.as_deref() {
+                return Registry::open(Arc::new(FileStore::new(state_root, &canonical)?))
+                    .map_err(artifact_error);
+            }
+            Ok(Registry::memory())
+        },
+        |registry, fresh| {
+            let root = crate::platform_fs(
+                aw_platform::scoped_fs::Root::open_with_private_artifacts(&canonical, registry),
+            )?;
+            if fresh {
+                crate::platform_fs(root.reconcile_private_artifacts())?;
+            }
+            Ok(root)
+        },
+    )
+}
+
+/// Provision the existing durable artifact namespace for an independently
+/// approved source directory. This never reconciles source contents. The
+/// host owns exclusive protection of the private state and source roots.
+pub fn open_source_artifacts(root: &Path, state_root: &Path) -> Result<Arc<Registry>> {
+    source_artifacts(root, state_root, true)
+}
+
+/// Recovery may reopen only an already-provisioned namespace. Missing or
+/// unsupported durable state is not an empty registry or quiescence proof.
+pub fn reopen_source_artifacts(root: &Path, state_root: &Path) -> Result<Arc<Registry>> {
+    source_artifacts(root, state_root, false)
+}
+
+#[cfg(unix)]
+fn source_artifacts(root: &Path, state_root: &Path, create: bool) -> Result<Arc<Registry>> {
+    if !aw_platform::secure_private_files_supported()
+        || root.canonicalize()? != root
+        || !root.is_dir()
+        || state_root.canonicalize()? != state_root
+        || root.starts_with(state_root)
+        || state_root.starts_with(root)
+    {
+        return Err(Error::Conflict(
+            "source artifacts require exact disjoint durable private state",
         ));
     }
+    aw_platform::validate_private_dir(state_root)?;
+    with_registry(
+        namespace_key(root, Some(state_root)),
+        true,
+        || {
+            Registry::open(Arc::new(FileStore::source(state_root, root, create)?))
+                .map_err(artifact_error)
+        },
+        |registry, _| {
+            // Recovery cannot silently adopt missing state even if a live
+            // registry remains cached. Opening does not touch source files.
+            FileStore::source(state_root, root, false)?;
+            Ok(registry)
+        },
+    )
+}
 
-    #[cfg(unix)]
-    let registry = if let Some(state_root) = durable_state.as_deref() {
-        Registry::open(Arc::new(FileStore::new(state_root, &canonical)?)).map_err(artifact_error)?
-    } else {
-        Registry::memory()
-    };
-    #[cfg(not(unix))]
-    let registry = Registry::memory();
-
-    let root = crate::platform_fs(aw_platform::scoped_fs::Root::open_with_private_artifacts(
-        &canonical,
-        registry.clone(),
-    ))?;
-    crate::platform_fs(root.reconcile_private_artifacts())?;
-    cache.insert(key, Arc::downgrade(&registry));
-    Ok(root)
+#[cfg(not(unix))]
+fn source_artifacts(_root: &Path, _state_root: &Path, _create: bool) -> Result<Arc<Registry>> {
+    Err(Error::Conflict(
+        "durable source artifact custody unavailable on this platform",
+    ))
 }
 
 #[cfg(all(test, unix))]
@@ -361,6 +533,54 @@ mod tests {
     fn fresh_registry(temp: &Temp) -> Arc<Registry> {
         let workspace = temp.workspace.canonicalize().unwrap();
         Registry::open(Arc::new(FileStore::new(&temp.state, &workspace).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn source_namespace_reopens_without_ambient_cleanup() {
+        use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity};
+        use std::os::unix::fs::MetadataExt;
+        let temp = Temp::new("source-owner");
+        let root = temp.workspace.canonicalize().unwrap();
+        let state = temp.state.canonicalize().unwrap();
+        assert!(reopen_source_artifacts(&root, &state).is_err());
+        let registry = open_source_artifacts(&root, &state).unwrap();
+        assert!(registry.is_durable());
+        assert!(Arc::ptr_eq(
+            &registry,
+            &reopen_source_artifacts(&root, &state).unwrap()
+        ));
+        assert!(open_root(&root, Some(&state)).is_err());
+
+        let identity = |path: &Path| {
+            let meta = fs::symlink_metadata(path).unwrap();
+            ObjectIdentity {
+                volume: meta.dev(),
+                object: meta.ino(),
+            }
+        };
+        let name = ".aw-stage-source-fixture.tmp";
+        let mut reservation = registry
+            .reserve_name(Kind::Stage, String::new(), identity(&root), name.into())
+            .unwrap();
+        let private = root.join(name);
+        let file = aw_platform::open_private_new(&private).unwrap();
+        let lease = reservation.finalize(identity(&private)).unwrap();
+        drop(file);
+        drop(lease);
+        drop(reservation);
+        drop(registry);
+        // No live cache owner: the persisted namespace discriminator
+        // still prevents legacy startup from cleaning the source.
+        assert!(open_root(&root, Some(&state)).is_err());
+        let registry = reopen_source_artifacts(&root, &state).unwrap();
+        assert_eq!(registry.records().unwrap().len(), 1);
+        assert!(private.is_file());
+        let capability =
+            aw_platform::scoped_fs::Root::open_with_private_artifacts(&root, registry.clone())
+                .unwrap();
+        capability.reconcile_private_artifacts().unwrap();
+        assert!(!private.exists());
+        assert!(registry.records().unwrap().is_empty());
     }
 
     #[test]

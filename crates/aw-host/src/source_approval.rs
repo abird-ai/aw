@@ -38,6 +38,26 @@ pub struct NativeSourceDirectorySpec {
     pub private_artifacts: Arc<PrivateArtifactRegistry>,
 }
 
+impl NativeSourceDirectorySpec {
+    /// Trusted provisioning of the actual persistent artifact owner.
+    /// This neither grants source access nor performs physical cleanup.
+    pub fn durable(
+        source: VersionedSourceBinding,
+        directory: GrantSpec,
+        state_root: &Path,
+    ) -> Result<Self> {
+        let private_artifacts = aw_tools_adapter::native_filesystem::open_source_artifacts(
+            &directory.path,
+            state_root,
+        )?;
+        Ok(Self {
+            source,
+            directory,
+            private_artifacts,
+        })
+    }
+}
+
 struct Decision {
     agent: AgentExecutionBinding,
     policy: SandboxGrantPolicy,

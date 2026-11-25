@@ -54,8 +54,8 @@ staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
 and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
-source detachment, and independently approved multi-source native filesystem
-realization are implemented locally.
+source detachment, independently approved multi-source native filesystem
+realization and durable native artifact custody/recovery are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2495,13 +2495,57 @@ Store failures remain recorded, not rerun. Existing single-root physical encodin
 remains compatible; general multi-source Process containment and host provisioning
 still open.
 
+Durable native artifact custody composes the existing adapter FileStore, registry
+cache and lower exact private-artifact owner, not another ledger. A bounded private
+`.source-owned-v1` namespace discriminator selects deferred source-owner recovery;
+legacy ambient open refuses that same persistent namespace (including after cache
+loss), and a source opener cannot adopt nonempty unmarked ambient records. Original
+FileStore root digest/record format remains unchanged. `open_source_artifacts`
+provisions in separately protected, canonical disjoint private state; recovery-only
+`reopen_source_artifacts` requires the existing marked namespace. Missing or unsupported
+state cannot become empty/volatile custody. Opening never reconciles source files.
+`NativeSourceDirectorySpec::durable` composes the actual artifact registry with trusted
+approval; custom providers can still supply the original Registry contract. Native
+worker keeps the narrowed ApprovedSourceLayout through completion and checks that
+writable private-artifact records are retired before recording positive source proof.
+A factual successful ToolOutput survives unresolved artifact custody (Unknown).
+`GitNativeSourceResolver::recover` uses the original journal-linked recovery owner,
+typed registered native driver, original trusted-host filesystem intent, exact
+claimed named roots, independent quiescence/namespace guard and the actual registered
+Git driver/pins. Normal preparation and recovery share Git administration exclusions;
+recovery refuses unexpected RO records or records overlapping excluded administration.
+No arbitrary source file deletion, replay, replacement effect, new journal receipt or
+Run-hazard acknowledgement. The original lower artifact reconciler uses exact durable
+records; all writable records must retire before source release. Independent physical
+and provider authority stays held through settlement, including failure. The host
+must know the actual original durable artifact state namespace and exclude all surviving
+workers, aliases and external writers; marker/empty registry alone is never quiescence,
+no automatic policy reconstruction or proof from a wrong pre-provisioned namespace.
+Unsupported private-file platforms remain denied; lower mount convergence unchanged.
+Grouped adapter regression drops/reopens the actual durable registry, refuses legacy
+automatic cleanup and reconciles an exact stage record. Existing native regression
+now uses real durable namespaces and actual mutation lock instead of test-only
+pausing Store. Under original source custody it simulates an interrupted Stage
+finalization, verifies successful ToolFinished with Unknown custody, missing namespace
+refusal, exact cleanup preserving unowned lookalikes and target contents, and terminal
+replay. Existing detached worker/reopen settlement remains exercised. Final artifact
+owner **8/8** (also green within adapter library run), non-Git native **1/1**, Host
+**16/16**, strict Adapter/Host all-target/all-feature Clippy, source-effects-only Host
+Clippy, workspace all-target/all-feature check and scoped fmt/diff passed. Broad
+adapter library **254/255**: unchanged `job_tools::tests::skipped_node_read_does_not_wait_for_sibling`
+fails the `finished.content.ends_with(" unchanged ack=all released=true")` assertion
+both in the full run and isolated rerun. Parent baseline not rerun; do not claim this
+failure pre-existing or the adapter suite fully green. Previously recorded Store
+failures not rerun. This does not claim a real process crash at every boundary or
+production Bubblewrap containment.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
-checkout cleanup, production cleanup composition/physical authority, effectful
+checkout cleanup, remaining production physical authority/cleanup, effectful
 final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v59.

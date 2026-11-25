@@ -1031,6 +1031,27 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Clippy for both feature variants, workspace check and scoped fmt/diff passed.
       No schema/new executor/admission or lower mount changes. General Process
       containment and independent host provisioning still pending.
+      **Durable native artifact custody/recovery landed:** same adapter FileStore and
+      cache, persistent source-owner discriminator prevents ambient cleanup of that
+      namespace on reopen. Explicit durable provisioning/recovery-only open, no
+      source-file cleanup during opening or silent volatile fallback. Native worker
+      keeps unresolved writable artifact custody Unknown even with factual successful
+      ToolOutput. Existing Git native resolver composes original journal recovery,
+      exact registered driver/intent/set, independent permanent quiescence and original
+      durable namespace authority, shared physical pin/admin exclusions and existing
+      exact artifact reconciler. No new operation ledger, Run acknowledgement or
+      execution admission. Missing namespace/RO records/protected administration
+      refuse; writable records must retire before release. Adapter real durable
+      reopen plus grouped native fixture simulate private Stage loss under original
+      claim, preserve successful terminal/unowned files, recover/replay and retain
+      detached-worker tests using actual native mutation lock. Host must independently
+      establish exact original state and physical exclusion; not automatic recovery
+      or authority from empty registry. Unsupported private-file platforms deny.
+      Artifact owner **8/8**, non-Git native **1/1**, Host **16/16**, strict affected
+      Clippy (including Host source-effects-only), workspace and scoped fmt/diff
+      passed. Adapter broad **254/255**; unchanged `skipped_node_read_does_not_wait_for_sibling`
+      acknowledgement assertion fails isolated rerun too; parent not rerun, no
+      full adapter green or proven pre-existing failure claim.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
