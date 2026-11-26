@@ -177,15 +177,30 @@ impl Job {
             sequence,
             width,
         )?;
+        projection.binding = Self::task_run_binding(task, job_id, projection.graph_hash)?;
+        Ok(projection)
+    }
+
+    /// Reuse the original task/Job identity in durable node custody without
+    /// rebuilding a live Job or allocating a copy of its Graph.
+    pub fn task_run_binding(
+        task: &crate::task_fence::TaskIdentity,
+        job_id: &str,
+        graph_hash: [u8; 32],
+    ) -> Result<[u8; 32], Error> {
+        task.validate().map_err(|_| Error::InvalidIdentity)?;
+        if job_id.is_empty() || job_id.len() > 256 || job_id.chars().any(char::is_control) {
+            return Err(Error::InvalidIdentity);
+        }
         let mut hash = Sha256::new();
         hash.update(b"aw-tools-core-job-task-binding-v2");
         hash.update(task.fingerprint());
         hash.update((job_id.len() as u64).to_le_bytes());
         hash.update(job_id.as_bytes());
-        hash.update(projection.graph_hash);
-        projection.binding = hash.finalize().into();
-        Ok(projection)
+        hash.update(graph_hash);
+        Ok(hash.finalize().into())
     }
+
     pub fn from_task_journal(
         graph: Graph,
         task: &crate::task_fence::TaskIdentity,

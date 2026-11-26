@@ -65,7 +65,7 @@ pub struct NodePolicy {
     pub task_result_eligible: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodePlan {
     coordinate: usize,
     tool: NodeTool,
@@ -108,6 +108,68 @@ impl NodePlan {
     }
     pub fn replay_identity(&self) -> [u8; 32] {
         self.replay_identity
+    }
+}
+
+/// Durable identity of one actual Running node. The existing Job binding
+/// includes the original task and graph; the coordinate identifies the
+/// effect within that Job. No new execution or replay namespace.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeExecutionBinding {
+    pub job_id: String,
+    pub coordinate: usize,
+    pub run_binding: [u8; 32],
+    pub graph_hash: [u8; 32],
+    pub plan_identity: [u8; 32],
+    pub running_sequence: u64,
+}
+
+impl NodeExecutionBinding {
+    /// Verify the original Job owner's exact terminal commit proposal.
+    pub fn settlement(&self, transition: Transition) -> Option<Status> {
+        if transition.run_binding != self.run_binding
+            || transition.graph_hash != self.graph_hash
+            || transition.node != Some(self.coordinate)
+            || transition.before
+                != Some(NodeState::Running {
+                    sequence: self.running_sequence,
+                })
+            || transition.previous_sequence < self.running_sequence
+            || transition.next_sequence <= transition.previous_sequence
+        {
+            return None;
+        }
+        match transition.action {
+            Action::Settle(status) if status.primary != Primary::Skip => Some(status),
+            Action::UnlaunchedSkip => Some(Status {
+                primary: Primary::Skip,
+                more: false,
+                incomplete: false,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Inert observation minted only by the original JobManager at Running.
+/// Contains the actual sealed plan and original outer Task, not a caller
+/// supplied subcall ID or an execution capability on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningNode {
+    binding: NodeExecutionBinding,
+    task: TaskIdentity,
+    plan: NodePlan,
+}
+impl RunningNode {
+    pub fn binding(&self) -> &NodeExecutionBinding {
+        &self.binding
+    }
+    pub fn task(&self) -> &TaskIdentity {
+        &self.task
+    }
+    pub fn plan(&self) -> &NodePlan {
+        &self.plan
     }
 }
 
@@ -1663,6 +1725,46 @@ impl JobManager {
             .job
             .state(coordinate)
             .ok_or(Error::InvalidPlans)
+    }
+
+    /// Capture one exact original node only after its Start commit.
+    /// No allocation or extra state in ordinary Job transitions.
+    pub fn running_node(
+        &self,
+        id: &str,
+        coordinate: usize,
+        running_sequence: u64,
+    ) -> Result<RunningNode, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if managed.transition_inflight.is_some()
+            || managed.job.journal_ambiguous()
+            || managed.job.state(coordinate)
+                != Some(NodeState::Running {
+                    sequence: running_sequence,
+                })
+        {
+            return Err(Error::Job(JobError::StaleGeneration));
+        }
+        let plan = managed
+            .plans
+            .get(coordinate.checked_sub(1).ok_or(Error::InvalidPlans)?)
+            .filter(|plan| plan.coordinate() == coordinate)
+            .ok_or(Error::InvalidPlans)?
+            .clone();
+        let task = managed.task_binding.clone().ok_or(Error::InvalidPlans)?;
+        Ok(RunningNode {
+            binding: NodeExecutionBinding {
+                job_id: id.to_owned(),
+                coordinate,
+                run_binding: managed.job.binding(),
+                graph_hash: managed.job.graph_hash(),
+                plan_identity: plan.replay_identity(),
+                running_sequence,
+            },
+            task,
+            plan,
+        })
     }
 
     /// Typed terminal process facts retained for one node. This is a

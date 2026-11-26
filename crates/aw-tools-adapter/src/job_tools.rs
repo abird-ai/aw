@@ -424,22 +424,61 @@ impl Tool for JobShell {
 }
 
 #[derive(Clone)]
+enum BatchRuntime {
+    Local(Arc<JobRuntime>),
+    Source(std::sync::Weak<JobRuntime>),
+}
+
+#[derive(Clone)]
 pub struct Batch {
-    runtime: Arc<JobRuntime>,
+    runtime: BatchRuntime,
 }
 impl Batch {
     pub fn new(runtime: Arc<JobRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime: BatchRuntime::Local(runtime),
+        }
+    }
+
+    pub(crate) fn source(runtime: Arc<JobRuntime>) -> Self {
+        Self {
+            runtime: BatchRuntime::Source(Arc::downgrade(&runtime)),
+        }
+    }
+
+    fn runtime(&self) -> Result<Arc<JobRuntime>> {
+        match &self.runtime {
+            BatchRuntime::Local(runtime) => Ok(runtime.clone()),
+            BatchRuntime::Source(runtime) => runtime
+                .upgrade()
+                .ok_or(Error::Denied("original source Graph runtime is gone")),
+        }
+    }
+
+    fn source_backed(&self) -> bool {
+        matches!(self.runtime, BatchRuntime::Source(_))
     }
 }
 impl Tool for Batch {
     fn spec(&self) -> ToolSpec {
+        let tools = self
+            .runtime()
+            .map(|runtime| runtime.node_tools())
+            .unwrap_or_default();
+        if self.source_backed() {
+            return ToolSpec {
+                name: "batch".into(),
+                description: "Run one bounded foreground Graph of explicitly granted native source tools. Each node has its own durable source claim and settlement. Results are coordinate-keyed.".into(),
+                parameters: aw_tools::filesystem::batch::parameters_for(tools),
+                effect: ToolEffect::Control,
+            };
+        }
         ToolSpec {
             name: "batch".into(),
             description: "Run a bounded Graph with compact [tool,args,when?] nodes. Eligible native tools and prepared shell interpreters share one Job; node authority is rechecked individually. Results are coordinate-keyed. Set background=true to return the same Graph Job immediately.".into(),
             parameters: batch_parameters_with_background(
-                self.runtime.node_tools(),
-                self.runtime.wake_capable(),
+                tools,
+                self.runtime().is_ok_and(|runtime| runtime.wake_capable()),
             ),
             // Construction/lifecycle is Control; every node independently keeps
             // its original semantic effect and exact current authority.
@@ -447,31 +486,55 @@ impl Tool for Batch {
         }
     }
 
+    fn claim_route(&self) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+        self.source_backed()
+            .then_some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)
+    }
+
+    fn is_available(&self) -> bool {
+        match &self.runtime {
+            BatchRuntime::Local(_) => true,
+            BatchRuntime::Source(runtime) => runtime.strong_count() != 0,
+        }
+    }
+
     fn validate(&self, arguments: &Value) -> Result<()> {
+        let runtime = self.runtime()?;
+        if self.source_backed() {
+            return runtime.validate_graph(arguments);
+        }
         let _ = background(arguments)?;
-        let _ = constructor_wake_rules(arguments, &self.runtime)?;
+        let _ = constructor_wake_rules(arguments, &runtime)?;
         let semantic = semantic_constructor_arguments(arguments)?;
-        self.runtime.validate_graph(&semantic)
+        runtime.validate_graph(&semantic)
     }
 
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
-            if ctx.execution_scope.is_some() {
+            let runtime = self.runtime()?;
+            if ctx.execution_scope.is_some()
+                || (self.source_backed()
+                    && (ctx.effect != ToolEffect::Control
+                        || ctx.source != aw_agent_core::ToolSource::trusted_host()
+                        || ctx.scope.is_none()
+                        || ctx.execution_owner.is_none()
+                        || ctx.execution_site != "local"))
+            {
                 return Err(Error::Denied(
                     "batch cannot start while this work is owned by an active Graph node",
                 ));
             }
             self.validate(arguments)?;
             let run_background = background(arguments)?;
-            let wake = match constructor_wake_rules(arguments, &self.runtime)? {
-                Some(rules) => self.runtime.prepare_initial_wake(&ctx, rules)?,
+            let wake = match constructor_wake_rules(arguments, &runtime)? {
+                Some(rules) => runtime.prepare_initial_wake(&ctx, rules)?,
                 None => None,
             };
             let semantic = semantic_constructor_arguments(arguments)?;
-            let direct_budget = ctx.result_budget(self.runtime.result_limit())?;
+            let direct_budget = ctx.result_budget(runtime.result_limit())?;
             let decision = match wake {
                 Some(wake) => {
-                    self.runtime
+                    runtime
                         .start_replay_presealed_with_initial_wake(
                             &ctx,
                             &semantic,
@@ -481,7 +544,7 @@ impl Tool for Batch {
                         .await?
                 }
                 None => {
-                    self.runtime
+                    runtime
                         .start_replay_presealed(&ctx, &semantic, run_background)
                         .await?
                 }
@@ -496,6 +559,11 @@ impl Tool for Batch {
                     started
                 }
                 StartDecision::Existing { id, host } => {
+                    if self.source_backed() {
+                        return Err(Error::Transport(
+                            "original source Graph already admitted; inspect before retry",
+                        ));
+                    }
                     host.manager()
                         .set_finite_kind(&id, FiniteJobKind::Graph)
                         .map_err(|_| Error::Denied("replayed Job kind changed"))?;
@@ -507,6 +575,9 @@ impl Tool for Batch {
                     return handoff_receipt(&host, &id, &snapshot, direct_budget);
                 }
                 StartDecision::Unknown => {
+                    if self.source_backed() {
+                        return Err(Error::Transport("source Graph admission uncertain"));
+                    }
                     return Ok(ToolOutput::error(
                         "unknown batch Job admission; do not retry automatically",
                     ));
@@ -527,7 +598,7 @@ impl Tool for Batch {
                 result = &mut started.task => result,
                 _ = ctx.cancellation.cancelled() => {
                     handoff.expose()?;
-                    let _ = self.runtime.cancel(&ctx, &started.id)?;
+                    let _ = runtime.cancel(&ctx, &started.id)?;
                     return Err(Error::Cancelled);
                 },
             };
@@ -545,6 +616,24 @@ impl Tool for Batch {
                     ));
                 }
             };
+            if self.source_backed()
+                && (snapshot.journal_unknown
+                    || (1..=snapshot.total).any(|coordinate| {
+                        started
+                            .host
+                            .manager()
+                            .node_state(&started.id, coordinate)
+                            .map_or(true, |node| {
+                                node.result()
+                                    .is_none_or(|status| status.primary == Primary::Unknown)
+                            })
+                    }))
+            {
+                handoff.expose()?;
+                return Err(Error::Transport(
+                    "source Graph outcome uncertain; inspect before retry",
+                ));
+            }
             if snapshot.journal_unknown {
                 handoff.expose()?;
                 return handoff_receipt(&started.host, &started.id, &snapshot, direct_budget);

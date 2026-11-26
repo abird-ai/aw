@@ -37,6 +37,11 @@ pub trait SandboxEffectAuthority {
         None
     }
 
+    /// Original constructor authority, required only for a peer Graph node.
+    fn constructor_binding(&self) -> Option<&ToolBindingSnapshot> {
+        None
+    }
+
     /// Compose the original synchronous authority owner's final admission
     /// fence with the Store commit. A live external guard remains owned by
     /// self through launch; a ToolBinding publication lock need not cross
@@ -56,6 +61,7 @@ pub trait SandboxEffectAuthority {
 pub enum SandboxEffectOrigin {
     Host(String),
     Tool { turn_id: u64, call: ToolCall },
+    GraphNode(Box<aw_tools::filesystem::job_manager::RunningNode>),
 }
 
 /// Trusted host effect request, not a model selector. This seam does not
@@ -83,6 +89,11 @@ impl SandboxEffectRequest {
                 {
                     return Err(Error::Config("invalid host source effect identity".into()));
                 }
+            }
+            SandboxEffectOrigin::GraphNode(node) => {
+                node.task()
+                    .validate()
+                    .map_err(|_| Error::Denied("invalid original Graph Task"))?;
             }
             SandboxEffectOrigin::Tool { turn_id, call } => {
                 call.validate_envelope()?;
@@ -150,15 +161,28 @@ fn observe_in(
     tx: &Transaction<'_>,
     request: &SandboxEffectRequest,
     driver: &SandboxDriverDescriptor,
-    policy: &SandboxGrantPolicy,
-    tool_ceiling: &[NamedSourceAccess],
-    tool_binding: Option<&ToolBindingSnapshot>,
+    authority: &impl SandboxEffectAuthority,
     admitted: Option<&journal::Intent>,
 ) -> Result<Boundary> {
-    let (effect_id, intent) = match (&request.origin, tool_binding) {
-        (SandboxEffectOrigin::Host(id), None) => (id.clone(), None),
-        (SandboxEffectOrigin::Tool { turn_id, call }, Some(binding)) => {
+    let (effect_id, intent) = match (
+        &request.origin,
+        authority.tool_binding(),
+        authority.constructor_binding(),
+    ) {
+        (SandboxEffectOrigin::Host(id), None, None) => (id.clone(), None),
+        (SandboxEffectOrigin::Tool { turn_id, call }, Some(binding), None) => {
             let intent = journal::admit_in(tx, request, *turn_id, call, binding, admitted)?;
+            (intent.effect_id(), Some(intent))
+        }
+        (SandboxEffectOrigin::GraphNode(node), Some(binding), Some(constructor))
+            if admitted.is_none() =>
+        {
+            if driver.driver != aw_agent_core::DriverKey::builtin("native-filesystem")? {
+                return Err(Error::Denied(
+                    "source Graph requires the original native filesystem driver",
+                ));
+            }
+            let intent = journal::node::admit_in(tx, request, node, binding, constructor)?;
             (intent.effect_id(), Some(intent))
         }
         _ => {
@@ -171,8 +195,8 @@ fn observe_in(
         tx,
         &request.actor,
         &request.agent_ref,
-        policy,
-        tool_ceiling,
+        authority.policy(),
+        authority.tool_ceiling(),
     )?;
     // Both collections are in canonical name order. Consume the exact
     // requested subset once; a narrower permission is a refusal, not a
@@ -200,6 +224,13 @@ fn observe_in(
     }
     grant.sources = selected;
     let sandbox = snapshot_with_sources(tx, &grant.sandbox_ref)?;
+    if intent.as_ref().is_some_and(|intent| intent.node.is_some())
+        && grant.sources.len() != sandbox.sources.len()
+    {
+        return Err(Error::Denied(
+            "source Graph node requires the complete approved source set",
+        ));
+    }
     let project = parse_sandbox_ref(&grant.sandbox_ref)?.project;
     let writer = workspace_writer::require_workspace_writer(tx, &project.project)?;
     Ok(Boundary {
@@ -324,9 +355,6 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
             prepared,
         } = self;
         let barrier = authority.with_admission(|| {
-            let policy = authority.policy();
-            let tool_ceiling = authority.tool_ceiling();
-            let tool_binding = authority.tool_binding();
             let mut connection = store.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let current = observe_in(
@@ -334,9 +362,7 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
                 &tx,
                 &request,
                 &boundary.plan.driver,
-                policy,
-                tool_ceiling,
-                tool_binding,
+                &authority,
                 None,
             )?;
             if current != boundary {
@@ -436,9 +462,7 @@ impl SandboxEffectLaunch {
                 &tx,
                 &self.request,
                 &self.boundary.plan.driver,
-                source.policy(),
-                source.tool_ceiling(),
-                source.tool_binding(),
+                source,
                 self.boundary.intent.as_ref(),
             )?;
             if current != self.boundary {
@@ -484,6 +508,32 @@ impl SandboxEffectLease {
     /// claims; the original receipt owner can release them after its commit.
     /// Unknown carries no positive proof and remains an ordinary hazard.
     pub fn defer_until_tool_finished(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        if self
+            .intent
+            .as_ref()
+            .is_some_and(|intent| intent.node.is_some())
+        {
+            return Err(Error::Denied(
+                "Graph node requires its original node settlement",
+            ));
+        }
+        self.defer_until_owner_settled(outcome)
+    }
+
+    pub fn defer_until_node_settled(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        if self
+            .intent
+            .as_ref()
+            .is_none_or(|intent| intent.node.is_none())
+        {
+            return Err(Error::Denied(
+                "source custody does not belong to a Graph node",
+            ));
+        }
+        self.defer_until_owner_settled(outcome)
+    }
+
+    fn defer_until_owner_settled(self, outcome: SandboxEffectOutcome) -> Result<()> {
         if outcome == SandboxEffectOutcome::Unknown {
             return self.settle(outcome);
         }
@@ -521,6 +571,12 @@ impl SandboxEffectLease {
                 journal::release_in(tx, intent, &self.actor, outcome)?;
             }
         }
+        self.settle_sources_in(tx, outcome)
+    }
+
+    // Only after the original direct or node release fact has committed
+    // within this transaction. Physical revision/custody is shared.
+    fn settle_sources_in(&self, tx: &Transaction<'_>, outcome: SandboxEffectOutcome) -> Result<()> {
         if outcome == SandboxEffectOutcome::Settled && self.write_capable {
             let changed = db(tx.execute(
                 "UPDATE sandboxes_current SET rev=rev+1,updated_at=?1
@@ -585,21 +641,9 @@ impl SessionStore {
         let implementation = registry.get(driver)?;
         let authority = resolve(&request)?;
         let boundary = authority.with_admission(|| {
-            let policy = authority.policy();
-            let tool_ceiling = authority.tool_ceiling();
-            let tool_binding = authority.tool_binding();
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            let boundary = observe_in(
-                self,
-                &tx,
-                &request,
-                driver.descriptor(),
-                policy,
-                tool_ceiling,
-                tool_binding,
-                None,
-            )?;
+            let boundary = observe_in(self, &tx, &request, driver.descriptor(), &authority, None)?;
             boundary.mutation_set()?.require_unleased_in(&tx)?;
             db(tx.commit())?;
             Ok(boundary)

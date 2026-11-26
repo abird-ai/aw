@@ -143,6 +143,7 @@ impl Default for JobRuntimeOptions {
 
 pub struct JobRuntime {
     root: Option<Arc<aw_platform::scoped_fs::Root>>,
+    source_graph: Option<std::sync::Weak<dyn crate::native_filesystem::SourceGraphExecutor>>,
     authority: ToolBindingAuthority,
     tool_limits: crate::LocalToolLimits,
     shells: shell::ShellRegistry,
@@ -203,6 +204,7 @@ impl JobRuntime {
     ) -> Result<Arc<Self>> {
         Self::new_inner(
             Some(root),
+            None,
             authority,
             tool_limits,
             concurrency,
@@ -218,6 +220,7 @@ impl JobRuntime {
     ) -> Result<Arc<Self>> {
         Self::new_inner(
             None,
+            None,
             authority,
             tool_limits,
             concurrency,
@@ -229,8 +232,27 @@ impl JobRuntime {
         )
     }
 
+    pub(crate) fn new_source_graph(
+        authority: ToolBindingAuthority,
+        tool_limits: crate::LocalToolLimits,
+        concurrency: crate::LocalToolConcurrency,
+        native_tools: Vec<aw_tools::filesystem::schema::Tool>,
+        route: Arc<dyn crate::native_filesystem::SourceGraphExecutor>,
+    ) -> Result<Arc<Self>> {
+        Self::new_inner(
+            None,
+            Some(Arc::downgrade(&route)),
+            authority,
+            tool_limits,
+            concurrency,
+            JobRuntimeOptions::default(),
+            native_tools,
+        )
+    }
+
     fn new_inner(
         root: Option<Arc<aw_platform::scoped_fs::Root>>,
+        source_graph: Option<std::sync::Weak<dyn crate::native_filesystem::SourceGraphExecutor>>,
         authority: ToolBindingAuthority,
         tool_limits: crate::LocalToolLimits,
         concurrency: crate::LocalToolConcurrency,
@@ -261,6 +283,7 @@ impl JobRuntime {
         let exposure = Arc::new(ExposureIndex::new(tool_limits.jobs.max_retained_jobs)?);
         let host = Arc::new(JobHost::new_with_optional_root(
             root.clone(),
+            source_graph.clone(),
             authority.clone(),
             JobHostConfig {
                 session: scope.session().to_owned(),
@@ -278,6 +301,7 @@ impl JobRuntime {
         )?);
         Ok(Arc::new(Self {
             root,
+            source_graph,
             authority,
             tool_limits,
             shells,
@@ -522,6 +546,7 @@ impl JobRuntime {
     fn build_host(&self, scope: &LiveScope) -> Result<Arc<JobHost>> {
         Ok(Arc::new(JobHost::new_with_optional_root(
             self.root.clone(),
+            self.source_graph.clone(),
             self.authority.clone(),
             JobHostConfig {
                 session: scope.session().to_owned(),

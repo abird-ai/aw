@@ -213,6 +213,7 @@ pub struct JobHost {
     graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
     authority: ToolBindingAuthority,
     root: Option<Arc<aw_platform::scoped_fs::Root>>,
+    source_graph: Option<std::sync::Weak<dyn crate::native_filesystem::SourceGraphExecutor>>,
     session: String,
     branch: String,
     root_binding: [u8; 32],
@@ -284,6 +285,18 @@ fn binding_hash(actor: &PrincipalId, binding: &ToolBindingSnapshot) -> [u8; 32] 
         aw_agent_core::ToolEffect::Control => 3,
         aw_agent_core::ToolEffect::Unknown => 4,
     }]);
+    hash.finalize().into()
+}
+
+fn source_graph_authority_hash(
+    actor: &PrincipalId,
+    constructor: &ToolBindingSnapshot,
+    peer: [u8; 32],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-source-graph-node-authority-v1\0");
+    hash.update(binding_hash(actor, constructor));
+    hash.update(peer);
     hash.finalize().into()
 }
 
@@ -500,11 +513,12 @@ impl JobHost {
         authority: ToolBindingAuthority,
         config: JobHostConfig,
     ) -> Result<Self> {
-        Self::new_with_optional_root(Some(root), authority, config)
+        Self::new_with_optional_root(Some(root), None, authority, config)
     }
 
     pub(crate) fn new_with_optional_root(
         root: Option<Arc<aw_platform::scoped_fs::Root>>,
+        source_graph: Option<std::sync::Weak<dyn crate::native_filesystem::SourceGraphExecutor>>,
         authority: ToolBindingAuthority,
         config: JobHostConfig,
     ) -> Result<Self> {
@@ -531,7 +545,8 @@ impl JobHost {
                 "Job Graph node ceiling exceeds the shared safety maximum".into(),
             ));
         }
-        if (root.is_none() && !native_tools.is_empty())
+        if (root.is_none() && source_graph.is_none() && !native_tools.is_empty())
+            || (source_graph.is_some() && (root.is_some() || native_tools.is_empty()))
             || native_tools.iter().any(|tool| !tool.graph_eligible())
         {
             return Err(Error::Config(
@@ -556,6 +571,7 @@ impl JobHost {
             graph_host_tools,
             authority,
             root,
+            source_graph,
             session,
             branch,
             root_binding,
@@ -1204,6 +1220,36 @@ impl JobHost {
         false
     }
 
+    fn graph_constructor(&self, actor: &PrincipalId) -> Result<ToolBindingSnapshot> {
+        let binding = self.authority.permitted_binding(actor, "batch")?;
+        if binding.effect != aw_agent_core::ToolEffect::Control
+            || binding.source != aw_agent_core::ToolSource::trusted_host()
+            || binding.execution_site != "local"
+            || binding.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)
+        {
+            return Err(Error::Denied(
+                "source Graph requires exact original constructor",
+            ));
+        }
+        Ok(binding)
+    }
+
+    fn node_authority_hash(
+        &self,
+        actor: &PrincipalId,
+        binding: &ToolBindingSnapshot,
+    ) -> Result<[u8; 32]> {
+        let peer = binding_hash(actor, binding);
+        if self.source_graph.is_none() {
+            return Ok(peer);
+        }
+        if binding.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1) {
+            return Err(Error::Denied("source Graph requires fixed native peer"));
+        }
+        let constructor = self.graph_constructor(actor)?;
+        Ok(source_graph_authority_hash(actor, &constructor, peer))
+    }
+
     fn plans_for_graph(&self, ctx: &ToolContext, graph: &Graph) -> Result<Vec<NodePlan>> {
         self.plans_for_graph_with_overrides(ctx, graph, &BTreeMap::new())
     }
@@ -1215,6 +1261,18 @@ impl JobHost {
         overrides: &BTreeMap<u32, aw_tools::filesystem::footprint::Footprint>,
     ) -> Result<Vec<NodePlan>> {
         let one = graph.steps().len() == 1;
+        if self.source_graph.is_some()
+            && (ctx.effect != aw_agent_core::ToolEffect::Control
+                || ctx.source != aw_agent_core::ToolSource::trusted_host()
+                || ctx.execution_scope.is_some()
+                || ctx.execution_owner.is_none()
+                || ctx.scope.is_none()
+                || ctx.execution_site != "local")
+        {
+            return Err(Error::Denied(
+                "source Graph requires original direct Agent constructor",
+            ));
+        }
         plan_graph(graph, |coordinate, step| {
             if !graph_arguments_are_semantic(&step.arguments) {
                 return Err(());
@@ -1227,10 +1285,23 @@ impl JobHost {
                 if let Some(native) = step.tool.native() {
                     let request =
                         canonical_request(native, &step.arguments, self.tool_limits).ok_or(())?;
-                    (
+                    let footprint = if self.source_graph.is_some() {
+                        if native == CoreTool::Remove
+                            || binding.claim_route
+                                != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
+                        {
+                            return Err(());
+                        }
+                        // Source claims cover the full approved binding set,
+                        // never narrow custody using advisory footprints.
+                        aw_tools::filesystem::footprint::Footprint::unknown(true, true)
+                    } else {
                         request
                             .footprint(self.root.as_deref().ok_or(())?)
-                            .map_err(|_| ())?,
+                            .map_err(|_| ())?
+                    };
+                    (
+                        footprint,
                         self.root_binding,
                         one,
                         self.tool_limits.result_bytes,
@@ -1285,7 +1356,9 @@ impl JobHost {
                 },
                 footprint,
                 registry_generation: binding.registry_revision,
-                authority_binding: binding_hash(&ctx.actor, &binding),
+                authority_binding: self
+                    .node_authority_hash(&ctx.actor, &binding)
+                    .map_err(|_| ())?,
                 runtime_binding,
                 task_result_eligible,
             })
@@ -1804,7 +1877,12 @@ impl JobHost {
             .permitted_binding(actor, plan.tool().name())
             .ok()?;
         let runtime_live = if plan.tool().native().is_some() {
-            self.root.is_some() && plan.runtime_binding() == self.root_binding
+            (self.root.is_some()
+                || self
+                    .source_graph
+                    .as_ref()
+                    .is_some_and(|route| route.strong_count() != 0))
+                && plan.runtime_binding() == self.root_binding
         } else if plan.tool().is_shell() {
             self.shells.get(plan.tool()).is_some_and(|shell| {
                 shell
@@ -1824,7 +1902,9 @@ impl JobHost {
             false
         };
         (binding.registry_revision == plan.registry_generation()
-            && binding_hash(actor, &binding) == plan.authority_binding()
+            && self
+                .node_authority_hash(actor, &binding)
+                .is_ok_and(|hash| hash == plan.authority_binding())
             && runtime_live)
             .then_some(binding)
     }
@@ -2915,7 +2995,7 @@ impl JobHost {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(Error::Cancelled);
         }
-        let _binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
+        let binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
         if let Err(error) = self.attach_exact_result(id, coordinate, plan.budget().result_bytes) {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(error);
@@ -2934,6 +3014,78 @@ impl JobHost {
                 return Err(error);
             }
         };
+        if let Some(route) = &self.source_graph {
+            let Some(route) = route.upgrade() else {
+                self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                return Err(Error::Denied("original source Graph owner is gone"));
+            };
+            let constructor = match self.graph_constructor(&ctx.actor) {
+                Ok(constructor) => constructor,
+                Err(error) => {
+                    self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                    return Err(error);
+                }
+            };
+            // Compare the exact constructor captured by the sealed plan;
+            // the route atomically revalidates both actual snapshots.
+            if source_graph_authority_hash(
+                &ctx.actor,
+                &constructor,
+                binding_hash(&ctx.actor, &binding),
+            ) != plan.authority_binding()
+            {
+                self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                return Err(Error::Denied("original source Graph authority changed"));
+            }
+            let running_sequence =
+                match self.start_exact(&ctx.actor, id, coordinate, claimed_sequence, true) {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                        return Err(error);
+                    }
+                };
+            let node = self
+                .manager
+                .running_node(id, coordinate, running_sequence)
+                .map_err(|_| Error::Protocol("original Running Graph node unavailable"))?;
+            let result = route
+                .execute_node(crate::native_filesystem::SourceGraphNodeRequest {
+                    context: ctx,
+                    node: &node,
+                    constructor: &constructor,
+                    binding: &binding,
+                    cancellation,
+                })
+                .await;
+            let (output, status) = match result {
+                Ok(result) => (result.output, result.status),
+                Err(error) => {
+                    // A rejected/uncertain source admission never falls back
+                    // to the local native engine.
+                    (
+                        ToolOutput::error(aw_tools::task::bounded_task_error(error.to_string())),
+                        Status {
+                            primary: Primary::Unknown,
+                            more: false,
+                            incomplete: true,
+                        },
+                    )
+                }
+            };
+            return self.settle_native_result(
+                id,
+                &plan,
+                running_sequence,
+                output,
+                status,
+                |_, transition| {
+                    route
+                        .settle_node(ctx, &node, transition)
+                        .map_err(|_| aw_tools::filesystem::job::JournalError::OutcomeUnknown)
+                },
+            );
+        }
         let Some(root) = &self.root else {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(Error::Denied("Job has no native filesystem authority"));
@@ -3001,6 +3153,42 @@ impl JobHost {
                 ),
             ),
         };
+        self.settle_native_result(id, &plan, running_sequence, output, status, |_, _| Ok(()))
+    }
+
+    fn settle_native_result(
+        &self,
+        id: &str,
+        plan: &NodePlan,
+        running_sequence: u64,
+        output: ToolOutput,
+        status: Status,
+        persist: impl FnOnce(
+            &str,
+            aw_tools::filesystem::job::Transition,
+        )
+            -> std::result::Result<(), aw_tools::filesystem::job::JournalError>,
+    ) -> Result<Status> {
+        let coordinate = plan.coordinate();
+        let settle = |result| {
+            let _gate = self
+                .transition_gate
+                .lock()
+                .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
+            let sequence = self.transition_sequence(id)?;
+            self.manager
+                .settle(
+                    id,
+                    coordinate,
+                    NodeState::Running {
+                        sequence: running_sequence,
+                    },
+                    result,
+                    sequence,
+                    persist,
+                )
+                .map_err(|_| Error::Protocol("Job node settlement failed"))
+        };
         if output.content.len() > plan.budget().result_bytes {
             let _ = self
                 .manager
@@ -3010,14 +3198,7 @@ impl JobHost {
                 more: false,
                 incomplete: false,
             };
-            self.settle(
-                id,
-                coordinate,
-                NodeState::Running {
-                    sequence: running_sequence,
-                },
-                unknown,
-            )?;
+            settle(unknown)?;
             return Err(Error::Limit("Job result exceeds captured semantic ceiling"));
         }
         let retained = self
@@ -3040,26 +3221,12 @@ impl JobHost {
                 more: false,
                 incomplete: false,
             };
-            self.settle(
-                id,
-                coordinate,
-                NodeState::Running {
-                    sequence: running_sequence,
-                },
-                unknown,
-            )?;
+            settle(unknown)?;
             return Err(Error::Protocol(
                 "Job result retention failed after execution",
             ));
         }
-        self.settle(
-            id,
-            coordinate,
-            NodeState::Running {
-                sequence: running_sequence,
-            },
-            status,
-        )?;
+        settle(status)?;
         Ok(status)
     }
 

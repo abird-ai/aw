@@ -1152,6 +1152,54 @@ mod tests {
             }
         }
 
+        // Fault only the actual original node terminal persist callback,
+        // after the real native worker and physical proof completed.
+        // No manufactured ToolStarted/ToolFinished or source proof.
+        struct LostNodeSettlement<R>(Arc<R>);
+        impl<R: aw_tools_adapter::operation_router::OperationRouter>
+            aw_tools_adapter::operation_router::OperationRouter for LostNodeSettlement<R>
+        {
+            fn claim_route(
+                &self,
+                operation: aw_tools::OperationId,
+            ) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+                self.0.claim_route(operation)
+            }
+            fn execute<'a>(
+                &'a self,
+                operation: aw_tools::OperationId,
+                ctx: aw_agent_core::ToolContext,
+                arguments: &'a serde_json::Value,
+                original: Arc<dyn aw_agent_core::Tool>,
+            ) -> aw_agent_core::tool::ToolFuture<'a> {
+                self.0.execute(operation, ctx, arguments, original)
+            }
+        }
+        impl<R: aw_tools_adapter::native_filesystem::SourceGraphExecutor>
+            aw_tools_adapter::native_filesystem::SourceGraphExecutor for LostNodeSettlement<R>
+        {
+            fn execute_node<'a>(
+                &'a self,
+                request: aw_tools_adapter::native_filesystem::SourceGraphNodeRequest<'a>,
+            ) -> aw_tools_adapter::native_filesystem::SourceGraphNodeFuture<'a> {
+                self.0.execute_node(request)
+            }
+            fn settle_node(
+                &self,
+                ctx: &aw_agent_core::ToolContext,
+                node: &aw_tools::filesystem::job_manager::RunningNode,
+                transition: aw_tools::filesystem::job::Transition,
+            ) -> Result<()> {
+                if node.binding().coordinate == 2 {
+                    let mut foreign = transition;
+                    foreign.node = Some(1);
+                    assert!(self.0.settle_node(ctx, node, foreign).is_err());
+                    return Err(Error::Protocol("fixture lost original node settlement"));
+                }
+                self.0.settle_node(ctx, node, transition)
+            }
+        }
+
         struct NativeProvider {
             calls: Arc<AtomicUsize>,
         }
@@ -1186,6 +1234,16 @@ mod tests {
                         assert!(tools[0].parameters["properties"]
                             .get("background")
                             .is_none());
+                    } else if prompt.starts_with("interrupt-graph-") {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<std::collections::BTreeSet<_>>(),
+                            std::collections::BTreeSet::from(["batch", "read", "write"])
+                        );
+                        let batch = tools.iter().find(|tool| tool.name == "batch").unwrap();
+                        assert!(batch.parameters["properties"].get("background").is_none());
                     } else if prompt == "interrupt-mixed-before-claim" {
                         assert_eq!(
                             tools
@@ -1198,6 +1256,28 @@ mod tests {
                         assert_eq!(tools.len(), 2);
                     }
                     let call = match (prompt, results.len()) {
+                        (
+                            "interrupt-graph-before-claim"
+                            | "interrupt-graph-after-settlement"
+                            | "interrupt-graph-lost-node",
+                            0,
+                        ) => {
+                            let path = match prompt {
+                                "interrupt-graph-before-claim" => "graph-not-started",
+                                "interrupt-graph-after-settlement" => "graph-created",
+                                _ => "graph-unreleased",
+                            };
+                            Some(ToolCall {
+                                id: "source-graph-fixture".into(),
+                                name: "batch".into(),
+                                arguments: json!({"ops":[
+                                    ["read", {"path":"tracked"}],
+                                    ["write", {"path":path,"content":"graph node"}],
+                                    ["read", {"path":path}],
+                                    ["write", {"path":"graph-skipped","content":"must not exist"}, "1.fail"]
+                                ]}),
+                            })
+                        }
                         ("interrupt-mixed-before-claim", 0) => Some(ToolCall {
                             id: "mixed-read".into(),
                             name: "read".into(),
@@ -2199,6 +2279,299 @@ mod tests {
             drop(store);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 14);
+        for (message_id, prompt, path) in [
+            (10, "interrupt-graph-before-claim", "graph-not-started"),
+            (11, "interrupt-graph-after-settlement", "graph-created"),
+            (12, "interrupt-graph-lost-node", "graph-unreleased"),
+        ] {
+            let no_start = message_id == 10;
+            let lost_node = message_id == 12;
+            let store =
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap();
+            let before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            drop(refresh(&store));
+            let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
+            let approval = resolver
+                .provision_configured_approval(&manager, &approvals)
+                .unwrap();
+            drop(resolver);
+            let drivers = SandboxDriverRegistry::new();
+            let native = drivers
+                .register(
+                    DriverKey::builtin("native-filesystem").unwrap(),
+                    NativeFilesystemDriver,
+                )
+                .unwrap();
+            let host = GitNativeSourceHost::new(
+                approval.clone(),
+                handle.clone(),
+                drivers.clone(),
+                native.clone(),
+            )
+            .unwrap();
+            let mut options = tools.clone();
+            options.selected_tools.push("batch".into());
+            let builder = || {
+                Agent::builder_from_selection(
+                    selection.clone(),
+                    AgentOptions::new("fixture", "model"),
+                )
+            };
+            assert!(host
+                .build_execution_with_graph(
+                    &store,
+                    owner.clone(),
+                    execution.clone(),
+                    builder(),
+                    &options
+                )
+                .is_err());
+            grant_rev = approval
+                .publish_grant(&manager, grant_rev)
+                .unwrap()
+                .revision;
+            let (mut agent, source, jobs) = if lost_node {
+                let builder = builder();
+                let route_host = host.clone();
+                let route = Arc::new(
+                    aw_host::source_filesystem::SourceFilesystemRoute::new(
+                        store.clone(),
+                        execution.clone(),
+                        drivers.clone(),
+                        native,
+                        builder.tool_binding_authority(),
+                        options.limits,
+                        move |ctx, tool| route_host.resolve(ctx, tool),
+                    )
+                    .unwrap(),
+                );
+                let configured = aw_tools_adapter::configure_source_graph(
+                    builder,
+                    owner.clone(),
+                    &options,
+                    Arc::new(LostNodeSettlement(route.clone())),
+                )
+                .unwrap();
+                let jobs = configured.job_runtime.unwrap();
+                let mut agent = configured.builder.shared_extension(route).build().unwrap();
+                agent.bind_execution_owner(execution.clone()).unwrap();
+                let independent = approval.clone();
+                let source = aw_store::SandboxExecution::from_trusted_host(
+                    &store,
+                    owner.clone(),
+                    execution.clone(),
+                    repo.clone(),
+                    &agent.tool_binding_authority(),
+                    move || independent.read(),
+                )
+                .unwrap();
+                (agent, source, jobs)
+            } else {
+                host.build_execution_with_graph(
+                    &store,
+                    owner.clone(),
+                    execution.clone(),
+                    builder(),
+                    &options,
+                )
+                .unwrap()
+            };
+            let jobs_weak = Arc::downgrade(&jobs);
+            assert_eq!(agent.registered_tool_names(), ["batch", "read", "write"]);
+            let (view, journal) = store.activate_with_source(&source).unwrap();
+            let turn_id = view.history.next_turn_id;
+            agent
+                .load_history(view.history, Some(Arc::new(journal)))
+                .unwrap();
+            let actor = actor_owner::Service::attach_for_agent_with_source(
+                store.clone(),
+                &agent,
+                source.clone(),
+            )
+            .unwrap();
+            let request_id = format!("fixture:graph-{message_id}");
+            actor
+                .enqueue_bound_text(
+                    &agent,
+                    &request_id,
+                    message_id,
+                    aw_store::QueueTarget::Auto,
+                    0,
+                    prompt,
+                )
+                .unwrap();
+            assert_eq!(
+                actor
+                    .admit_next_queued(&agent)
+                    .unwrap()
+                    .unwrap()
+                    .request
+                    .request_id,
+                request_id
+            );
+            let task = tokio::spawn(async move {
+                actor
+                    .run_once(&mut agent, |event| {
+                        let record = match event {
+                            aw_agent_core::AgentEvent::ToolStarted { record, .. } if no_start => {
+                                record
+                            }
+                            aw_agent_core::AgentEvent::ToolFinished { record, .. } if !no_start => {
+                                assert_eq!(
+                                    record.status,
+                                    if lost_node {
+                                        aw_agent_core::ToolStatus::Interrupted
+                                    } else {
+                                        aw_agent_core::ToolStatus::Succeeded
+                                    }
+                                );
+                                if !lost_node {
+                                    let output = record.output.as_ref().unwrap();
+                                    assert!(output.content.contains("fixture data"), "{output:?}");
+                                    assert!(output.content.contains("graph node"), "{output:?}");
+                                }
+                                record
+                            }
+                            _ => return Ok(()),
+                        };
+                        assert_eq!(record.call.name, "batch");
+                        panic!("fixture lost original Graph Actor");
+                    })
+                    .await
+            });
+            let panic = task
+                .await
+                .expect_err("fixture must lose original Graph Actor")
+                .into_panic();
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"fixture lost original Graph Actor")
+            );
+            let after = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            assert_eq!(after.rev, before.rev + u64::from(!no_start && !lost_node));
+            assert_eq!(after.sources, before.sources);
+            if no_start {
+                assert!(!repo.join(path).exists());
+            } else {
+                assert_eq!(fs::read(repo.join(path)).unwrap(), b"graph node");
+            }
+            assert!(!repo.join("graph-skipped").exists());
+            assert_eq!(
+                store
+                    .actor_queue_fact(&owner, &session, &request_id)
+                    .unwrap()
+                    .state,
+                aw_store::QueueState::Accepted
+            );
+            drop(source);
+            drop(jobs);
+            assert!(jobs_weak.upgrade().is_none());
+            drop(host);
+            drop(drivers);
+            drop(approval);
+            drop(store);
+            let store = if lost_node {
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap()
+            } else {
+                SessionStore::open(&state).unwrap()
+            };
+            let view = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap();
+            assert!(view.history.needs_reconciliation);
+            let original = view.history.turns.last().unwrap();
+            assert_eq!(original.id, turn_id);
+            assert_eq!(original.outcome, aw_agent_core::Outcome::Failed);
+            assert_eq!(original.tool_records.len(), 1);
+            assert!(store
+                .reconcile_native_turn(&manager, &reference, turn_id)
+                .is_err());
+            assert!(store
+                .sandbox_recover_tool_source_effect(
+                    &manager,
+                    &reference,
+                    turn_id,
+                    "source-graph-fixture",
+                    |_| panic!("Graph constructor is not node custody")
+                )
+                .is_err());
+            let recover = |coordinate| {
+                store.sandbox_recover_recorded_graph_node(
+                    &manager,
+                    &reference,
+                    turn_id,
+                    "source-graph-fixture",
+                    coordinate,
+                )
+            };
+            assert!(recover(4).is_err());
+            assert!(recover(5).is_err());
+            if no_start {
+                assert!(recover(1).is_err());
+            } else {
+                assert_eq!(recover(1).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                if lost_node {
+                    assert!(store
+                        .reconcile_source_turn(&manager, &reference, turn_id)
+                        .is_err());
+                    assert_eq!(
+                        store
+                            .actor_queue_fact(&owner, &session, &request_id)
+                            .unwrap()
+                            .state,
+                        aw_store::QueueState::Accepted
+                    );
+                    assert!(recover(3).is_err());
+                } else {
+                    assert_eq!(recover(3).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                }
+                assert_eq!(recover(2).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                assert_eq!(recover(2).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+            }
+            let result = store
+                .reconcile_source_turn(&manager, &reference, turn_id)
+                .unwrap();
+            let effects = if no_start {
+                0
+            } else if lost_node {
+                2
+            } else {
+                3
+            };
+            assert_eq!(result.source_effects, effects);
+            assert_eq!(result.unclaimed_no_start, 4 - effects);
+            assert!(result.hazard_cleared && result.changed);
+            assert_eq!(result.input, aw_store::InputAdmissionState::Inspected);
+            assert_eq!(result.queue, Some(aw_store::QueueState::Inspected));
+            let replay = store
+                .reconcile_source_turn(&manager, &reference, turn_id)
+                .unwrap();
+            assert_eq!(replay.source_effects, effects);
+            assert!(!replay.changed && !replay.hazard_cleared);
+            let after = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap();
+            assert_eq!(json!(after.history.turns.last().unwrap()), json!(original));
+            assert!(!after.history.needs_reconciliation);
+            assert_eq!(
+                store
+                    .actor_queue_fact(&owner, &session, "fixture:next")
+                    .unwrap()
+                    .state,
+                aw_store::QueueState::Pending
+            );
+            assert_eq!(
+                store
+                    .sandbox_get(&manager, &sandbox.canonical_ref)
+                    .unwrap()
+                    .rev,
+                before.rev + u64::from(!no_start)
+            );
+            assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 17);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -2220,8 +2593,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 9
-                            && v.history.turns[8].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 12
+                            && v.history.turns[11].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -2231,7 +2604,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 17);
+        assert_eq!(calls.load(Ordering::SeqCst), 20);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

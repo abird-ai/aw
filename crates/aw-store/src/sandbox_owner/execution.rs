@@ -59,13 +59,20 @@ impl SandboxExecution {
             .iter()
             .filter(|binding| binding.effect == ToolEffect::Process)
             .count();
+        let graph = bindings.iter().any(|binding| binding.name == "batch");
+        if graph && (process_count != 0 || bindings.len() < 2) {
+            return Err(Error::Denied(
+                "native Graph source selection requires fixed native nodes only",
+            ));
+        }
+
         if bindings.is_empty()
             || process_count > 1
             || bindings.iter().any(|binding| {
                 let native = Tool::from_name(&binding.name).is_some_and(|tool| {
                     tool != Tool::Remove
                         && binding.effect == native_effect(tool)
-                        && (process_count == 0
+                        && ((!graph && process_count == 0)
                             || binding.claim_route
                                 == Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1))
                 });
@@ -75,10 +82,15 @@ impl SandboxExecution {
                     && binding.effect == ToolEffect::Process
                     && binding.claim_route
                         == Some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1);
-                !(native || process)
+                let constructor = graph
+                    && binding.name == "batch"
+                    && binding.effect == ToolEffect::Control
+                    && binding.claim_route
+                        == Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1);
+                !(native || process || constructor)
                     || binding.source != ToolSource::trusted_host()
                     || binding.execution_site != bindings[0].execution_site
-                    || (process_count != 0 && binding.execution_site != "local")
+                    || ((graph || process_count != 0) && binding.execution_site != "local")
             })
         {
             return Err(Error::Denied(

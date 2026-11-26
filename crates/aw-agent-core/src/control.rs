@@ -87,6 +87,27 @@ pub trait AgentStepGate: Send + Sync {
             "Actor gate cannot serialize this effect with revocation",
         ))
     }
+
+    /// Multiple exact grants must be observed at the same authority commit.
+    /// Existing custom gates continue to support their original single-tool
+    /// path; they must opt in to atomic constructor/peer conjunction.
+    fn with_authorized_tool_commits(
+        &self,
+        bindings: &[&crate::tool::ToolBindingSnapshot],
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        match bindings {
+            [binding] => self.with_authorized_tool_commit(
+                &binding.name,
+                &binding.source,
+                &binding.effect,
+                commit,
+            ),
+            _ => Err(Error::Denied(
+                "Actor gate cannot serialize combined tool authority",
+            )),
+        }
+    }
 }
 
 /// Optional host-only live owner epoch fence. The implementation must query
@@ -773,6 +794,32 @@ impl AgentStepGate for AgentSessionController {
             if !crate::tool::envelope_permits_tool(env, name, source, effect) {
                 return Err(Error::Denied(
                     "Actor Envelope revoked or lacks exact tool authority",
+                ));
+            }
+            commit()
+        })
+    }
+
+    fn with_authorized_tool_commits(
+        &self,
+        bindings: &[&crate::tool::ToolBindingSnapshot],
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.verify_writer_fence()?;
+        self.with_runtime(|runtime| {
+            let env = runtime.envelope(&self.principal, self.actor, self.writer_epoch)?;
+            if bindings.is_empty()
+                || bindings.iter().any(|binding| {
+                    !crate::tool::envelope_permits_tool(
+                        env,
+                        &binding.name,
+                        &binding.source,
+                        &binding.effect,
+                    )
+                })
+            {
+                return Err(Error::Denied(
+                    "Actor Envelope revoked or lacks combined tool authority",
                 ));
             }
             commit()

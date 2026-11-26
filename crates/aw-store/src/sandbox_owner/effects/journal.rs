@@ -32,11 +32,16 @@ pub(super) struct Intent {
     pub(super) run_id: String,
     pub(super) started_seq: u64,
     pub(super) actor: PrincipalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) node: Option<aw_tools::filesystem::job_manager::NodeExecutionBinding>,
 }
 
 impl Intent {
     pub(super) fn effect_id(&self) -> String {
-        format!("{EFFECT_PREFIX}{}", self.started_seq)
+        match &self.node {
+            Some(node) => format!("{EFFECT_PREFIX}{}:{}", self.started_seq, node.coordinate),
+            None => format!("{EFFECT_PREFIX}{}", self.started_seq),
+        }
     }
 }
 
@@ -93,10 +98,13 @@ fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Resu
         || record.call.id != call_id
         || record.status != ToolStatus::Running
         || record.output.is_some()
-        || !matches!(
+        || !(matches!(
             record.effect,
             ToolEffect::Read | ToolEffect::Write | ToolEffect::Process
-        )
+        ) || (record.effect == ToolEffect::Control
+            && record.call.name == "batch"
+            && source.claim_route
+                == Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)))
     {
         return Err(Error::Conflict("invalid original source effect intent"));
     }
@@ -193,6 +201,7 @@ fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Resu
             run_id,
             started_seq,
             actor,
+            node: None,
         },
         record,
         source,
@@ -212,6 +221,7 @@ pub(super) fn admit_in(
 ) -> Result<Intent> {
     let observed = observe(tx, &request.agent_ref, turn_id, &call.id)?;
     if !observed.active
+        || observed.record.effect == ToolEffect::Control
         || observed.terminal.is_some()
         || observed.intent.actor != request.actor
         || &observed.record.call != call
@@ -389,6 +399,9 @@ fn require_claim(c: &Connection, intent: &Intent) -> Result<Claim> {
 pub enum SandboxToolTerminalRef {
     ToolFinished(u64),
     InterruptedTurn(String),
+    /// Original JobManager terminal transition, committed by its persist
+    /// callback as part of the node source release, not a fake ToolFinished.
+    GraphNode(aw_tools::filesystem::job::Transition),
 }
 
 fn terminal_in(
@@ -467,18 +480,22 @@ struct Release {
     terminal_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interrupted_turn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_transition: Option<aw_tools::filesystem::job::Transition>,
     outcome: SandboxEffectOutcome,
 }
 
 impl Release {
     fn new(terminal: SandboxToolTerminalRef, outcome: SandboxEffectOutcome) -> Self {
-        let (terminal_seq, interrupted_turn) = match terminal {
-            SandboxToolTerminalRef::ToolFinished(seq) => (Some(seq), None),
-            SandboxToolTerminalRef::InterruptedTurn(node) => (None, Some(node)),
+        let (terminal_seq, interrupted_turn, node_transition) = match terminal {
+            SandboxToolTerminalRef::ToolFinished(seq) => (Some(seq), None, None),
+            SandboxToolTerminalRef::InterruptedTurn(node) => (None, Some(node), None),
+            SandboxToolTerminalRef::GraphNode(transition) => (None, None, Some(transition)),
         };
         Self {
             terminal_seq,
             interrupted_turn,
+            node_transition,
             outcome,
         }
     }
@@ -510,6 +527,11 @@ pub(super) fn release_in(
     outcome: SandboxEffectOutcome,
 ) -> Result<()> {
     require_claim(tx, intent)?;
+    if intent.node.is_some() {
+        return Err(Error::Denied(
+            "Graph source effect requires its original node closure",
+        ));
+    }
     let observed = observe(tx, &intent.agent_ref, intent.turn_id, &intent.call_id)?;
     if observed.intent != *intent {
         return Err(Error::Conflict("original source effect intent changed"));
@@ -572,6 +594,11 @@ fn authorize_recovery_in(
     let key = AgentKey::new(&session, &branch);
     agent_owner::authorize_permission(tx, manager, key, AgentPermission::View)?;
     let observed = observe(tx, agent_ref, turn_id, call_id)?;
+    if observed.record.effect == ToolEffect::Control {
+        return Err(Error::Denied(
+            "Graph source recovery requires exact node coordinate",
+        ));
+    }
     let claim = require_claim(tx, &observed.intent)?;
     let project = super::super::parse_sandbox_ref(&claim.sandbox_ref)?.project;
     super::super::authorize_project(tx, manager, &project, true)?;
@@ -745,6 +772,7 @@ fn require_unclaimed_run_in(
     Ok(())
 }
 
+pub(super) mod node;
 mod run_recovery;
 pub use run_recovery::{NativeTurnReconciliation, SourceTurnReconciliation};
 
@@ -799,7 +827,8 @@ pub(crate) fn require_owner_recovery_in(
             "SELECT e.seq,json_extract(e.payload,'$.record.call.id') FROM run_events e
              WHERE e.run_id=?1 AND e.kind='tool_started' AND EXISTS(
                SELECT 1 FROM commit_log l WHERE l.entity_type='source_effect'
-                 AND l.kind='source.effect.claimed' AND l.entity_id='source-tool:'||e.seq)
+                 AND l.kind='source.effect.claimed' AND
+                 (l.entity_id='source-tool:'||e.seq OR l.entity_id GLOB 'source-tool:'||e.seq||':*'))
              ORDER BY e.seq LIMIT 513",
         ))?;
         let mut starts = db(starts.query([&run]))?;
@@ -815,8 +844,12 @@ pub(crate) fn require_owner_recovery_in(
             if observed.intent.run_id != run || observed.intent.started_seq != seq {
                 return Err(Error::Conflict("source effect startup intent changed"));
             }
-            let claim = require_claim(c, &observed.intent)?;
-            require_current_sandbox_in(c, key, &claim)?;
+            if observed.record.effect == ToolEffect::Control {
+                node::require_startup_claims(c, &observed, key)?;
+            } else {
+                let claim = require_claim(c, &observed.intent)?;
+                require_current_sandbox_in(c, key, &claim)?;
+            }
         }
         if count == 0 {
             require_unclaimed_run_in(c, session, &branch, &run, turn)?;
@@ -954,6 +987,11 @@ impl SessionStore {
         let observed = observe(&tx, agent_ref, turn_id, call_id)?;
         if &observed.intent.actor != actor {
             return Err(Error::Denied("original source effect actor differs"));
+        }
+        if observed.record.effect == ToolEffect::Control {
+            return Err(Error::Denied(
+                "Graph source effects settle at their exact nodes",
+            ));
         }
         let Some(_) = claim_in(&tx, &observed.intent.effect_id())? else {
             return Ok(None);

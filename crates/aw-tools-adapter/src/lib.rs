@@ -1054,7 +1054,7 @@ pub fn configure_routed_native(
     options: &LocalToolOptions,
     route: Arc<dyn operation_router::OperationRouter>,
 ) -> Result<AgentBuilder> {
-    Ok(configure_fixed_sources(builder, actor, options, Some(route), None)?.builder)
+    Ok(configure_fixed_sources(builder, actor, options, Some(route), None, None)?.builder)
 }
 
 /// Explicit host-selected foreground Process Job. The embedding host
@@ -1066,7 +1066,14 @@ pub fn configure_source_process(
     operation: aw_tools::OperationId,
     executor: Arc<dyn process::SourceJobProcessExecutor>,
 ) -> Result<ConfiguredLocalTools> {
-    configure_fixed_sources(builder, actor, options, None, Some((operation, executor)))
+    configure_fixed_sources(
+        builder,
+        actor,
+        options,
+        None,
+        Some((operation, executor)),
+        None,
+    )
 }
 
 /// Compose the original fixed native tools and one fixed foreground
@@ -1087,6 +1094,29 @@ pub fn configure_source_tools(
         options,
         Some(native),
         Some((operation, executor)),
+        None,
+    )
+}
+
+/// Explicit fixed foreground native Graph. Only the selected native peer
+/// tools and constructor are offered; the same route owns both. No shell,
+/// mutable router, nested/interactive/background Job or control fallback.
+pub fn configure_source_graph<R>(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    route: Arc<R>,
+) -> Result<ConfiguredLocalTools>
+where
+    R: operation_router::OperationRouter + native_filesystem::SourceGraphExecutor + 'static,
+{
+    configure_fixed_sources(
+        builder,
+        actor,
+        options,
+        Some(route.clone()),
+        None,
+        Some(route),
     )
 }
 
@@ -1099,6 +1129,7 @@ fn configure_fixed_sources(
         aw_tools::OperationId,
         Arc<dyn process::SourceJobProcessExecutor>,
     )>,
+    graph: Option<Arc<dyn native_filesystem::SourceGraphExecutor>>,
 ) -> Result<ConfiguredLocalTools> {
     use aw_tools::{filesystem::schema::Tool as FsTool, OperationId};
     let selected = options
@@ -1131,6 +1162,8 @@ fn configure_fixed_sources(
                 ));
             }
             native_tools.push(tool);
+        } else if *name == "batch" && graph.is_some() {
+            continue;
         } else if process.as_ref().is_some_and(|(operation, _)| {
             matches!(
                 operation,
@@ -1142,7 +1175,14 @@ fn configure_fixed_sources(
             return Err(Error::Denied("unsupported fixed source tool selection"));
         }
     }
+    let graph_selected = graph.is_some();
     if native.is_some() == native_tools.is_empty()
+        || graph_selected != selected.contains("batch")
+        || (graph_selected
+            && (process_selected
+                || options.execution_site != "local"
+                || options.bash.is_some()
+                || native_tools.iter().all(|tool| !tool.graph_eligible())))
         || process.is_some() != process_selected
         || (process_selected
             && (!options
@@ -1159,12 +1199,15 @@ fn configure_fixed_sources(
     let limits = options.limits.validate_for_core_tools(
         &native_tools,
         process_selected,
-        process_selected,
+        process_selected || graph_selected,
     )?;
     let concurrency = options.concurrency.validate()?;
     let mut policy = builder.tool_policy_snapshot();
     if policy.execution_site != options.execution_site {
-        if process_selected || policy.execution_site != ToolPolicy::default().execution_site {
+        if process_selected
+            || graph_selected
+            || policy.execution_site != ToolPolicy::default().execution_site
+        {
             return Err(Error::Config(
                 "fixed source tools cannot retarget host authority".into(),
             ));
@@ -1178,7 +1221,7 @@ fn configure_fixed_sources(
     policy.max_parallel_bash = policy
         .max_parallel_bash
         .min(concurrency.parallelism.max_parallel_shell);
-    if process_selected {
+    if process_selected || graph_selected {
         // Complete source custody is exclusive, including reads. A mixed
         // direct tool set never starts two source effects in a wave.
         policy.max_parallel_reads = 1;
@@ -1186,7 +1229,7 @@ fn configure_fixed_sources(
         policy.max_parallel_bash = 1;
     }
     let effective = LocalToolConcurrency {
-        graph_width: if process_selected {
+        graph_width: if process_selected || graph_selected {
             1
         } else {
             concurrency.graph_width
@@ -1197,12 +1240,12 @@ fn configure_fixed_sources(
         ceiling: effective.parallelism,
     }));
     if let Some(native) = native {
-        for tool in native_tools {
+        for &tool in &native_tools {
             let fixed = operation_router::RoutedTool::fixed(
                 Arc::new(RoutedNativeTool { tool, limits }),
                 native.clone(),
             )?;
-            if process_selected
+            if (process_selected || graph_selected)
                 && fixed.claim_route() != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
             {
                 return Err(Error::Denied(
@@ -1232,6 +1275,24 @@ fn configure_fixed_sources(
             .scope_lifecycle(runtime.clone())
             .tool_policy_lifecycle(runtime.clone())
             .shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
+        Some(runtime)
+    } else if let Some(route) = graph {
+        let graph_tools = native_tools
+            .into_iter()
+            .filter(|tool| tool.graph_eligible())
+            .collect();
+        let runtime = job_runtime::JobRuntime::new_source_graph(
+            builder.tool_binding_authority(),
+            limits,
+            effective,
+            graph_tools,
+            route,
+        )?;
+        policy.permit_host(actor, "batch", &ToolEffect::Control)?;
+        builder = builder
+            .scope_lifecycle(runtime.clone())
+            .tool_policy_lifecycle(runtime.clone())
+            .shared_tool(Arc::new(job_tools::Batch::source(runtime.clone())));
         Some(runtime)
     } else {
         None

@@ -357,7 +357,21 @@ impl ToolContext {
         binding: &ToolBindingSnapshot,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        if binding.execution_site != self.execution_site {
+        self.with_peer_tool_commits(&[binding], commit)
+    }
+
+    /// Conjoin the current original constructor and peer operation at one
+    /// Actor Envelope commit, without reentering its runtime mutex.
+    pub fn with_peer_tool_commits<T>(
+        &self,
+        bindings: &[&ToolBindingSnapshot],
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if bindings.is_empty()
+            || bindings
+                .iter()
+                .any(|binding| binding.execution_site != self.execution_site)
+        {
             return Err(Error::Denied("peer tool binding execution site changed"));
         }
         let Some(gate) = &self.live_step_gate else {
@@ -374,12 +388,7 @@ impl ToolContext {
             result = Some(operation()?);
             Ok(())
         };
-        gate.with_authorized_tool_commit(
-            &binding.name,
-            &binding.source,
-            &binding.effect,
-            &mut guarded_commit,
-        )?;
+        gate.with_authorized_tool_commits(bindings, &mut guarded_commit)?;
         result.ok_or(Error::Protocol(
             "Actor authority gate returned without executing its commit",
         ))
@@ -421,6 +430,7 @@ pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send
 pub enum ToolClaimRoute {
     NativeSourceV1,
     ProcessSourceV1,
+    NativeGraphSourceV1,
 }
 
 pub trait Tool: Send + Sync {
@@ -768,7 +778,13 @@ impl ToolRegistry {
                         Some(ToolClaimRoute::NativeSourceV1),
                         ToolEffect::Read | ToolEffect::Write
                     ) | (Some(ToolClaimRoute::ProcessSourceV1), ToolEffect::Process)
-                ))
+                        | (
+                            Some(ToolClaimRoute::NativeGraphSourceV1),
+                            ToolEffect::Control
+                        )
+                )
+                || (claim_route == Some(ToolClaimRoute::NativeGraphSourceV1)
+                    && spec.name != "batch"))
         {
             return Err(Error::Denied(
                 "claim-gated route requires its exact trusted effect",
@@ -1281,12 +1297,28 @@ impl ToolBindingAuthority {
         binding: &ToolBindingSnapshot,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.with_revalidated_bindings(actor, &[binding], commit)
+    }
+
+    /// Check the original constructor and peer node under ONE publication
+    /// lock. Never nest read locks around an awaiting/revocable operation.
+    pub fn with_revalidated_bindings<T>(
+        &self,
+        actor: &PrincipalId,
+        bindings: &[&ToolBindingSnapshot],
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if bindings.is_empty() {
+            return Err(Error::Denied("empty tool authority fence"));
+        }
         let view = self
             .inner
             .view
             .read()
             .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
-        revalidate_binding_view(&view, actor, binding)?;
+        for binding in bindings {
+            revalidate_binding_view(&view, actor, binding)?;
+        }
         commit()
     }
 }

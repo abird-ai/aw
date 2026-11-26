@@ -26,7 +26,102 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: mixed direct native/Process source execution
+## Latest local implementation delta — 2026-11-26: exact foreground native Graph node source custody
+
+Parent `b41d1507cdc8147254bf723936c1d8708f5d9ee5` (mixed direct native/Process
+composition); published AW main `3eb2da2280dd1f2860e1303d64297e0710d7e93f`,
+dotlink main `85ceccc1088e201c98c994a46a68834440eeab32`. L5 only; Store v60,
+Git recovery v4 and product 0.15.0 unchanged.
+
+- The original JobManager mints an exact immutable `RunningNode` from its
+  sealed task, node plan and actual Running transition. `NodeExecutionBinding`
+  records the original Job ID, run/graph/plan identity, coordinate and
+  Running sequence; no new Job owner or scheduling ledger. Reuse the original
+  task-run hash in recovery. Original native results, result retention and
+  the JobManager terminal commit callback remain authoritative.
+- `NativeGraphSourceV1` identifies the exact fixed local `batch` constructor.
+  `configure_source_graph` and `GitNativeSourceHost::build_execution_with_graph`
+  select explicit graph-eligible native peers and the same source route,
+  complete Git approval and Agent registry; the root-free runtime has no
+  ambient filesystem fallback. One foreground Graph, serial node ceiling,
+  no Process, Remove, nested, background, interactive, wake or dynamic route.
+  Both original constructor and peer binding/Actor grants are checked together
+  under the existing publication and Actor locks at source admission; custom
+  gates without combined authority support fail closed. Ordinary local Batch
+  and existing fixed direct routes retain their own behavior.
+- Extend original source-effect custody (not a new journal/table): an outer
+  `ToolStarted` at sequence S owns the constructor, and each actual node at N
+  uses `source-tool:S:N` with exact immutable node identity. Validate the
+  original Graph/task, actual plan, peer binding, constructor and original
+  writer/sandbox/driver; all sibling claims must belong to one Job. The full
+  approved named source set is required, read-only for reads. The original
+  native worker records positive physical quiescence and retains the source
+  barrier. The JobManager's actual terminal persist callback consumes that
+  proof with the exact node transition, advances the Sandbox revision when
+  appropriate and releases the barrier in one Store transaction before the
+  local terminal projection. Unknown or rejected settlement never promotes
+  a successful effect or permits replay. Direct source-effect encoding and
+  settlement remain backward compatible.
+- Startup and `reconcile_source_turn` use the original bounded Run intent
+  scan and atomic hazard/Input/queue disposition. Count each original
+  Graph node separately, with positive releases or claim-gated no-start;
+  skipped/unclaimed coordinates must have no contradictory custody. Reject
+  unmarked/legacy or Process-containing Graphs, changed plans/Job identities,
+  and incomplete/foreign evidence. The native-only API remains narrow.
+  `sandbox_recover_recorded_graph_node` consumes only exact previously
+  recorded quiescence after original outer logical closure (or replays an
+  already released node); does not invent a missing node terminal or inspect
+  physical artifacts. A claimed node lacking positive proof stays held.
+- Real Actor/Store/Job regression adds three cuts to the previous grouped
+  fixture: loss after outer intent before any node claim (four no-start);
+  loss after actual read/write/read and conditional skip (three releases,
+  one no-start); and refusal of the actual second node settlement callback
+  after physical write/quiescence (foreign coordinate rejected, original
+  proof retained, whole-Run recovery refuses until node proof is consumed).
+  Reopen the Store, verify physical files and unchanged Git index, immutable
+  original Turn, exact release/recovery replay, one writable revision advance,
+  retire only original Input/queue, leave later pending Input for its actual
+  dispatch. No synthesized execution facts. Earlier native/Process/mixed cuts
+  remain in the same regression.
+
+Validation (L5, locked/offline, final source): Actor lifecycle 3/3
+(21.99s; eight deliberate caught Actor losses across the grouped fixture),
+adapter library 259/259 (1.38s), binding authority 6/6, Host native/Process
+2/2 (6.18s), standalone Store Sandbox owner 4/4 (2.11s), native executable
+1/1 (35.37s, ordinary and linked layouts). Strict affected all-feature/all-target
+Clippy passed after simplifying the binding comparison. Standalone Store
+initially lacked the new shared Graph types; explicitly enable only the
+required `aw-tools` batch/durable features. Standalone Store and CLI
+durable/minimal all-target checks passed (existing profile-specific dead-code
+warnings), actual CLI version/help and scoped fmt/diff passed.
+
+One broader JobManager qualification failure: `aw-tools` filesystem::job
+88 passed, 1 failed; `worst_case_compact_job_status_fits_control_plane_bound`
+renders 8,458 bytes for 64 Process nodes against the existing 8,192-byte
+control-plane bound. Neither its fixture nor rendering/runtime-admission
+path changed in this slice; the parent was not separately executed. Keep
+the assertion and existing limit intact; correct the projection/budget
+contract before broader Job qualification. Total distinct test cases in
+these runs: 363 passed, one failed. Full workspace, pinned Nix, and other
+platforms not repeated.
+
+Scope: qualified fixed foreground native Graph embedding-host route, with
+serial nodes and exact recorded-proof recovery only. No independent physical
+artifact recovery for a Graph node without positive quiescence yet; no
+Process-containing Graph, arbitrary shell containment, background/interactive
+or extension promotion. Faulted actual callback and Actor-task losses, not
+OS process death inside arbitrary filesystem effects. No schema migration,
+new public CLI Graph route or frozen 017 changes.
+
+Next: resolve the compact Job status size-bound failure without dropping
+required evidence or silently widening existing control budgets. Then
+driver-specific independent physical recovery for the original Graph
+node using the existing native artifact owners (without inventing a node
+terminal), then Process nodes under the reviewed containment and combined
+source/constructor/peer authority contracts; later Vault and remaining host
+RPC/retention gates. Phase 3 remains underway.
+
+## Previous local implementation delta — 2026-11-26: mixed direct native/Process source execution
 
 Parent `3eb2da2280dd1f2860e1303d64297e0710d7e93f`, independently verified
 published AW main. Dotlink main `85ceccc1` was also confirmed published;

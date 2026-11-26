@@ -48,11 +48,18 @@ pub(super) enum RecoveryScope {
 pub(super) enum IntentRoute {
     Native,
     Process(OperationId),
+    NativeGraph,
 }
 
 impl IntentRoute {
     fn from_observed(observed: &Observation) -> Result<Self> {
         let record = &observed.record;
+        if record.call.name == "batch"
+            && record.effect == ToolEffect::Control
+            && observed.source.claim_route == Some(ToolClaimRoute::NativeGraphSourceV1)
+        {
+            return Ok(Self::NativeGraph);
+        }
         if let Some(tool) = Tool::from_name(&record.call.name) {
             let effect = if tool.action() == Action::Read {
                 ToolEffect::Read
@@ -87,6 +94,7 @@ impl IntentRoute {
         match self {
             Self::Native => ToolClaimRoute::NativeSourceV1,
             Self::Process(_) => ToolClaimRoute::ProcessSourceV1,
+            Self::NativeGraph => ToolClaimRoute::NativeGraphSourceV1,
         }
     }
 }
@@ -96,6 +104,7 @@ pub(super) struct IntentSummary {
     pub possible_effect: bool,
     native: bool,
     legacy_native: bool,
+    graph: bool,
     process: Option<OperationId>,
 }
 
@@ -112,6 +121,15 @@ impl IntentSummary {
                 self.legacy_native |=
                     observed.source.claim_route != Some(ToolClaimRoute::NativeSourceV1);
             }
+            IntentRoute::NativeGraph => {
+                if scope == RecoveryScope::NativeOnly {
+                    return Err(Error::Denied(
+                        "native-only recovery excludes Graph constructors",
+                    ));
+                }
+                self.native = true;
+                self.graph = true;
+            }
             IntentRoute::Process(operation) => {
                 if scope == RecoveryScope::NativeOnly
                     || self.process.is_some_and(|old| old != operation)
@@ -123,7 +141,12 @@ impl IntentSummary {
                 self.process = Some(operation);
             }
         }
-        if self.process.is_some() && self.legacy_native {
+        if self.graph && self.process.is_some() {
+            return Err(Error::Denied(
+                "original source route cannot mix native Graph and Process",
+            ));
+        }
+        if (self.graph || self.process.is_some()) && self.legacy_native {
             return Err(Error::Denied(
                 "mixed source Run contains an unmarked native intent",
             ));
@@ -146,6 +169,9 @@ impl IntentSummary {
     }
 
     fn note(&self) -> &'static str {
+        if self.graph {
+            return "Original Graph node source releases or claim-gated no-start verified; original Run retained, no replay";
+        }
         match (self.native, self.process.is_some()) {
             (true, true) => MIXED_NOTE,
             (false, true) => PROCESS_NOTE,
@@ -162,6 +188,9 @@ pub(super) fn require_unclaimed_no_start(
     observed: &Observation,
     route: IntentRoute,
 ) -> Result<()> {
+    if route == IntentRoute::NativeGraph {
+        return super::node::require_unclaimed_graph(c, observed);
+    }
     let effect_id = observed.intent.effect_id();
     if observed.source.claim_route != Some(route.marker())
         || claim_in(c, &effect_id)?.is_some()
@@ -220,6 +249,7 @@ pub(super) fn inspect_source_intents(
         possible_effect: false,
         native: false,
         legacy_native: false,
+        graph: false,
         process: None,
     };
     let mut count = 0;
@@ -279,14 +309,21 @@ fn require_releases(
     turn: u64,
     actor: &PrincipalId,
     scope: RecoveryScope,
-) -> Result<(IntentSummary, usize)> {
+) -> Result<(IntentSummary, usize, usize)> {
     let native = DriverKey::builtin("native-filesystem")?;
     // The original complete versioned binding digest is sufficient for
     // logical recovery: do not require a current driver or physical probe.
     let bindings =
         sandbox_owner::source_bindings::versioned_bindings_in(c, &sandbox.canonical_ref)?;
     let mut no_start = 0;
+    let mut effects = 0;
     let summary = inspect_source_intents(c, run, agent, turn, actor, scope, |observed, route| {
+        if route == IntentRoute::NativeGraph {
+            let (claimed, unclaimed) = super::node::require_graph_releases(c, observed, sandbox)?;
+            effects += claimed;
+            no_start += unclaimed;
+            return Ok(());
+        }
         if observed.active {
             return Err(Error::Denied("source Run is still active"));
         }
@@ -319,7 +356,9 @@ fn require_releases(
                     "no-start release contradicts original success",
                 ));
             }
-            Some(_) => {}
+            Some(_) => {
+                effects += 1;
+            }
             None => {
                 return Err(Error::Conflict(
                     "original effect has no positive source release",
@@ -329,7 +368,7 @@ fn require_releases(
         Ok(())
     })?;
     summary.require_layout(sandbox)?;
-    Ok((summary, no_start))
+    Ok((summary, effects, no_start))
 }
 
 impl SessionStore {
@@ -432,7 +471,7 @@ impl SessionStore {
             {
                 return Err(Error::Conflict("settled source Run identity changed"));
             }
-            let (summary, unclaimed_no_start) =
+            let (summary, source_effects, unclaimed_no_start) =
                 require_releases(&tx, &run, agent_ref, &sandbox, turn, &original.actor, scope)?;
             let effectful = summary.possible_effect;
             let note = summary.note();
@@ -492,7 +531,7 @@ impl SessionStore {
             }
             let result = SourceTurnReconciliation {
                 turn,
-                source_effects: summary.count - unclaimed_no_start,
+                source_effects,
                 unclaimed_no_start,
                 hazard_cleared,
                 input,

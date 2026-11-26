@@ -281,6 +281,27 @@ where
         ctx: ToolContext,
         arguments: &serde_json::Value,
     ) -> Result<aw_agent_core::ToolOutput> {
+        self.execute_source(tool, ctx, arguments, None, |request, backend, cancelled| {
+            request.execute(backend, cancelled)
+        })
+        .await
+        .map(|(result, _)| result)
+    }
+
+    async fn execute_source<T: Send + 'static>(
+        &self,
+        tool: FsTool,
+        ctx: ToolContext,
+        arguments: &serde_json::Value,
+        graph: Option<&aw_tools_adapter::native_filesystem::SourceGraphNodeRequest<'_>>,
+        execute: impl FnOnce(
+                PreparedNativeRequest,
+                &aw_tools_adapter::native_filesystem::CapabilitySet,
+                &dyn Fn() -> bool,
+            ) -> Result<T>
+            + Send
+            + 'static,
+    ) -> Result<(T, SandboxEffectOutcome)> {
         if ctx.execution_scope.is_some()
             || ctx.execution_owner.as_ref() != Some(&self.agent)
             || ctx.scope.as_ref().is_none_or(|scope| {
@@ -302,7 +323,8 @@ where
         } else {
             ToolEffect::Write
         };
-        if ctx.effect != expected_effect
+        if (graph.is_none() && ctx.effect != expected_effect)
+            || (graph.is_some() && ctx.effect != ToolEffect::Control)
             || ctx.identity.actor != ctx.actor
             || ctx.source != aw_agent_core::ToolSource::trusted_host()
         {
@@ -310,7 +332,26 @@ where
                 "native source operation differs from its original tool effect",
             ));
         }
-        let request = PreparedNativeRequest::new(tool, arguments, self.limits, &ctx)?;
+        let request = if let Some(graph) = graph {
+            if graph.node.plan().tool().native() != Some(tool)
+                || graph.node.plan().arguments() != arguments
+                || graph.binding.effect != expected_effect
+                || graph.node.task().turn_id != ctx.turn_id
+                || graph.node.task().call_id != ctx.call_id
+            {
+                return Err(Error::Denied(
+                    "source Graph request differs from actual sealed native node",
+                ));
+            }
+            PreparedNativeRequest::for_graph_node(
+                tool,
+                arguments,
+                self.limits,
+                graph.node.plan().budget().result_bytes,
+            )?
+        } else {
+            PreparedNativeRequest::new(tool, arguments, self.limits, &ctx)?
+        };
         if ctx.cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -346,12 +387,15 @@ where
         let effect = SandboxEffectRequest {
             actor: ctx.actor.clone(),
             agent_ref: self.agent.canonical_ref().into(),
-            origin: SandboxEffectOrigin::Tool {
-                turn_id: ctx.turn_id,
-                call: aw_agent_core::ToolCall {
-                    id: ctx.call_id.clone(),
-                    name: operation.model_name().into(),
-                    arguments: arguments.clone(),
+            origin: match graph {
+                Some(graph) => SandboxEffectOrigin::GraphNode(Box::new(graph.node.clone())),
+                None => SandboxEffectOrigin::Tool {
+                    turn_id: ctx.turn_id,
+                    call: aw_agent_core::ToolCall {
+                        id: ctx.call_id.clone(),
+                        name: operation.model_name().into(),
+                        arguments: arguments.clone(),
+                    },
                 },
             },
             sources: layout
@@ -364,8 +408,17 @@ where
                 .collect(),
         };
         let cancellation = ctx.cancellation.clone();
-        let authority =
-            SourceToolAuthority::new(authority, tool_authority, evidence)?.for_invocation(ctx)?;
+        if graph.is_some_and(|graph| evidence.binding() != graph.binding) {
+            return Err(Error::Denied(
+                "source Graph peer binding changed after sealed Start",
+            ));
+        }
+        let authority = SourceToolAuthority::new(authority, tool_authority, evidence)?;
+        let authority = match graph {
+            Some(graph) => authority.for_graph_node(ctx, graph.constructor.clone())?,
+            None => authority.for_invocation(ctx)?,
+        };
+        let node_owned = graph.is_some();
         let reader = self.registry.reader()?;
         let prepared = self.store.sandbox_prepare_source_effect(
             effect,
@@ -384,7 +437,7 @@ where
                 (Err(Error::Cancelled), SandboxEffectOutcome::NotStarted)
             } else {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    request.execute(&layout.capability, &|| cancellation.is_cancelled())
+                    execute(request, &layout.capability, &|| cancellation.is_cancelled())
                 })) {
                     Ok(result) => {
                         let outcome = if result.is_ok() && layout.artifacts_retired() {
@@ -406,14 +459,76 @@ where
             // Persist positive quiescence (or Unknown) while the worker
             // still holds its independent authority, before any result
             // can reach the original ToolFinished owner.
-            lease.defer_until_tool_finished(outcome)?;
+            if node_owned {
+                lease.defer_until_node_settled(outcome)?;
+            } else {
+                lease.defer_until_tool_finished(outcome)?;
+            }
             drop(authority);
-            result
+            result.map(|result| (result, outcome))
         })
         .await
         .map_err(|_| {
             Error::Protocol("native source worker outcome uncertain; inspect before retry")
         })?
+    }
+}
+
+impl<A, F> aw_tools_adapter::native_filesystem::SourceGraphExecutor for SourceFilesystemRoute<A, F>
+where
+    A: SandboxEffectAuthority + Send + 'static,
+    F: Fn(&ToolContext, FsTool) -> Result<NativeSourceAdmission<A>> + Send + Sync + 'static,
+{
+    fn execute_node<'a>(
+        &'a self,
+        request: aw_tools_adapter::native_filesystem::SourceGraphNodeRequest<'a>,
+    ) -> aw_tools_adapter::native_filesystem::SourceGraphNodeFuture<'a> {
+        Box::pin(async move {
+            let tool = request
+                .node
+                .plan()
+                .tool()
+                .native()
+                .ok_or(Error::Denied("source Graph requires original native node"))?;
+            let mut ctx = request.context.clone();
+            ctx.cancellation = request.cancellation.clone();
+            let (mut result, outcome) = self
+                .execute_source(
+                    tool,
+                    ctx,
+                    request.node.plan().arguments(),
+                    Some(&request),
+                    |prepared, backend, cancelled| prepared.execute_graph(backend, cancelled),
+                )
+                .await?;
+            if outcome == SandboxEffectOutcome::Unknown {
+                result.status.primary = aw_tools::filesystem::status::Primary::Unknown;
+                result.status.incomplete = true;
+            }
+            Ok(result)
+        })
+    }
+
+    fn settle_node(
+        &self,
+        ctx: &ToolContext,
+        node: &aw_tools::filesystem::job_manager::RunningNode,
+        transition: aw_tools::filesystem::job::Transition,
+    ) -> Result<()> {
+        if ctx.execution_owner.as_ref() != Some(&self.agent)
+            || ctx.turn_id != node.task().turn_id
+            || ctx.call_id != node.task().call_id
+        {
+            return Err(Error::Denied(
+                "source Graph settlement belongs to another original invocation",
+            ));
+        }
+        self.store.sandbox_settle_recorded_graph_node(
+            &ctx.actor,
+            self.agent.canonical_ref(),
+            node,
+            transition,
+        )
     }
 }
 

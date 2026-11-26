@@ -940,6 +940,7 @@ impl GitNativeSourceHost {
     ) -> Result<
         Arc<
             impl aw_tools_adapter::operation_router::OperationRouter
+                + aw_tools_adapter::native_filesystem::SourceGraphExecutor
                 + aw_agent_core::Extension
                 + 'static,
         >,
@@ -954,6 +955,53 @@ impl GitNativeSourceHost {
             options.limits,
             move |ctx, tool| host.resolve(ctx, tool),
         )?))
+    }
+
+    /// Explicit foreground native Graph on the original approved Git
+    /// source scope and existing JobRuntime. The ordinary native-only CLI
+    /// continues to use its narrower configuration.
+    pub fn build_execution_with_graph(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+    ) -> Result<(
+        Agent,
+        SandboxExecution,
+        Arc<aw_tools_adapter::job_runtime::JobRuntime>,
+    )> {
+        let mut native_options = options.clone();
+        native_options.selected_tools.retain(|name| name != "batch");
+        self.preflight(store, &actor, &execution, &native_options)?;
+        let route = self.native_route(store, execution.clone(), &builder, options)?;
+        let configured = aw_tools_adapter::configure_source_graph(
+            builder,
+            actor.clone(),
+            options,
+            route.clone(),
+        )?;
+        let jobs = configured
+            .job_runtime
+            .ok_or(Error::Storage("source Graph Job runtime unavailable"))?;
+        let mut agent = configured.builder.shared_extension(route).build()?;
+        agent.bind_execution_owner(execution.clone())?;
+        let base = self.approval.read()?.base().to_owned();
+        if base != options.root {
+            return Err(Error::Denied("source Graph root differs from approval"));
+        }
+        let base_pin = aw_platform::DirectoryIdentity::open(&base)?;
+        let host = self.clone();
+        let source = SandboxExecution::from_trusted_host(
+            store,
+            actor,
+            execution,
+            base,
+            &agent.tool_binding_authority(),
+            move || host.execution_fence(&base_pin),
+        )?;
+        Ok((agent, source, jobs))
     }
 
     /// Compose the fixed native route and one registered foreground Process

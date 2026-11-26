@@ -15,11 +15,17 @@ pub struct SourceToolRecoveryTarget<'a> {
 pub(crate) struct LiveSourceTool {
     authority: ToolBindingAuthority,
     evidence: AuthenticatedToolGrantEvidence,
+    constructor: Option<aw_agent_core::tool::ToolBindingSnapshot>,
 }
 
 impl LiveSourceTool {
     pub(crate) fn is_live(&self) -> bool {
         self.evidence.revalidate(&self.authority).is_ok()
+            && self.constructor.as_ref().is_none_or(|binding| {
+                self.authority
+                    .revalidate(&self.evidence.actor, binding)
+                    .is_ok()
+            })
     }
 
     pub(crate) async fn wait_until_not_live(&self) {
@@ -62,6 +68,7 @@ impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
             tool: LiveSourceTool {
                 authority,
                 evidence,
+                constructor: None,
             },
             invocation: None,
             containment: ContainmentRequirement::BestAvailable,
@@ -96,6 +103,39 @@ impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
         self.invocation = Some(ctx);
         Ok(self)
     }
+
+    /// Peer native effect under the original fixed Graph constructor.
+    /// Both grants and both Actor capabilities are committed together.
+    pub(crate) fn for_graph_node(
+        mut self,
+        ctx: aw_agent_core::ToolContext,
+        constructor: aw_agent_core::tool::ToolBindingSnapshot,
+    ) -> Result<Self> {
+        use aw_agent_core::tool::ToolClaimRoute;
+        let binding = self.tool.evidence.binding();
+        if self.tool.evidence.actor != ctx.actor
+            || ctx.identity.actor != ctx.actor
+            || ctx.effect != ToolEffect::Control
+            || ctx.source != constructor.source
+            || ctx.execution_site != constructor.execution_site
+            || constructor.name != "batch"
+            || constructor.effect != ToolEffect::Control
+            || constructor.claim_route != Some(ToolClaimRoute::NativeGraphSourceV1)
+            || binding.claim_route != Some(ToolClaimRoute::NativeSourceV1)
+            || binding.execution_site != ctx.execution_site
+            || binding.source != ctx.source
+        {
+            return Err(Error::Denied(
+                "source Graph constructor or native peer differs from invocation",
+            ));
+        }
+        self.tool.authority.revalidate(&ctx.actor, &constructor)?;
+        ctx.authorize_peer_tool(&constructor)?;
+        ctx.authorize_peer_tool(binding)?;
+        self.tool.constructor = Some(constructor);
+        self.invocation = Some(ctx);
+        Ok(self)
+    }
 }
 
 impl<A: SandboxEffectAuthority> SandboxEffectAuthority for SourceToolAuthority<A> {
@@ -111,10 +151,26 @@ impl<A: SandboxEffectAuthority> SandboxEffectAuthority for SourceToolAuthority<A
         Some(self.tool.evidence.binding())
     }
 
+    fn constructor_binding(&self) -> Option<&aw_agent_core::tool::ToolBindingSnapshot> {
+        self.tool.constructor.as_ref()
+    }
+
     fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
         // Both preflight and the final Store commit use the existing tool
         // publication fence. Never hold its synchronous lock across await.
         self.source.with_admission(|| {
+            if let Some(constructor) = &self.tool.constructor {
+                let bindings = [constructor, self.tool.evidence.binding()];
+                let ctx = self
+                    .invocation
+                    .as_ref()
+                    .ok_or(Error::Denied("source Graph has no Actor invocation"))?;
+                return self.tool.authority.with_revalidated_bindings(
+                    &self.tool.evidence.actor,
+                    &bindings,
+                    || ctx.with_peer_tool_commits(&bindings, admit),
+                );
+            }
             self.tool.authority.with_revalidated_binding(
                 &self.tool.evidence.actor,
                 self.tool.evidence.binding(),

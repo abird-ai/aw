@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: mixed direct native/Process source execution (this checkpoint; local parent `3eb2da2280dd1f2860e1303d64297e0710d7e93f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: exact foreground native Graph node source custody (this checkpoint; local parent `b41d1507cdc8147254bf723936c1d8708f5d9ee5`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1762,7 +1762,26 @@ Current implementation: mixed direct native/Process source execution (this check
       Host native/Process 2/2, Store Sandbox owner 4/4, native executable
       1/1, strict affected Clippy, durable/minimal checks, version/help and
       scoped fmt/diff passed.
-      **Next:** exact node-level source custody for broader Job/Graph and
+      **Foreground native Graph node source custody:** original marked
+      constructor, actual sealed RunningNode/JobManager transition identity,
+      combined constructor+peer authority, serial root-free Git native Graph.
+      Exact per-node source claim/quiescence/terminal release in the original
+      owner; full named source set, no ambient fallback or extra ledger.
+      Bounded startup/Run reconciliation counts original releases/no-start
+      by coordinate, exact positive recorded-proof recovery, immutable history
+      and original Input/queue disposition. Grouped Actor loss before claims,
+      after actual Graph results, and actual callback loss after physical
+      write/positive proof (foreign transition refused). Actor lifecycle 3/3,
+      adapter 259/259, binding authority 6/6, Host 2/2, standalone Store 4/4,
+      native executable 1/1, strict affected Clippy, durable/minimal checks,
+      CLI version/help and scoped fmt/diff passed. Explicit Store batch/durable
+      dependency avoids relying on combined feature unification. Wider
+      shared Job suite 88/89: unchanged 64-Process-node compact status fixture
+      exceeds 8 KiB (8,458 bytes); assertion retained, parent not independently
+      executed, correction open. 363 passed, one failed overall.
+      **Next:** correct the compact Job status bound before broader Job
+      qualification; independent Graph node physical recovery using the original
+      native artifact owner, then qualified Process-containing Graph and
       extension dispatch, reviewed actual containment driver, then Vault
       projection and remaining host RPC/retention. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
