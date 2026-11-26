@@ -25,6 +25,8 @@ mod sandbox_derive;
 mod sandbox_retention;
 #[cfg(feature = "workspace")]
 mod sandbox_source_attach;
+#[cfg(feature = "workspace")]
+mod sandbox_source_rpc;
 mod skill_package;
 mod source_metadata;
 #[cfg(all(feature = "team", target_os = "linux"))]
@@ -968,6 +970,11 @@ struct RpcCommandCliArgs {
     /// Never authorizes materialization, capture, restore or execution.
     #[arg(long = "source-metadata-approval", requires = "rpc_actor_owner")]
     rpc_source_metadata_approval: Option<PathBuf>,
+    /// Independently approved exact source mutation for an unused same-
+    /// Project Sandbox. No caller-selected paths or recovery modes.
+    #[cfg(feature = "workspace")]
+    #[arg(long = "sandbox-source-approval", requires = "rpc_actor_owner")]
+    rpc_sandbox_source_approval: Option<PathBuf>,
     /// Activate an existing private signing Vault and authorize binding
     /// management for this exact local Actor. Entry refs require explicit
     /// provider metadata approval. Host must independently
@@ -1067,6 +1074,8 @@ pub(crate) struct RunArgs {
     rpc_checkpoint_restore_root: Option<PathBuf>,
     rpc_checkpoint_delete: bool,
     rpc_source_metadata_approval: Option<PathBuf>,
+    #[cfg(feature = "workspace")]
+    rpc_sandbox_source_approval: Option<PathBuf>,
     rpc_signing_vault_root: Option<PathBuf>,
     rpc_signing_broker_entry: Option<String>,
     #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1206,6 +1215,8 @@ impl RunArgs {
             rpc_checkpoint_restore_root: None,
             rpc_checkpoint_delete: false,
             rpc_source_metadata_approval: None,
+            #[cfg(feature = "workspace")]
+            rpc_sandbox_source_approval: None,
             rpc_signing_vault_root: None,
             rpc_signing_broker_entry: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1653,6 +1664,10 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
             run.rpc_source_metadata_approval = args.rpc_source_metadata_approval;
+            #[cfg(feature = "workspace")]
+            {
+                run.rpc_sandbox_source_approval = args.rpc_sandbox_source_approval;
+            }
             run.rpc_signing_vault_root = args.rpc_signing_vault_root;
             run.rpc_signing_broker_entry = args.rpc_signing_broker_entry;
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -3196,6 +3211,10 @@ fn run_agent_with_shell_containment(
             if let Some(path) = args.rpc_source_metadata_approval {
                 host.attach_rpc_source_metadata(&path)?;
             }
+            #[cfg(feature = "workspace")]
+            if let Some(path) = args.rpc_sandbox_source_approval {
+                host.attach_rpc_sandbox_source(&path)?;
+            }
             if let Some(root) = args.rpc_signing_vault_root {
                 host.attach_rpc_signing_vault(&root, args.rpc_signing_broker_entry.as_deref())?;
             }
@@ -3549,6 +3568,8 @@ struct Host {
     agent_vault_port: Option<std::sync::Arc<StdioVaultPort>>,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
+    #[cfg(feature = "workspace")]
+    sandbox_source_approval: Option<sandbox_source_rpc::ApprovalFile>,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -4971,6 +4992,31 @@ impl Host {
         Ok(())
     }
 
+    #[cfg(feature = "workspace")]
+    fn attach_rpc_sandbox_source(&mut self, path: &std::path::Path) -> Result<()> {
+        let owner = self.actor_owner.as_ref().ok_or(Error::Denied(
+            "source mutation requires the local Actor owner",
+        ))?;
+        owner.verify_rpc_state()?;
+        let state = self.sandbox_owner.as_ref().ok_or(Error::Denied(
+            "source mutation requires the exact Project Sandbox owner",
+        ))?;
+        let creator = self.agent_create_owner.as_ref().ok_or(Error::Denied(
+            "source mutation requires the original execution layout",
+        ))?;
+        if self.sandbox_source_approval.is_some() {
+            return Err(Error::Conflict("Sandbox source approval already selected"));
+        }
+        self.sandbox_source_approval = Some(sandbox_source_rpc::ApprovalFile::open(
+            path,
+            &state.store,
+            &state.caller,
+            &state.current_project_ref,
+            &creator.binding,
+        )?);
+        Ok(())
+    }
+
     fn attach_rpc_signing_vault(
         &mut self,
         root: &std::path::Path,
@@ -5293,6 +5339,8 @@ impl Host {
             agent_vault_port: None,
             agent_inputs_owner: None,
             sandbox_owner: None,
+            #[cfg(feature = "workspace")]
+            sandbox_source_approval: None,
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -6993,6 +7041,43 @@ impl aw::headless::Driver for Host {
             .ok_or(Error::Denied("signing broker not selected"))?
             .sign(grant_rev, message)
     }
+    #[cfg(feature = "workspace")]
+    fn can_sandbox_sources_set(&self) -> bool {
+        self.sandbox_source_approval.is_some() && self.actor_owner.is_some()
+    }
+
+    #[cfg(feature = "workspace")]
+    fn sandbox_sources_set(
+        &self,
+        request_id: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let owner = self.actor_owner.as_ref().ok_or(Error::Denied(
+            "source mutation requires the local Actor owner",
+        ))?;
+        owner.verify_rpc_state()?;
+        owner.verify_rpc_agent(
+            self.agent
+                .as_ref()
+                .ok_or(Error::Denied("original Agent unavailable"))?,
+        )?;
+        let state = self.sandbox_owner.as_ref().ok_or(Error::Denied(
+            "source mutation requires the Project Sandbox owner",
+        ))?;
+        let approval = self
+            .sandbox_source_approval
+            .as_ref()
+            .ok_or(Error::Denied("source mutation approval unavailable"))?;
+        let result = approval.apply(
+            &state.store,
+            &state.caller,
+            &state.current_project_ref,
+            request_id,
+            params,
+        )?;
+        bounded_source_metadata(sandbox_snapshot_value(&result, true))
+    }
+
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()

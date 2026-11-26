@@ -30,21 +30,21 @@ pub(crate) struct ReleaseArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
+pub(crate) struct Config {
     version: u16,
     store_directory: PathBuf,
     store_id: String,
     store_generation: u64,
     manager: PrincipalId,
-    sandbox: String,
-    sandbox_rev: u64,
-    destination_root: PathBuf,
+    pub(crate) sandbox: String,
+    pub(crate) sandbox_rev: u64,
+    pub(crate) destination_root: PathBuf,
     destination_identity: (u64, u64),
-    repositories: Vec<GitSourceLocation>,
+    pub(crate) repositories: Vec<GitSourceLocation>,
     /// Present only for removal of one named source from an open Sandbox.
     /// Closed-Sandbox retirement must not consume this decision.
     #[serde(default)]
-    source: Option<SourceName>,
+    pub(crate) source: Option<SourceName>,
 }
 
 pub(crate) struct Approval {
@@ -54,15 +54,29 @@ pub(crate) struct Approval {
 }
 
 impl Approval {
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub(crate) fn open(path: &Path, manager: &PrincipalId) -> Result<Self> {
         Self::open_in(path, manager, None)
     }
 
     fn open_in(path: &Path, manager: &PrincipalId, source: Option<&SourceName>) -> Result<Self> {
+        let (lease, config): (_, Config) = open_private_approval(path)?;
+        Self::from_config(path, manager, source, lease, config)
+    }
+
+    pub(crate) fn from_config(
+        path: &Path,
+        manager: &PrincipalId,
+        source: Option<&SourceName>,
+        lease: File,
+        mut config: Config,
+    ) -> Result<Self> {
         let parent = path
             .parent()
             .ok_or(Error::Denied("Sandbox approval directory required"))?;
-        let (lease, mut config): (_, Config) = open_private_approval(path)?;
         if config.version != 1
             || &config.manager != manager
             || config.source.as_ref() != source
@@ -117,11 +131,21 @@ impl Approval {
             &c.manager,
             &c.sandbox,
             c.sandbox_rev,
-            |snapshot, bindings, prepared| self.fence(snapshot, bindings, prepared),
+            |snapshot, bindings, prepared| self.fence(snapshot, bindings, prepared, &[]),
         )
     }
 
-    fn release(&self, store: &SessionStore, sandbox: &str) -> Result<SandboxSnapshot> {
+    pub(crate) fn require_scope(&self, store: &SessionStore) -> Result<()> {
+        let c = &self.config;
+        require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)
+    }
+
+    pub(crate) fn release(
+        &self,
+        store: &SessionStore,
+        sandbox: &str,
+        extra_protected: &[&Path],
+    ) -> Result<SandboxSnapshot> {
         let c = &self.config;
         let name = c.source.as_ref().ok_or(Error::Denied(
             "named source release requires separate approval",
@@ -150,6 +174,7 @@ impl Approval {
                     release.snapshot(),
                     release.bindings(),
                     release.preparations(),
+                    extra_protected,
                 )
             },
         )
@@ -160,6 +185,7 @@ impl Approval {
         snapshot: &SandboxSnapshot,
         bindings: &[VersionedSourceBinding],
         prepared: &[NamedPreparedSource],
+        extra_protected: &[&Path],
     ) -> Result<PinnedGitLayout<'_>> {
         let c = &self.config;
         if snapshot.canonical_ref != c.sandbox
@@ -181,12 +207,14 @@ impl Approval {
         // Only private named children. No arbitrary source binding is a
         // cleanup recipe: the original Applied descriptor is checked by
         // the Git host before the cleanup claim and each release.
+        let mut protected = vec![c.store_directory.as_path(), self.directory.as_path()];
+        protected.extend_from_slice(extra_protected);
         pin_named_layout(
             &self._lease,
             &c.destination_root,
             c.destination_identity,
             &c.repositories,
-            &[&c.store_directory, &self.directory],
+            &protected,
             true,
         )
     }
@@ -199,7 +227,7 @@ pub(crate) fn release(
     sandbox: &str,
     source: &SourceName,
 ) -> Result<SandboxSnapshot> {
-    Approval::open_in(path, actor, Some(source))?.release(store, sandbox)
+    Approval::open_in(path, actor, Some(source))?.release(store, sandbox, &[])
 }
 
 pub(crate) fn run_release(args: ReleaseArgs) -> Result<u8> {

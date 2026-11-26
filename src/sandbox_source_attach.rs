@@ -32,6 +32,11 @@ pub(crate) struct Args {
     /// Reconcile the original unpublished candidate; replacement requires an intact predecessor.
     #[arg(long = "agent-abandon", conflicts_with = "recover")]
     abandon: bool,
+    /// Recover the original sandbox_sources_set stdio request ID rather than
+    /// an offline invocation. Valid only for explicit recovery/abandonment/
+    /// replacement continuation.
+    #[arg(long = "rpc-invocation")]
+    rpc_invocation: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -52,34 +57,38 @@ pub(crate) enum MaterializationMode {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
+pub(crate) struct Config {
     version: u16,
     store_directory: PathBuf,
     store_id: String,
     store_generation: u64,
     manager: PrincipalId,
-    sandbox: String,
-    sandbox_rev: u64,
-    anchor: SourceAnchor,
-    destination_root: PathBuf,
+    pub(crate) sandbox: String,
+    pub(crate) sandbox_rev: u64,
+    pub(crate) anchor: SourceAnchor,
+    pub(crate) destination_root: PathBuf,
     destination_identity: (u64, u64),
-    repositories: Vec<GitSourceLocation>,
+    pub(crate) repositories: Vec<GitSourceLocation>,
     /// Explicit independent disposal approval of the old origin, at the
     /// same named destination as the incoming version.
     #[serde(default)]
-    replaced_repository: Option<GitSourceLocation>,
+    pub(crate) replaced_repository: Option<GitSourceLocation>,
     /// Separately approve exact continuation, not general retry.
     #[serde(default)]
     allow_continuation: bool,
 }
 
-struct Approval {
+pub(crate) struct Approval {
     config: Config,
     directory: PathBuf,
     lease: File,
 }
 
 impl Approval {
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     fn open(
         store: &SessionStore,
         actor: &PrincipalId,
@@ -87,10 +96,22 @@ impl Approval {
         path: &Path,
         replace: bool,
     ) -> Result<Self> {
+        let (lease, config): (_, Config) = open_private_approval(path)?;
+        Self::from_config(store, actor, sandbox, path, replace, lease, config)
+    }
+
+    pub(crate) fn from_config(
+        store: &SessionStore,
+        actor: &PrincipalId,
+        sandbox: &str,
+        path: &Path,
+        replace: bool,
+        lease: File,
+        mut config: Config,
+    ) -> Result<Self> {
         let directory = path
             .parent()
             .ok_or(Error::Denied("attachment approval directory required"))?;
-        let (lease, mut config): (_, Config) = open_private_approval(path)?;
         if config.version != 1
             || &config.manager != actor
             || config.sandbox != sandbox
@@ -151,7 +172,12 @@ impl Approval {
         }
     }
 
-    fn fence(&self, attachment: &SandboxAttachment, recover: bool) -> Result<PinnedGitLayout<'_>> {
+    fn fence(
+        &self,
+        attachment: &SandboxAttachment,
+        recover: bool,
+        extra_protected: &[&Path],
+    ) -> Result<PinnedGitLayout<'_>> {
         let c = &self.config;
         let snapshot = attachment.snapshot();
         if snapshot.canonical_ref != c.sandbox
@@ -186,7 +212,8 @@ impl Approval {
         if existing.next().is_some() {
             return Err(Error::Denied("attachment approval omits a retained source"));
         }
-        let protected = [c.store_directory.as_path(), self.directory.as_path()];
+        let mut protected = vec![c.store_directory.as_path(), self.directory.as_path()];
+        protected.extend_from_slice(extra_protected);
         let mut fence = pin_named_layout(
             &self.lease,
             &c.destination_root,
@@ -259,66 +286,86 @@ fn materialize(
     replace: bool,
     mode: MaterializationMode,
 ) -> Result<SandboxSnapshot> {
-    // Unlike standalone creation, the exact anchor and original CAS
-    // revision are semantic request inputs. Read the approval before
-    // replay, but never inspect a physical layout or driver on replay.
-    let approval = Approval::open(store, actor, sandbox, path, replace)?;
-    let c = &approval.config;
-    let replay = if replace {
-        store.sandbox_replay_replacement(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
-    } else {
-        store.sandbox_replay_attachment(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
-    };
-    let recover = mode != MaterializationMode::Fresh;
-    match replay {
-        Ok(Some(result)) => return Ok(result),
-        Ok(None) if recover => {
-            return Err(Error::Denied(
-                "original prepared materialization unavailable",
-            ))
+    Approval::open(store, actor, sandbox, path, replace)?.materialize(
+        store,
+        actor,
+        request_id,
+        mode,
+        &[],
+    )
+}
+
+impl Approval {
+    pub(crate) fn materialize(
+        &self,
+        store: &SessionStore,
+        actor: &PrincipalId,
+        request_id: &str,
+        mode: MaterializationMode,
+        extra_protected: &[&Path],
+    ) -> Result<SandboxSnapshot> {
+        // Unlike standalone creation, the exact anchor and original CAS
+        // revision are semantic request inputs. Read the approval before
+        // replay, but never inspect a physical layout or driver on replay.
+        let c = &self.config;
+        let sandbox = c.sandbox.as_str();
+        let replace = c.replaced_repository.is_some();
+        let replay = if replace {
+            store.sandbox_replay_replacement(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
+        } else {
+            store.sandbox_replay_attachment(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
+        };
+        let recover = mode != MaterializationMode::Fresh;
+        match replay {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) if recover => {
+                return Err(Error::Denied(
+                    "original prepared materialization unavailable",
+                ))
+            }
+            Ok(None) => (),
+            Err(Error::Conflict(_)) if recover => (),
+            Err(error) => return Err(error),
         }
-        Ok(None) => (),
-        Err(Error::Conflict(_)) if recover => (),
-        Err(error) => return Err(error),
-    }
-    if mode == MaterializationMode::Continue && (!replace || !c.allow_continuation) {
-        return Err(Error::Denied(
-            "replacement continuation requires explicit host approval",
-        ));
-    }
-    let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
-    let host = GitCheckpointRestoreHost::new(store, &handle);
-    match mode {
-        MaterializationMode::Recover => host.resume_sandbox_attachment_exact(
-            actor,
-            sandbox,
-            request_id,
-            approval.request(),
-            |attachment, _| approval.fence(attachment, true),
-        ),
-        MaterializationMode::Continue => host.continue_sandbox_replacement_exact(
-            actor,
-            sandbox,
-            request_id,
-            approval.request(),
-            |attachment, _| approval.fence(attachment, true),
-        ),
-        MaterializationMode::Fresh if replace => host.replace_sandbox_source(
-            actor,
-            sandbox,
-            c.sandbox_rev,
-            request_id,
-            c.anchor.clone(),
-            |attachment| approval.fence(attachment, false),
-        ),
-        MaterializationMode::Fresh => host.attach_sandbox_source(
-            actor,
-            sandbox,
-            c.sandbox_rev,
-            request_id,
-            c.anchor.clone(),
-            |attachment| approval.fence(attachment, false),
-        ),
+        if mode == MaterializationMode::Continue && (!replace || !c.allow_continuation) {
+            return Err(Error::Denied(
+                "replacement continuation requires explicit host approval",
+            ));
+        }
+        let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
+        let host = GitCheckpointRestoreHost::new(store, &handle);
+        match mode {
+            MaterializationMode::Recover => host.resume_sandbox_attachment_exact(
+                actor,
+                sandbox,
+                request_id,
+                self.request(),
+                |attachment, _| self.fence(attachment, true, extra_protected),
+            ),
+            MaterializationMode::Continue => host.continue_sandbox_replacement_exact(
+                actor,
+                sandbox,
+                request_id,
+                self.request(),
+                |attachment, _| self.fence(attachment, true, extra_protected),
+            ),
+            MaterializationMode::Fresh if replace => host.replace_sandbox_source(
+                actor,
+                sandbox,
+                c.sandbox_rev,
+                request_id,
+                c.anchor.clone(),
+                |attachment| self.fence(attachment, false, extra_protected),
+            ),
+            MaterializationMode::Fresh => host.attach_sandbox_source(
+                actor,
+                sandbox,
+                c.sandbox_rev,
+                request_id,
+                c.anchor.clone(),
+                |attachment| self.fence(attachment, false, extra_protected),
+            ),
+        }
     }
 }
 
@@ -360,7 +407,7 @@ fn abandon_in(
         sandbox,
         request_id,
         approval.request(),
-        |attachment, _| approval.fence(attachment, true),
+        |attachment, _| approval.fence(attachment, true, &[]),
     )
 }
 
@@ -372,12 +419,33 @@ pub(crate) fn run_replace(args: ReplaceArgs) -> Result<u8> {
     run_in(args.common, true, args.continue_effect)
 }
 
+pub(crate) fn rpc_invocation_id(request_id: &str) -> Result<String> {
+    if request_id.is_empty()
+        || request_id.len() > 64
+        || !request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(Error::Protocol("invalid original RPC request ID"));
+    }
+    Ok(format!("rpc:stdio:sandbox-sources-set:{request_id}"))
+}
+
 fn run_in(args: Args, replacing: bool, continuing: bool) -> Result<u8> {
+    if args.rpc_invocation && !(args.recover || args.abandon || continuing) {
+        return Err(Error::Denied(
+            "RPC invocation requires explicit recovery mode",
+        ));
+    }
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
     let operation = if replacing { "replace" } else { "attach" };
-    let id = format!("cli:sandbox-source-{operation}:{}", args.request_id);
+    let id = if args.rpc_invocation {
+        rpc_invocation_id(&args.request_id)?
+    } else {
+        format!("cli:sandbox-source-{operation}:{}", args.request_id)
+    };
     if args.abandon {
         if replacing {
             abandon_replacement(&store, &actor, &args.approval, &args.sandbox, &id)?;

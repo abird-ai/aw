@@ -178,6 +178,14 @@ pub trait Driver {
     fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
         None
     }
+    /// Explicit host source mutation, serialized after request identity
+    /// gates. Never dispatched on the concurrent input reader.
+    fn can_sandbox_sources_set(&self) -> bool {
+        false
+    }
+    fn sandbox_sources_set(&self, _request_id: &str, _params: Value) -> Result<Value> {
+        Err(Error::Denied("Sandbox source mutation unavailable"))
+    }
     fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
         None
     }
@@ -430,6 +438,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "sandbox_list" => Some(&["project", "limit", "cursor"]),
         "sandbox_get" => Some(&["ref", "include"]),
         "sandbox_sources_list" => Some(&["ref"]),
+        "sandbox_sources_set" => Some(&["ref", "name", "binding", "rev"]),
         "checkpoint_list" => Some(&["ref", "limit", "cursor"]),
         "checkpoint_get" => Some(&["id", "include"]),
         "checkpoint_create" => Some(&["ref", "sources", "note"]),
@@ -774,6 +783,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "sandbox_close":driver.sandbox_port().is_some(),
     });
     capabilities["sandbox_sources_list"] = json!(driver.sandbox_port().is_some());
+    capabilities["sandbox_sources_set"] = json!(driver.can_sandbox_sources_set());
     let checkpoint_read = driver.checkpoint_read_port().is_some();
     capabilities["checkpoint_list"] = json!(checkpoint_read);
     capabilities["checkpoint_get"] = json!(checkpoint_read);
@@ -868,6 +878,12 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
         match request.method.as_str() {
             // This constructor is serialized after the connection's request-ID
             // gate, not dispatched speculatively by the live input reader.
+            "sandbox_sources_set" if driver.can_sandbox_sources_set() => {
+                match driver.sandbox_sources_set(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
             "checkpoint_create" if checkpoint_create.is_some() => {
                 let port = checkpoint_create.as_ref().expect("enabled checkpoint port");
                 match port.create(id, request.params) {

@@ -19,7 +19,96 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: exact offline Git source release
+## Latest local implementation delta — 2026-11-26: authenticated Sandbox source setter
+
+Parent: `6cdfd88d9fc65792abc4f6216d0016ab34b7bc60` (source
+release), signature verified. Original Agent/Turn journal and resource
+CLI owners remain occupied. Independent production host surface,
+L5 only. No source-bearing runtime activation.
+
+- Complete the narrow Git-backed unused-Sandbox portion of sealed
+  SPEC §25.4 `sandbox.sources.set` through the existing authenticated
+  local stdio transport (`sandbox_sources_set`). Explicit workspace-
+  feature startup `--agent-sandbox-source-approval <file>` requires
+  `--agent-actor-owner` and the existing exact local SQLite Session,
+  tools-off/no MCP/subagents/extensions guard. Default disabled.
+  Real Host verifies original Actor/Agent and writer epoch at actual
+  dispatch; the original Store checks current Project authority and
+  quiescent/unused isolated Sandbox. Dispatch serialized **after**
+  transport request-ID/budget/parameter gates, not speculative
+  concurrent input reader execution. Hello advertises only the
+  explicitly enabled setter; no new model tool or resource owner.
+- Exact wire params `{ref,name,binding,rev}`. Explicit null is named
+  removal; omission refuses. Non-null
+  `binding:{source:{driver:DriverKey,source_ref},checkpoint:"required",
+  access:"ro"|"rw"}` is only the opaque typed source identity and
+  requested maximum policy. Nested and top-level unknown fields
+  refuse; no version, path, retention locator, configuration selector,
+  destination Project, physical target, attach/replace override or
+  recovery/continuation mode from RPC. Independent host selects
+  exact incoming retained version and attach/replace mode; match
+  every logical field and original positive revision. No implied
+  SourceRef disclosure or mount/runtime grant.
+- Reuse the existing private v1 attachment/replacement or named-release
+  approval file, no new policy schema. Read exactly one strict typed
+  variant under its existing bounded exclusive advisory file lease
+  at activation and anew per request; retain actual lease through
+  the original Host/Store effect, publication/Unknown or terminal
+  replay. Current approved file may be renewed by trusted cooperating
+  host writer; invalid/missing/busy or mismatching policy fails closed.
+  Original canonical current Project and Store scope/manager matched.
+  Approval, destination and origins must not overlap bound Agent
+  execution paths, in addition to existing Store/approval exclusions.
+  Actual driver/pins verify original source/materialization identities
+  and whole layout, with extra bound layout exclusions. Host still
+  independently excludes other users, physical aliases/mounts,
+  ancestor/external writers and backing/retention/private-state users
+  through operation and interruption; no new kernel containment proof.
+  Closed-retention approval is not a setter approval. Same shared
+  loaded approvals and existing materialize/release owners used by
+  offline commands; do not duplicate physical implementation.
+- Both incoming effect modes share original semantic receipt namespace
+  `rpc:stdio:sandbox-sources-set:<request-id>`. Exact existing fingerprint
+  includes Sandbox, revision, complete host-selected anchor and attach/
+  replace mode; replay cannot substitute a new version, mode or target.
+  Only fresh or exact Applied replay in RPC; unresolved or Rejected
+  refuses. Existing offline `sandbox-source-attach` / `sandbox-source-replace`
+  accept explicit `--agent-rpc-invocation` only with recover, abandon or
+  replacement continuation, using the original raw RPC ID and approval.
+  No replan or fresh effect under this namespace. Removal retains
+  original name/revision/descriptor release claim and immutable fact,
+  including safe exact reconciliation and settled replay; no extra
+  request ledger. Current redacted bounded Sandbox snapshot response
+  only. Original Agent/admission/queue, grant and history unchanged.
+  No schema or driver recovery format change.
+
+Validation: real stdio integration 3/3 (including approved attach,
+replacement, final release, wrong/nested/duplicate-ID refusal, exact
+terminal replay and original-ID interrupted attachment recovery after
+Store reopen); existing offline Git lifecycle 1/1; headless protocol
+8/8. All-feature/all-target strict CLI Clippy, durable library check,
+minimal all-target check (two pre-existing dead-code warnings), full CLI
+build, actual approval/Actor dependency and explicit recovery-only flag
+smoke, scoped fmt/diff passed. Initial fixture retained an external
+shared tool-router reference and prevented exclusive Store reopen; use
+fresh tool options per test host, then restart passed. Strict Clippy
+required boxing both cold approval variants; final grouped stdio run
+passed. Unchanged Store/Host suites and pinned Nix/native-platform
+qualification not rerun; existing durable-only binary blocker remains.
+No physical containment promotion.
+
+Next: exact live source-aware Actor/Turn admission through original
+journal owners when available. Otherwise narrow actual host
+`sandbox.create` production consumer or original independently
+authorized native artifact/Process recovery proof acquisition.
+The narrow Git attachment/replacement/release setter and offline
+lifecycle are now actual host consumers; do not duplicate them or
+enable recovery from untrusted request-selected paths. General mixed/
+unversioned baselines, linked-checkout policy, bound-Agent structural
+mutation, source-bearing Actor/Process admission and remaining
+checkpoint/Sandbox host surfaces remain held.
+
+## Previous local implementation delta — 2026-11-26: exact offline Git source release
 
 Parent: `0110a2c09d5a4fcaaa1c8c2bc8ded4acd8baf0be` (source
 replacement), signature verified. Original Agent/Turn journal and resource
