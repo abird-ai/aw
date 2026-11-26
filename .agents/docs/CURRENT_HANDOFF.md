@@ -19,7 +19,110 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: reconcile committed queue revision and local history projection
+## Latest local implementation delta — 2026-11-26: production configured native source-root stdio
+
+Parent `1215c2e3c7c9e63c475a271099f266f34714c59a` (queue/history
+correction); published AW main remains `7b92686`. L5, clean at entry.
+Original source-aware Actor, journal and Git native route from e34da44
+now consumed by the actual CLI, not a second owner or scheduler.
+
+- Workspace-feature startup:
+  ```text
+  aw rpc --agent-stdio --agent-actor-owner --state-dir <existing-private-Store>
+    --session-id <exact-ID> --session-branch <ID-or-name>
+    --agent-native-source-root <existing-private-approval-directory>
+    --agent-native-source-grant-rev <expected-grant-revision>
+    [--agent-native-source-open-rev <expected-Agent-revision>]
+    --tools-mode read-only|rw --tools-allow <explicit-native-tool-names>
+  ```
+  The explicit grant CAS is required (0 only for first grant); new
+  process authority is fresh, not reconstructed from persisted grant.
+  Held Agent additionally needs explicit matching Manage-authorized open
+  revision. Already-open intent alone gives no live authority; open
+  flag optional there, still CAS if specified. Startup does not create
+  a Store/Agent/Session, infer a grant, resume an ambient root, or
+  dispatch an Input. No context/layout transfer, implicit model setup
+  wizard, shared provider, routing, project-resource/skill/system
+  overrides, subagents, MCP/extensions, shell, Remove, Graph or Process
+  route. No other optional checkpoint/Sandbox/Vault admin capability in
+  this initial narrow execution mode. Exact saved local Session ID
+  required; branch selector resolves to the exact canonical Agent
+  pinned by the independent config. Other RPC modes remain unchanged
+  except raw prompt now truthfully disabled at the transport gate for
+  all bound Actor owners, including templates.
+- `native_source_root::Selection::activate` selects the existing
+  Session/Agent/active writer through the authenticated local OS owner.
+  Checks exact saved cwd/tool root/system/provider destination (no
+  transfer), explicit native tool mode/unique allowlist, original
+  open/held CAS, current grant revision, read-only original history/
+  reconciliation state, private canonical state/approval dirs and
+  physical/lexical separation. Reuse the existing strict v1
+  `git-native.json` approval format and
+  `GitNativeSourceResolver::provision_configured_approval_with`;
+  callback checks the exact selected Agent, Sandbox, full source set,
+  immutable layout, actual same stable owner identity (configured
+  actor is local authenticated principal or original Session owner),
+  writer and access ceiling before Git checkout/artifact probes.
+  Registered actual Git and native filesystem drivers only. No
+  persisted policy minting or new source schema. Host independently
+  excludes other writers/users, aliases, mounts, backing/private state
+  access through execution and interruption, as with existing native
+  approval; no kernel containment claim.
+- Existing configured provider selection (including separately
+  authorized local/OAuth/server-account provider selection), current
+  live host decision, explicit grant CAS, `build_execution`, optional
+  explicit Agent-open CAS, `activate_with_source`, original history/
+  SessionHandle and `Service::attach_for_agent_with_source`. Existing
+  Host receives that actual Agent and Actor owner; bypass only ambient
+  tool construction and duplicate tool-free RPC Runtime attachment.
+  Same `aw::headless::serve_stdio`, original encrypted queue, step,
+  query, inspect/disposition, cancellation, state/messages operations.
+  No event router/automatic wake, new resource admin ports or model
+  tools registered. RPC cannot choose policy paths, versions, provider,
+  source set, Actor, grant or recovery selectors. Explicit grant and
+  Agent open are original separate durable mutations: a subsequent
+  startup failure can leave a factual grant/open intent, but no live
+  policy or executable route survives failed startup/process exit.
+  Do not silently roll back these facts or retry effects. Observe
+  current revisions using original Store/SDK owners before startup.
+- Existing native approval is a live in-process decision from a
+  protected configuration snapshot. Editing/removing that file alone
+  does not withdraw an already-live decision. Restart requires fresh
+  configuration including actual current Sandbox rev after writes and
+  a fresh explicit grant CAS. No new live withdrawal endpoint or
+  incomplete-Run proof; separately qualify next. Normal source-unaware
+  activate still denies. Original native tool fences and factual
+  settlement unchanged.
+
+Validation (L5 Rust 1.95.0, final source): actual executable
+native-source RPC 1/1 (7.35s) with private Git/SQLite fixture and
+loopback SSE provider, no real credentials. Ordinary resume, missing
+grant CAS, held/stale open, shell selection, unrelated admin flag,
+wrong physical root identity refuse before first grant/model; valid
+startup runs real read/write and leaves second Input queued; stale
+Sandbox/grant approval refuses; fresh approval/regrant on restart
+settles original queued Input once, then idle. Exact two native tools
+at provider, raw prompt disabled, no extra model dispatch, unchanged
+Git HEAD/index/original tracked content; durable grant revisions 1/2.
+Headless 8/8, prior stdio integration 3/3, Agent lifecycle 3/3 passed.
+Strict all-feature/all-target CLI Clippy, durable-only/minimal
+all-target checks (existing dead-code warnings), full all-feature
+executable build (47.08s incremental), actual version/help and
+Actor-owner required flag smoke, scoped rustfmt/diff passed.
+Initial routing-option type-check correction was completed before
+final validation (role/lineage are defaulted strings, not optional
+route selectors). No full workspace test-suite, pinned Nix or
+native-platform qualification repeated.
+
+Next: explicit live withdrawal/stop and original incomplete-source
+Turn recovery, including independent physical native artifact proof.
+Do not promote broader source-bearing Process/Job/Graph/extension
+dispatch or general shared/participant/forked source execution.
+Legacy participant Agent ACL/access_generation cutover remains a
+separate qualification item. Store v60, Git recovery v4 unchanged.
+Frozen dotlink physical Sandbox untouched.
+
+## Previous local implementation delta — 2026-11-26: reconcile committed queue revision and local history projection
 
 Parent `e34da446d08157a87cac72a65175511fb34c5905` (live native
 source Actor/Turn admission); published AW main remains `7b92686`.

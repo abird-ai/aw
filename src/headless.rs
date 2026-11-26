@@ -752,9 +752,9 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let mut out = Emitter::new(writer).diagnostics(diagnostics);
     let initial = driver.state();
     let mut capabilities = json!({
-            "prompt":true,"abort":true,"get_state":true,
+            "prompt":!driver.actor_available(),"abort":true,"get_state":true,
             "get_messages":true,"available_models":true,
-            "prompt_template":driver.can_template(),"compact":driver.can_compact(),
+            "prompt_template":!driver.actor_available() && driver.can_template(),"compact":driver.can_compact(),
             "new_session":driver.can_sessions(),"open_session":driver.can_sessions(),
             "set_model":"configured_models_only; no durable Session rebind",
             "set_effort":"host/provider-validated; no durable Session rebind",
@@ -1010,7 +1010,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
                     out.emit("response",Some(id),bounded_history(driver.turns(),limit as usize))?;
                 }
             }
-            "prompt"|"prompt_template" => {
+            "prompt"|"prompt_template" if !driver.actor_available() => {
                 let result=(||->Result<String>{
                     let text=param_text(&request.params,"text",128*1024)?.to_owned();
                     if request.method=="prompt_template" {
@@ -1599,6 +1599,7 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"grant","method":"actor_enqueue","params":{"request_id":"evil","message_id":3,"text":"never accepted","grant":"tool:process"}}"#,
             r#"{"v":1,"id":"read","method":"actor_notice_read","params":{"request_id":"notice_1"}}"#,
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
+            r#"{"v":1,"id":"raw-prompt","method":"prompt","params":{"text":"not an Actor Input"}}"#,
             r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
             r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
             r#"{"v":1,"id":"agents","method":"agent_list","params":{"limit":8}}"#,
@@ -1656,6 +1657,10 @@ mod aw_p6_9c_protocol_tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(rows[0]["data"]["capabilities"]["actor_query"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["prompt"], false);
+        assert!(rows.iter().any(|row| row["id"] == "raw-prompt"
+            && row["type"] == "error"
+            && row["data"]["code"] == "unsupported_method"));
         assert_eq!(rows[0]["data"]["capabilities"]["agent_create"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_get"], true);

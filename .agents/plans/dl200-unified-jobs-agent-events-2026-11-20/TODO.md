@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: queue revision and local HistoryBase projection correction (this checkpoint; local parent `e34da446d08157a87cac72a65175511fb34c5905`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: production configured native source-root stdio (this checkpoint; local parent `1215c2e3c7c9e63c475a271099f266f34714c59a`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1612,10 +1612,24 @@ Current implementation: queue revision and local HistoryBase projection correcti
       Clippy, durable/minimal targets, full all-feature executable and
       actual version smoke, scoped fmt/diff passed. Prior timeout resolved.
       Historical binary reproduction is not an exact parent rebuild.
-      **Next:** production explicit configured source-root CLI/stdio
-      activation and live withdrawal/restart reconciliation; separately
-      qualify legacy participant Agent ACL/access_generation dispatch.
-      No generic
+      **Production native source-root stdio landed:** exact saved local
+      Agent, existing private v1 Git approval directory, explicit grant
+      CAS and separate held-open CAS, original current provider and
+      native-only tool selection. Reuse the actual qualified source
+      execution scope/SessionHandle/Actor owner and stdio transport;
+      no ambient tool builder or duplicate Runtime, no additional
+      resource mutations or automatic event/wake dispatch. Raw prompt
+      capability and dispatch disabled at the original Actor transport
+      gate. Real executable/private Git/SQLite/loopback provider test
+      qualifies read/write and queued continuation across fresh
+      approval/regrant at restart. Executable native root 1/1, headless 8/8, prior stdio 3/3,
+      Agent lifecycle 3/3; strict CLI Clippy, durable/minimal all
+      targets, full executable, actual version/help/required-flag
+      smoke and scoped fmt/diff passed.
+      **Next:** live withdrawal/stop and original incomplete source
+      Turn restart reconciliation, including independent recovery proof;
+      separately qualify legacy participant Agent ACL/access_generation
+      dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and

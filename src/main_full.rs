@@ -12,6 +12,8 @@ mod checkpoint_retention;
 mod device;
 #[cfg(feature = "workspace")]
 mod git_maintenance;
+#[cfg(feature = "workspace")]
+mod native_source_root;
 mod private_approval;
 mod resource_cli_args;
 mod resources_cli;
@@ -948,10 +950,25 @@ struct RpcCommandCliArgs {
     #[arg(long = "stdio")]
     rpc_stdio: bool,
     /// Opt in to owner-bound Actor query/queue operations for one existing
-    /// local SQLite Session. Requires --session-id ID and tools disabled;
-    /// never grants commands by a client-supplied ActorKey.
+    /// local SQLite Session. Requires --session-id ID and tools disabled
+    /// unless explicitly configured for native source execution. Never
+    /// grants commands by a client-supplied ActorKey.
     #[arg(long = "actor-owner", requires = "rpc_stdio")]
     rpc_actor_owner: bool,
+    /// Existing private git-native.json approval directory for this exact
+    /// local Agent. Explicit native tools only; no ambient root access.
+    #[cfg(feature = "workspace")]
+    #[arg(long = "native-source-root", requires_all = ["rpc_actor_owner", "rpc_native_source_grant_rev"], conflicts_with_all = ["rpc_checkpoint_create", "rpc_checkpoint_restore_root", "rpc_checkpoint_delete", "rpc_source_metadata_approval", "rpc_sandbox_source_approval", "rpc_signing_vault_root"])]
+    rpc_native_source_root: Option<PathBuf>,
+    /// Explicit expected Sandbox grant revision (0 = first grant).
+    #[cfg(feature = "workspace")]
+    #[arg(long = "native-source-grant-rev", requires = "rpc_native_source_root")]
+    rpc_native_source_grant_rev: Option<u64>,
+    /// Explicit current Agent revision to open held admission. Otherwise
+    /// startup requires an already-open Agent.
+    #[cfg(feature = "workspace")]
+    #[arg(long = "native-source-open-rev", requires = "rpc_native_source_root")]
+    rpc_native_source_open_rev: Option<u64>,
     /// Enable history-only checkpoint creation (Auto only for source-free
     /// capture) for the authenticated local Actor-owner RPC connection.
     #[arg(long = "checkpoint-create", requires = "rpc_actor_owner")]
@@ -1070,6 +1087,8 @@ pub(crate) struct RunArgs {
     output: aw::headless::Output,
     rpc_stdio: bool,
     rpc_actor_owner: bool,
+    #[cfg(feature = "workspace")]
+    rpc_native_source: Option<native_source_root::Selection>,
     rpc_checkpoint_create: bool,
     rpc_checkpoint_restore_root: Option<PathBuf>,
     rpc_checkpoint_delete: bool,
@@ -1211,6 +1230,8 @@ impl RunArgs {
             output: aw::headless::Output::Text,
             rpc_stdio: false,
             rpc_actor_owner: false,
+            #[cfg(feature = "workspace")]
+            rpc_native_source: None,
             rpc_checkpoint_create: false,
             rpc_checkpoint_restore_root: None,
             rpc_checkpoint_delete: false,
@@ -1660,6 +1681,16 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             );
             run.rpc_stdio = args.rpc_stdio;
             run.rpc_actor_owner = args.rpc_actor_owner || remote;
+            #[cfg(feature = "workspace")]
+            if let Some(root) = args.rpc_native_source_root {
+                run.rpc_native_source = Some(native_source_root::Selection {
+                    root,
+                    grant_rev: args.rpc_native_source_grant_rev.ok_or(Error::Denied(
+                        "native source startup requires an explicit grant revision",
+                    ))?,
+                    open_rev: args.rpc_native_source_open_rev,
+                });
+            }
             run.rpc_checkpoint_create = args.rpc_checkpoint_create;
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
@@ -1849,6 +1880,49 @@ fn run_agent_with_shell_containment(
         return Err(Error::Denied(
             "headless output supports only the local Agent execution owner",
         ));
+    }
+    #[cfg(feature = "workspace")]
+    if args.rpc_native_source.is_some() {
+        if !args.rpc_stdio
+            || !args.rpc_actor_owner
+            || args.no_state
+            || args.session.is_none()
+            || args.resume
+            || args.store_backend != resources_cli::SessionStoreBackendArg::Sqlite
+            || args.subagents
+            || args.subagent_tools != aw::ToolMode::Off
+            || !args.mcp.is_empty()
+            || !args.extensions.is_empty()
+            || args.directory.is_some()
+            || args.tool_root.is_some()
+            || args.allow_context_transfer
+            || args.rpc_checkpoint_create
+            || args.rpc_checkpoint_restore_root.is_some()
+            || args.rpc_checkpoint_delete
+            || args.rpc_source_metadata_approval.is_some()
+            || args.rpc_sandbox_source_approval.is_some()
+            || args.rpc_signing_vault_root.is_some()
+            || args.context_compact_now
+            || args.context_action.is_some()
+            || !args.instructions.is_empty()
+            || !args.skills.is_empty()
+            || args.system.is_some()
+            || args.resources.project.is_some()
+            || args.resources.trust_project.is_some()
+            || args.resources.revoke_project.is_some()
+            || args.resources.template.is_some()
+            || args.resources.theme.is_some()
+            || !args.resources.vars.is_empty()
+        {
+            return Err(Error::Denied("native source RPC requires one exact local SQLite Agent, its saved layout and only explicitly selected native tools"));
+        }
+        #[cfg(feature = "routing")]
+        if args.route.is_some() || args.route_revision.is_some() {
+            return Err(Error::Denied(
+                "native source RPC does not select another routing operation",
+            ));
+        }
+        native_source_root::require_native_tools(args.tools, &args.tool_allow)?;
     }
     let wants_workspace = args.open_workspace_ui || args.app_mode == AppModeArg::Workspace;
     if wants_workspace && args.tui_mode_override.is_some() {
@@ -2124,6 +2198,12 @@ fn run_agent_with_shell_containment(
                 .unwrap_or_else(sessions::default_directory)?,
         )
     };
+    #[cfg(feature = "workspace")]
+    if args.rpc_native_source.is_some() {
+        git_maintenance::require_existing_store(directory.as_deref().ok_or(Error::Denied(
+            "native source startup requires an existing Store",
+        ))?)?;
+    }
     #[cfg(feature = "jsonl")]
     let jsonl_store = if using_jsonl && !args.no_state {
         Some(sessions::jsonl_store(
@@ -2203,6 +2283,14 @@ fn run_agent_with_shell_containment(
     } else {
         None
     };
+    #[cfg(feature = "workspace")]
+    if args.rpc_native_source.is_some()
+        && saved.as_ref().map(|session| session.id.as_str()) != args.session.as_deref()
+    {
+        return Err(Error::Denied(
+            "native source startup requires the exact saved Session ID",
+        ));
+    }
     if let (Some(s), Some(selector)) = (&store, args.workspace.as_deref()) {
         let d = match args.domain.as_deref() {
             Some(v) => Some(s.domain(&actor, v)?.id),
@@ -2307,6 +2395,7 @@ fn run_agent_with_shell_containment(
     let loaded_skills = skills::load(&file_skills, &file_config.skills)?;
 
     let should_onboard = profile.model.is_none()
+        && !args.rpc_stdio
         && !wants_host
         && !args.print
         && args.prompt.is_empty()
@@ -2518,6 +2607,8 @@ fn run_agent_with_shell_containment(
         None
     };
     let mut persistent = None;
+    #[cfg(feature = "workspace")]
+    let mut native_actor = None;
     if let Some(s) = store.take() {
         // Local single-user web is a configuration/control surface even before
         // inference exists. Do not manufacture a durable binding with a fake
@@ -2535,14 +2626,39 @@ fn run_agent_with_shell_containment(
                 return Ok(0);
             }
             if let Some(info) = saved.as_ref() {
-                persistent = Some(PersistentSession::open(
-                    s,
-                    actor.clone(),
-                    binding,
-                    &info.id,
-                    &args.branch,
-                    args.allow_context_transfer,
-                )?);
+                #[cfg(feature = "workspace")]
+                let s = if let Some(selection) = args.rpc_native_source.as_ref() {
+                    let activated = selection.activate(
+                        s,
+                        native_source_root::Activation {
+                            manager: &actor,
+                            session: info,
+                            branch: &args.branch,
+                            binding: binding.clone(),
+                            settings: &settings,
+                            tools: &tool_options,
+                            account: args.account.as_deref(),
+                            pre_dispatch_retries: args.pre_dispatch_retries,
+                        },
+                    )?;
+                    native_actor = Some((activated.agent, activated.owner));
+                    persistent = Some(activated.persistent);
+                    None
+                } else {
+                    Some(s)
+                };
+                #[cfg(not(feature = "workspace"))]
+                let s = Some(s);
+                if let Some(s) = s {
+                    persistent = Some(PersistentSession::open(
+                        s,
+                        actor.clone(),
+                        binding,
+                        &info.id,
+                        &args.branch,
+                        args.allow_context_transfer,
+                    )?);
+                }
             }
         }
     }
@@ -3183,6 +3299,20 @@ fn run_agent_with_shell_containment(
         return Ok(0);
     }
     if args.rpc_stdio {
+        #[cfg(feature = "workspace")]
+        if let Some((agent, owner)) = native_actor {
+            // The real source-aware Actor is already attached. Do not
+            // configure ambient tools or allocate a second Runtime.
+            host.agent = Some(agent);
+            host.actor_owner = Some(owner);
+            return aw::headless::serve_stdio(
+                &mut host,
+                io::stdin(),
+                io::stdout(),
+                args.diagnostics_protocol,
+            )
+            .map(|()| 0);
+        }
         if args.rpc_actor_owner
             && (args.no_state
                 || args.session.is_none()
