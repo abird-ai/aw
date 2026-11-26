@@ -3852,6 +3852,84 @@ mod tests {
             .agent_finish_close(&actor, &restored.agent.canonical_ref)
             .unwrap();
         let closed = store.sandbox_close(&actor, sandbox, None).unwrap();
+
+        // A second genuinely managed (not merely passive) closed layout
+        // still owns its original release recipe. Simulate an ambiguous
+        // exact materialization identity in this isolated Store only.
+        // Neither owner may authorize physical cleanup of the collision.
+        let other_sandbox = versioned.agent.sandbox_ref.as_deref().unwrap();
+        let other_agent = store
+            .agent_execution_binding(&actor, &versioned.agent.canonical_ref)
+            .unwrap();
+        for input in store
+            .actor_queue_list(&actor, other_agent.session_id())
+            .unwrap()
+        {
+            store
+                .actor_queue_delete(
+                    &actor,
+                    other_agent.session_id(),
+                    &input.request.request_id,
+                    input.request.writer_epoch,
+                )
+                .unwrap();
+        }
+        store
+            .agent_request_close(&actor, &versioned.agent.canonical_ref, None)
+            .unwrap();
+        store
+            .agent_finish_close(&actor, &versioned.agent.canonical_ref)
+            .unwrap();
+        store.sandbox_close(&actor, other_sandbox, None).unwrap();
+        let original_other = {
+            let c = Connection::open(&database).unwrap();
+            let binding = |sandbox: &str| -> (String, String, String) {
+                c.query_row("SELECT driver_key,source_ref,materialization
+                    FROM sandbox_source_bindings_current WHERE sandbox_id=?1 AND source_name='code'",
+                    [sandbox], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+            };
+            let original = binding(sandbox);
+            let other = binding(other_sandbox);
+            assert_eq!((&original.0, &original.1), (&other.0, &other.1));
+            assert_ne!(original.2, other.2);
+            assert_eq!(
+                c.execute(
+                    "UPDATE sandbox_source_bindings_current SET materialization=?1
+                WHERE sandbox_id=?2 AND source_name='code'",
+                    (&original.2, other_sandbox)
+                )
+                .unwrap(),
+                1
+            );
+            other.2
+        };
+        for candidate in [sandbox, other_sandbox] {
+            assert!(matches!(
+                host.reconcile_closed_sandbox::<Fence<'_>>(&actor, candidate, |_, _, _| {
+                    panic!("ambiguous closed managed alias reached physical approval")
+                }),
+                Err(Error::Conflict(
+                    "Sandbox materialization is still required by another Sandbox"
+                ))
+            ));
+        }
+        assert!(
+            destination.join("code/tracked").exists()
+                && baseline_root.join("code/tracked").exists()
+        );
+        // Restore the exact fixture field; no release or cleanup occurred.
+        assert_eq!(
+            Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "UPDATE sandbox_source_bindings_current SET materialization=?1
+             WHERE sandbox_id=?2 AND source_name='code'",
+                    (&original_other, other_sandbox)
+                )
+                .unwrap(),
+            1
+        );
+
         store
             .checkpoint_delete(&actor, &request.checkpoint)
             .unwrap();

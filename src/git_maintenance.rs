@@ -76,8 +76,20 @@ pub(crate) fn pin_private_checkout(
     }
     canonical_private_directory(root)?;
     let pin = DirectoryIdentity::open(root)?;
-    if pin.identity()? != location.repository_identity {
+    let identity = pin.identity()?;
+    if identity != location.repository_identity {
         return Err(Error::Conflict("approved Git checkout changed"));
+    }
+    // The protected layout may have been saved under a different spelling.
+    // Compare canonical overlap and exact directory identity as well as
+    // the cheap lexical precheck. The host still excludes other aliases.
+    for path in protected {
+        let path = path.canonicalize()?;
+        if overlaps(root, &path) || DirectoryIdentity::open(&path)?.identity()? == identity {
+            return Err(Error::Denied(
+                "approved checkout aliases protected host state",
+            ));
+        }
     }
     let admin = root.join(".git");
     let objects = admin.join("objects");

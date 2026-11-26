@@ -90,18 +90,19 @@ fn cleanup_inputs_in(
     store: &SessionStore,
     actor: &PrincipalId,
     checkpoint: &str,
-) -> Result<Option<SourceSet>> {
+) -> Result<Option<(SourceSet, crate::workspace_writer::WorkspaceWriterInfo)>> {
     let row = require_manager(c, actor, checkpoint)?;
     let Some(set) = retained_in(c, &row)? else {
         return Ok(None);
     };
+    let writer = crate::workspace_writer::require_workspace_writer_for_session(c, &row.session)?;
     require_no_restore(c, store, checkpoint)?;
     require_unshared_in(c, checkpoint)?;
     let registry = store.inner.source_drivers.reader()?;
     for anchor in &set.anchors {
         registry.resolve(&anchor.pin()?)?;
     }
-    Ok(Some(set))
+    Ok(Some((set, writer)))
 }
 
 fn cleanup_id(checkpoint: &str) -> String {
@@ -395,26 +396,27 @@ impl SessionStore {
                 "retention cleanup requires the exclusive Store owner",
             ));
         }
-        let set = {
+        let (set, writer) = {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction())?;
-            let Some(set) = cleanup_inputs_in(&tx, self, actor, checkpoint)? else {
+            let Some(inputs) = cleanup_inputs_in(&tx, self, actor, checkpoint)? else {
                 return Ok(());
             };
             db(tx.commit())?;
-            set
+            inputs
         };
         let fence = authorize(&set)?;
         let prepare_id = cleanup_id(checkpoint);
         let barrier = {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            let Some(current) = cleanup_inputs_in(&tx, self, actor, checkpoint)? else {
+            let Some((current, current_writer)) = cleanup_inputs_in(&tx, self, actor, checkpoint)?
+            else {
                 return Ok(());
             };
-            if current != set {
+            if current != set || current_writer != writer {
                 return Err(Error::Conflict(
-                    "retained checkpoint anchors changed before cleanup",
+                    "retained checkpoint anchors or Workspace writer changed before cleanup",
                 ));
             }
             let mutations = SourceMutationSet::from_anchors(&set.anchors)?;

@@ -26,7 +26,106 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: explicit source construction RPC dispatch
+## Latest local implementation delta — 2026-11-27: explicit physical retention reconciliation RPC
+
+Parent `435bd7d44430168c96f1216bdb79ede36e052569`; published AW main
+`0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only, scoped clean at entry. Store v60, product 0.15.0,
+Git recovery v4 and frozen release unchanged.
+
+- Separate explicit local Actor-owner maintenance capabilities:
+  `--agent-checkpoint-retention-approval` and
+  `--agent-sandbox-retention-approval`, selecting the existing private
+  version-1 exact Git administrative approvals. Serialized host methods
+  `checkpoint_retention_reconcile(id)` and
+  `sandbox_retention_reconcile(ref, rev)` use the original authenticated
+  connection and request-ID gate, independently advertised. No implicit
+  cleanup on checkpoint_delete or sandbox_close; no path, provider,
+  recovery or authority supplied by the RPC client. Native-source
+  execution mode excludes both new flags. Host verifies the bound
+  Actor, current writer and original Agent before dispatch; exact current
+  Project and configured resource/revision must match.
+- Reuse existing checkpoint/Sandbox retention owners and private
+  approval lease, exact original immutable anchor/Applied worktree
+  provenance, driver pinning, complete source mutation barrier and
+  physical proof through original settlement. The existing resource-
+  scoped cleanup identity (checkpoint ID or original closed Sandbox
+  revision) is the durable reconciliation identity, not a new generic
+  request ledger. Retired/closed resources are required; no lifecycle
+  promotion, new construction, arbitrary Git ref deletion, user edit
+  disposal or object GC. Checkpoint success returns only settled status;
+  Sandbox returns bounded redacted snapshot. Reconciliation of Unknown
+  custody retains the exact original set and can prove already-absent
+  retention, never treat a changed ref as permission to remove it.
+  Current configured approval still required on the maintenance surface;
+  terminal owner replay does not probe Git or rematerialize.
+- Checkpoint cleanup now observes the current local Workspace writer
+  before acquiring independent physical approval and compares the
+  writer observation and exact retained set again in the actual claim
+  transaction. Read-only or changed writer refuses before any effect
+  claim. Factual settlement retains its existing independent source
+  lease and dependency checks; later policy changes cannot erase
+  completed physical facts.
+- Whole-layout dependency gate distinguishes open aliases and retained
+  children (existing rules), closed aliases with original managed
+  construction/attachment provenance (still physical custody), and
+  passive closed aliases with no managed descriptor (not an independent
+  physical release owner). Conflicting managed aliases refuse before
+  external approval. Reuse exact existing provenance readers, not a
+  new dependency table or inferred path owner. Common ordinary-checkout
+  fence now checks canonical protected layout overlap and exact
+  directory identity as well as lexical overlap. RPC maintenance
+  excludes the current controller's root/cwd from backing and cleanup
+  destinations; independent host must still exclude all external
+  writers/mount aliases/non-cooperating users. No stronger containment
+  or linked-layout promotion.
+- Actual Store retirement regression: live shared anchors, partial
+  release and missing driver restart retained; read-only writer and
+  writer epoch/revision change during authorization refuse with no
+  cleanup hazard or changed anchors. Existing restore regression
+  preserves closed passive alias semantics. Actual Host Git fixture
+  uses two independent closed managed layouts and deliberately injects
+  ambiguous exact materialization metadata in the isolated Store;
+  both owners refuse before physical approval, exact fixture field
+  restored with both worktrees intact. Actual CLI Git lifecycle
+  qualifies both configured RPC maintenance paths, open/live and wrong
+  target/Project/revision refusals, controller layout and symlink alias
+  exclusions, original changed-ref/dirty-worktree hazards, reopen
+  recovery and idempotent release with other retention and history
+  preserved. Protocol tests verify separate enabled flags, duplicate
+  envelopes, arbitrary path and disabled capability refusal.
+
+Validation: 13 distinct selected tests passed: headless protocol (8), Store
+checkpoint retention and restore (2), Host Git restore/publication/recovery
+(1, 169.43s), CLI offline Git checkpoint lifecycle (1, final rerun
+93.89s), native-source executable RPC (1, final rerun 46.65s).
+Locked/offline strict all-feature/all-target Store/Host/CLI Clippy,
+durable/minimal checks, executable help and required-owner/native-source
+flag conflict checks, scoped rustfmt/diff passed. Initial fixture guard
+and retained Store clone errors were corrected; separate RetentionApprovals
+Clap group fixed the executable's duplicate flattened group error.
+Only isolated fixture retention was released. Prior five historical
+Store failures, full workspace, pinned Nix, and non-Linux gates not rerun.
+
+Scope: existing exact ordinary Git retained checkpoint refs and
+original managed named worktrees, independent operator-approved
+maintenance only. No generic live source retention, automatic GC,
+linked backing maintenance, raw/unmarked materialization disposal,
+broader provider administrative capabilities, or full-workspace
+qualification. The typed controller capability is a separately
+trusted host decision, not authority derived from the client's
+Agent ACL. RPC port qualification uses actual Git owner fixture and
+headless dispatch tests; full end-to-end subprocess exercising both
+new physical maintenance methods not yet qualified.
+
+Next: registry compatibility and durable/live dependency enumeration
+for safe source/Vault provider retirement and replacement, then
+remaining bound-Agent structural/participant paths and reviewed
+production Process/extension containment/dispatch. Keep source-bearing
+task/cross-Project restore, protected broader sharing/manifest transport
+and unsupported physical layouts explicitly pending. No push.
+
+## Previous local implementation delta — 2026-11-27: explicit source construction RPC dispatch
 
 Parent `92aefcbe47f71535ceaf14480665560447759116`; published AW main
 `0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen

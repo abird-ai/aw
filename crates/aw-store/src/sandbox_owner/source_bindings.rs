@@ -704,34 +704,38 @@ fn require_unshared_materializations_in(
         .working_directory
         .to_str()
         .ok_or(Error::Storage("invalid Sandbox working directory"))?;
-    // Exact known mutable materializations and dependent open layouts.
-    // The source itself may be shared by isolated checkouts: never reclaim
-    // shared provider/object backing merely because one checkout closes.
-    let shared: bool = db(c.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM sandbox_source_bindings_current owned
+    // Open aliases remain live dependencies; closed aliases with
+    // managed provenance still hold physical custody. A closed passive
+    // binding (no owned descriptor) is not itself a second release owner.
+    let mut query = db(c.prepare_cached(
+        "SELECT s.sandbox_id,s.lifecycle FROM (
+             SELECT other.sandbox_id FROM sandbox_source_bindings_current owned
              JOIN sandbox_source_bindings_current other
                ON other.driver_key=owned.driver_key AND other.source_ref=owned.source_ref
               AND other.materialization=owned.materialization
-             JOIN sandboxes_current s ON s.sandbox_id=other.sandbox_id
-             WHERE owned.sandbox_id=?1 AND other.sandbox_id<>?1 AND s.lifecycle='open'
-         ) OR EXISTS(
-             SELECT 1 FROM sandboxes_current s
-             WHERE s.sandbox_id<>?1 AND s.lifecycle='open' AND (
-                 s.parent_sandbox_id=?1 OR (
-                     (s.tool_root IN (?2,?3) OR s.working_directory IN (?2,?3))
+             WHERE owned.sandbox_id=?1 AND other.sandbox_id<>?1
+             UNION
+             SELECT s.sandbox_id FROM sandboxes_current s
+             WHERE s.sandbox_id<>?1 AND (
+                 (s.lifecycle='open' AND s.parent_sandbox_id=?1)
+                 OR ((s.tool_root IN (?2,?3) OR s.working_directory IN (?2,?3))
                      AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
-                                WHERE b.sandbox_id=s.sandbox_id)
-                 )
+                                WHERE b.sandbox_id=s.sandbox_id))
              )
-         )",
-        params![snapshot.canonical_ref, root, cwd],
-        |row| row.get(0),
+         ) aliases JOIN sandboxes_current s ON s.sandbox_id=aliases.sandbox_id",
     ))?;
-    if shared {
-        return Err(Error::Conflict(
-            "Sandbox materialization is still required by an open Sandbox",
-        ));
+    let mut rows = db(query.query(params![snapshot.canonical_ref, root, cwd]))?;
+    while let Some(row) = db(rows.next())? {
+        let other: String = db(row.get(0))?;
+        let lifecycle: String = db(row.get(1))?;
+        if lifecycle != "closed"
+            || crate::construction_receipt::original_materializations_in(c, &other)?.is_some()
+            || attachment::has_attachment_in(c, &other)?
+        {
+            return Err(Error::Conflict(
+                "Sandbox materialization is still required by another Sandbox",
+            ));
+        }
     }
     Ok(())
 }

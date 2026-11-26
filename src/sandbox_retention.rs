@@ -119,6 +119,14 @@ impl Approval {
     }
 
     pub(crate) fn reconcile(&self, store: &SessionStore) -> Result<SandboxSnapshot> {
+        self.reconcile_protected(store, &[])
+    }
+
+    pub(crate) fn reconcile_protected(
+        &self,
+        store: &SessionStore,
+        protected: &[&Path],
+    ) -> Result<SandboxSnapshot> {
         let c = &self.config;
         if c.source.is_some() {
             return Err(Error::Denied(
@@ -131,7 +139,7 @@ impl Approval {
             &c.manager,
             &c.sandbox,
             c.sandbox_rev,
-            |snapshot, bindings, prepared| self.fence(snapshot, bindings, prepared, &[]),
+            |snapshot, bindings, prepared| self.fence(snapshot, bindings, prepared, protected),
         )
     }
 

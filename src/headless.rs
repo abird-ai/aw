@@ -91,6 +91,23 @@ pub trait CheckpointReadPort: Send + Sync {
     fn apply(&self, method: &str, params: Value) -> Result<Value>;
 }
 
+/// Explicit physical maintenance target. Resource-scoped reconciliation,
+/// never part of logical close/delete or an ambient driver capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRetention {
+    Checkpoint,
+    Sandbox,
+}
+
+impl SourceRetention {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint_retention_reconcile",
+            Self::Sandbox => "sandbox_retention_reconcile",
+        }
+    }
+}
+
 /// Explicit host checkpoint-create capability. The authenticated envelope
 /// ID is the original constructor replay identity, not a model parameter.
 pub trait CheckpointCreatePort: Send + Sync {
@@ -193,6 +210,12 @@ pub trait Driver {
     }
     fn sandbox_create(&self, _request_id: &str, _params: Value) -> Result<Value> {
         Err(Error::Denied("Sandbox construction unavailable"))
+    }
+    fn can_reconcile_retention(&self, _target: SourceRetention) -> bool {
+        false
+    }
+    fn reconcile_retention(&self, _target: SourceRetention, _params: Value) -> Result<Value> {
+        Err(Error::Denied("physical source retention unavailable"))
     }
     /// Explicit host source mutation, serialized after request identity
     /// gates. Never dispatched on the concurrent input reader.
@@ -461,6 +484,8 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "checkpoint_create" => Some(&["ref", "sources", "note"]),
         "checkpoint_restore" => Some(&["id", "project", "title", "task", "access"]),
         "checkpoint_delete" => Some(&["id"]),
+        "checkpoint_retention_reconcile" => Some(&["id"]),
+        "sandbox_retention_reconcile" => Some(&["ref", "rev"]),
         "agent_vault_list" => Some(&["ref"]),
         "agent_vault_set" => Some(&["ref", "name", "binding", "rev"]),
         "signing_broker_sign" => Some(&["grant_rev", "message"]),
@@ -852,6 +877,9 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     });
     capabilities["sandbox_sources_list"] = json!(driver.sandbox_port().is_some());
     capabilities["sandbox_sources_set"] = json!(driver.can_sandbox_sources_set());
+    for target in [SourceRetention::Checkpoint, SourceRetention::Sandbox] {
+        capabilities[target.method()] = json!(driver.can_reconcile_retention(target));
+    }
     let checkpoint_read = driver.checkpoint_read_port().is_some();
     capabilities["checkpoint_list"] = json!(checkpoint_read);
     capabilities["checkpoint_get"] = json!(checkpoint_read);
@@ -943,6 +971,21 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             // gate, not dispatched speculatively by the live input reader.
             "sandbox_create" if driver.can_sandbox_create() => {
                 match driver.sandbox_create(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
+            "checkpoint_retention_reconcile" | "sandbox_retention_reconcile" => {
+                let target = if request.method == "checkpoint_retention_reconcile" {
+                    SourceRetention::Checkpoint
+                } else {
+                    SourceRetention::Sandbox
+                };
+                if !driver.can_reconcile_retention(target) {
+                    out.emit("error", Some(id), json!({"code":"unsupported_method","status":"rejected"}))?;
+                    continue;
+                }
+                match driver.reconcile_retention(target, request.params) {
                     Ok(value) => out.emit("response", Some(id), value)?,
                     Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
                 }
@@ -1606,6 +1649,19 @@ mod aw_p6_9c_protocol_tests {
                 .push((format!("sandbox_create:{request_id}"), params));
             Ok(json!({"ref":"/d:d/i:i/p:p/s:fixture"}))
         }
+        fn can_reconcile_retention(&self, target: SourceRetention) -> bool {
+            // Independent capabilities; only checkpoint cleanup is enabled.
+            target == SourceRetention::Checkpoint
+        }
+        fn reconcile_retention(&self, target: SourceRetention, params: Value) -> Result<Value> {
+            assert_eq!(target, SourceRetention::Checkpoint);
+            self.sandbox
+                .calls
+                .lock()
+                .unwrap()
+                .push((target.method().into(), params));
+            Ok(json!({"status":"settled"}))
+        }
         fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
             Some(self.sandbox.clone())
         }
@@ -1706,6 +1762,10 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"checkpoint-restore","method":"checkpoint_restore","params":{"id":"other"}}"#,
             r#"{"v":1,"id":"restore-root","method":"checkpoint_restore","params":{"id":"cp_fixture","root":"/private"}}"#,
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"cp-retention","method":"checkpoint_retention_reconcile","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"cp-retention","method":"checkpoint_retention_reconcile","params":{"id":"other"}}"#,
+            r#"{"v":1,"id":"retention-raw","method":"checkpoint_retention_reconcile","params":{"id":"cp_fixture","path":"/private"}}"#,
+            r#"{"v":1,"id":"sbx-retention","method":"sandbox_retention_reconcile","params":{"ref":"/d:d/i:i/p:p/s:0","rev":1}}"#,
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"other"}}"#,
             r#"{"v":1,"id":"delete-raw","method":"checkpoint_delete","params":{"id":"cp_fixture","cleanup":true}}"#,
             r#"{"v":1,"id":"vault-list","method":"agent_vault_list","params":{}}"#,
@@ -1765,6 +1825,14 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_create"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_restore"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_delete"], true);
+        assert_eq!(
+            rows[0]["data"]["capabilities"]["checkpoint_retention_reconcile"],
+            true
+        );
+        assert_eq!(
+            rows[0]["data"]["capabilities"]["sandbox_retention_reconcile"],
+            false
+        );
         assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_set"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], true);
@@ -1812,12 +1880,25 @@ mod aw_p6_9c_protocol_tests {
                 "sandbox_create:sandbox-new",
                 "checkpoint_restore:checkpoint-restore",
                 "checkpoint_delete:cp-delete",
+                "checkpoint_retention_reconcile",
                 "agent_vault_list:vault-list",
                 "agent_vault_set:vault-set",
                 "checkpoint_create:cp-create"
             ]
         );
         assert_eq!(sandbox_calls[0].1["limit"], 8);
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "cp-retention" && r["data"]["status"] == "settled"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "cp-retention" && r["data"]["code"] == "duplicate_request_id"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "retention-raw" && r["data"]["code"] == "invalid_parameters"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "sbx-retention" && r["data"]["code"] == "unsupported_method"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "sandbox-new" && r["data"]["ref"] == "/d:d/i:i/p:p/s:fixture"));
@@ -1957,6 +2038,14 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(result[0]["data"]["capabilities"]["actor_query"], false);
         assert_eq!(result[0]["data"]["capabilities"]["agent_list"], false);
         assert_eq!(result[0]["data"]["capabilities"]["agent_access_set"], false);
+        assert_eq!(
+            result[0]["data"]["capabilities"]["checkpoint_retention_reconcile"],
+            false
+        );
+        assert_eq!(
+            result[0]["data"]["capabilities"]["sandbox_retention_reconcile"],
+            false
+        );
         for event in result.iter().skip(1) {
             assert_eq!(event["data"]["code"], "unsupported_method", "{event}");
         }

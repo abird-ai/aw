@@ -1203,6 +1203,46 @@ mod tests {
         store.checkpoint_delete(&actor, second).unwrap();
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
         let mutations = crate::SourceMutationSet::from_anchors(&cleanup_set.anchors).unwrap();
+        // This isolated Store fixture controls its Workspace writer.
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE workspace_writer_state SET state='read_only'", [])
+            .unwrap();
+        assert!(matches!(
+            store.checkpoint_reconcile_retired_sources_fenced::<()>(
+                &actor,
+                first,
+                |_| panic!("read-only writer reached physical approval"),
+                |_, _| panic!("read-only writer reached release"),
+            ),
+            Err(Error::Denied(_))
+        ));
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE workspace_writer_state SET state='active'", [])
+            .unwrap();
+        assert!(matches!(store.checkpoint_reconcile_retired_sources_fenced(
+            &actor, first,
+            |_| {
+                // Race a new writer epoch against the read-only approval
+                // phase, before the actual source custody claim.
+                store.connection()?.execute(
+                    "UPDATE workspace_writer_state SET writer_epoch=writer_epoch+1,revision=revision+1",
+                    [],
+                ).map_err(|_| Error::Storage("fixture writer change failed"))?;
+                Ok(())
+            },
+            |_, _| panic!("changed Workspace writer reached physical release"),
+        ), Err(Error::Conflict(_))));
+        assert_eq!(
+            sources_in(&store.connection().unwrap(), first, cleanup_set.coverage)
+                .unwrap()
+                .0,
+            cleanup_set
+        );
+        // Neither refusal left an Unknown cleanup or mutated retained rows.
         let held = store
             .acquire_source_mutation_barrier(&mutations, "other-retention")
             .unwrap();

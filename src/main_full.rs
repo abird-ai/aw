@@ -35,6 +35,8 @@ mod skill_package;
 #[cfg(feature = "workspace")]
 mod source_construction_rpc;
 mod source_metadata;
+#[cfg(feature = "workspace")]
+mod source_retention_rpc;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
 // Opt-in host-only Actor/child services. 9C gates authenticated stdio
@@ -982,7 +984,7 @@ struct RpcCommandCliArgs {
     /// Existing private git-native.json approval directory for this exact
     /// local Agent. Explicit native tools only; no ambient root access.
     #[cfg(feature = "workspace")]
-    #[arg(long = "native-source-root", requires_all = ["rpc_actor_owner", "rpc_native_source_grant_rev"], conflicts_with_all = ["rpc_checkpoint_create", "rpc_checkpoint_restore_root", "rpc_checkpoint_delete", "rpc_source_metadata_approval", "rpc_sandbox_source_approval", "rpc_signing_vault_root", "sandbox_create_approval", "sandbox_derive_approval", "checkpoint_capture_root", "checkpoint_restore_approval"])]
+    #[arg(long = "native-source-root", requires_all = ["rpc_actor_owner", "rpc_native_source_grant_rev"], conflicts_with_all = ["rpc_checkpoint_create", "rpc_checkpoint_restore_root", "rpc_checkpoint_delete", "rpc_source_metadata_approval", "rpc_sandbox_source_approval", "rpc_signing_vault_root", "sandbox_create_approval", "sandbox_derive_approval", "checkpoint_capture_root", "checkpoint_restore_approval", "checkpoint_retention_approval", "sandbox_retention_approval"])]
     rpc_native_source_root: Option<PathBuf>,
     /// Explicit expected Sandbox grant revision (0 = first grant).
     #[cfg(feature = "workspace")]
@@ -1019,6 +1021,9 @@ struct RpcCommandCliArgs {
     #[cfg(feature = "workspace")]
     #[command(flatten)]
     source_construction: source_construction_rpc::Approvals,
+    #[cfg(feature = "workspace")]
+    #[command(flatten)]
+    source_retention: source_retention_rpc::RetentionApprovals,
     /// Activate an existing private signing Vault and authorize binding
     /// management for this exact local Actor. Entry refs require explicit
     /// provider metadata approval. Host must independently
@@ -1124,6 +1129,8 @@ pub(crate) struct RunArgs {
     rpc_sandbox_source_approval: Option<PathBuf>,
     #[cfg(feature = "workspace")]
     source_construction: source_construction_rpc::Approvals,
+    #[cfg(feature = "workspace")]
+    source_retention: source_retention_rpc::RetentionApprovals,
     rpc_signing_vault_root: Option<PathBuf>,
     rpc_signing_broker_entry: Option<String>,
     #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1269,6 +1276,8 @@ impl RunArgs {
             rpc_sandbox_source_approval: None,
             #[cfg(feature = "workspace")]
             source_construction: Default::default(),
+            #[cfg(feature = "workspace")]
+            source_retention: Default::default(),
             rpc_signing_vault_root: None,
             rpc_signing_broker_entry: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1730,6 +1739,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             {
                 run.rpc_sandbox_source_approval = args.rpc_sandbox_source_approval;
                 run.source_construction = args.source_construction;
+                run.source_retention = args.source_retention;
             }
             run.rpc_signing_vault_root = args.rpc_signing_vault_root;
             run.rpc_signing_broker_entry = args.rpc_signing_broker_entry;
@@ -1942,6 +1952,7 @@ fn run_agent_with_shell_containment(
             || args.rpc_source_metadata_approval.is_some()
             || args.rpc_sandbox_source_approval.is_some()
             || !args.source_construction.is_empty()
+            || !args.source_retention.is_empty()
             || args.rpc_signing_vault_root.is_some()
             || args.context_compact_now
             || args.context_action.is_some()
@@ -3383,6 +3394,7 @@ fn run_agent_with_shell_containment(
             #[cfg(feature = "workspace")]
             {
                 host.source_construction = args.source_construction;
+                host.source_retention = args.source_retention;
             }
             if let Some(path) = args.rpc_source_metadata_approval {
                 host.attach_rpc_source_metadata(&path)?;
@@ -3750,6 +3762,8 @@ struct Host {
     sandbox_source_approval: Option<sandbox_source_rpc::ApprovalFile>,
     #[cfg(feature = "workspace")]
     source_construction: source_construction_rpc::Approvals,
+    #[cfg(feature = "workspace")]
+    source_retention: source_retention_rpc::RetentionApprovals,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -5531,6 +5545,8 @@ impl Host {
             sandbox_source_approval: None,
             #[cfg(feature = "workspace")]
             source_construction: Default::default(),
+            #[cfg(feature = "workspace")]
+            source_retention: Default::default(),
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -7279,6 +7295,40 @@ impl aw::headless::Driver for Host {
         ))?;
         self.source_construction
             .create_sandbox(state, request_id, params)
+    }
+
+    #[cfg(feature = "workspace")]
+    fn can_reconcile_retention(&self, target: aw::headless::SourceRetention) -> bool {
+        self.actor_owner.is_some() && self.source_retention.enabled(target)
+    }
+
+    #[cfg(feature = "workspace")]
+    fn reconcile_retention(
+        &self,
+        target: aw::headless::SourceRetention,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("retention requires the local Actor owner"))?;
+        owner.verify_rpc_state()?;
+        owner.verify_rpc_agent(
+            self.agent
+                .as_ref()
+                .ok_or(Error::Denied("original Agent unavailable"))?,
+        )?;
+        let state = self
+            .sandbox_owner
+            .as_ref()
+            .ok_or(Error::Denied("Project owner unavailable"))?;
+        let layout = &self
+            .agent_create_owner
+            .as_ref()
+            .ok_or(Error::Denied("original host layout unavailable"))?
+            .binding;
+        self.source_retention
+            .reconcile(target, state, layout, params)
     }
 
     #[cfg(feature = "workspace")]

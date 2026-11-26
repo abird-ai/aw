@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: explicit source construction RPC dispatch (this checkpoint; local parent `92aefcbe47f71535ceaf14480665560447759116`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: explicit physical retention reconciliation RPC (this checkpoint; local parent `435bd7d44430168c96f1216bdb79ede36e052569`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1890,11 +1890,27 @@ Current implementation: explicit source construction RPC dispatch (this checkpoi
       actual Git lifecycle 1/1; strict Clippy, durable/minimal,
       CLI help/parse gates and scoped fmt/diff passed. 11 selected tests.
       Prior five legacy Store failures not rerun.
-      **Next:** physical retention authority and explicit exact host
-      cleanup dispatch, reviewed containment/extension and bound-Agent
-      structural mutation, protected broader metadata/Views,
-      manifest-preserving legacy transfer/export and independent source/
-      provider share policy. Raw file/env and arbitrary secret exposure
+      **Explicit physical retention reconciliation:** separate
+      Actor-owner maintenance RPC for exact retired checkpoint and
+      original closed Sandbox revision, independent private approval,
+      current Project/writer, original source leases/provenance/driver
+      release and bounded redacted projection. No automatic deletion.
+      Writer observed before approval and rechecked at checkpoint claim;
+      closed managed alias retained custody versus passive closed alias,
+      existing child/live-anchor gates, canonical and directory-identity
+      exclusion of current controller layout. Real Store writer refusal,
+      actual managed-alias collision, exact Git maintenance/Unknown
+      recovery and headless capability/parameter/duplicate checks.
+      13 selected tests passed (headless 8, Store 2, Host Git 1, CLI Git 1,
+      native executable 1); strict Clippy, durable/minimal, help/flag
+      conflicts, scoped formatting/diff passed. Separate flattened
+      retention approval group and fixture lifetime corrections verified.
+      Real maintenance stdio subprocess qualification remains pending.
+      **Next:** registry compatibility and live/durable dependency
+      enumeration for exact provider/driver retirement/replacement,
+      reviewed containment/extension and bound-Agent structural mutation,
+      protected broader metadata/Views, manifest-preserving legacy
+      transfer/export and independent source/provider share policy. Raw file/env and arbitrary secret exposure
       remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.

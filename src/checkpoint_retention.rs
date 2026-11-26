@@ -75,18 +75,29 @@ impl Approval {
     }
 
     fn reconcile(&self, store: &SessionStore) -> Result<()> {
-        let c = &self.config;
-        require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)?;
-        reconcile_retired_git(store, &c.manager, &c.checkpoint, |set| self.fence(set))
+        self.reconcile_protected(store, &[])
     }
 
-    fn fence(&self, set: &SourceSet) -> Result<Fence<'_>> {
+    fn reconcile_protected(&self, store: &SessionStore, protected: &[&Path]) -> Result<()> {
+        let c = &self.config;
+        require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)?;
+        reconcile_retired_git(store, &c.manager, &c.checkpoint, |set| {
+            self.fence(set, protected)
+        })
+    }
+
+    fn fence(&self, set: &SourceSet, protected: &[&Path]) -> Result<Fence<'_>> {
         let locations = &self.config.repositories;
         if locations.len() != set.anchors.len() || locations.is_empty() {
             return Err(Error::Denied(
                 "retention approval must cover the exact retired set",
             ));
         }
+        let mut exclusions = vec![
+            self.config.store_directory.as_path(),
+            self.directory.as_path(),
+        ];
+        exclusions.extend_from_slice(protected);
         let mut pins = Vec::with_capacity(locations.len() * 3);
         for (location, anchor) in locations.iter().zip(&set.anchors) {
             let anchor = GitSourceAnchor::try_from(anchor)?;
@@ -95,10 +106,7 @@ impl Approval {
                     "retention approval names another checkpoint or source",
                 ));
             }
-            pins.extend(pin_private_checkout(
-                location,
-                &[&self.config.store_directory, &self.directory],
-            )?);
+            pins.extend(pin_private_checkout(location, &exclusions)?);
         }
         Ok(Fence {
             _approval: self,
@@ -118,6 +126,31 @@ impl GitSourceFence for Fence<'_> {
     fn locations(&self) -> &[GitSourceLocation] {
         self.locations
     }
+}
+
+/// Explicit local host capability; exact target and Project checked before
+/// any provider work. An existing retired tombstone does not grant cleanup.
+pub(crate) fn reconcile_configured(
+    store: &SessionStore,
+    manager: &PrincipalId,
+    path: &Path,
+    project: &str,
+    checkpoint: &str,
+    protected: &[&Path],
+) -> Result<()> {
+    let approval = Approval::open(path, manager)?;
+    let c = &approval.config;
+    if c.checkpoint != checkpoint {
+        return Err(Error::Denied("retention approval names another checkpoint"));
+    }
+    require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)?;
+    let snapshot = store.checkpoint_get_metadata(manager, checkpoint)?;
+    if snapshot.source_agent_ref.rsplit_once("/a:").map(|(p, _)| p) != Some(project) {
+        return Err(Error::Denied(
+            "cross-Project checkpoint retention unavailable",
+        ));
+    }
+    approval.reconcile_protected(store, protected)
 }
 
 pub(crate) fn run(path: &Path) -> Result<u8> {
@@ -1023,6 +1056,40 @@ mod tests {
         file.write_all(&serde_json::to_vec(&config).unwrap())
             .unwrap();
         drop(file);
+        use aw::headless::SourceRetention;
+        let retention_state = |store: &SessionStore| crate::StdioSandboxPort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_project_ref: project.clone(),
+            source_metadata: None,
+        };
+        let retention_approval = crate::source_retention_rpc::RetentionApprovals {
+            checkpoint_retention_approval: Some(path.clone()),
+            ..Default::default()
+        };
+        let reconcile_checkpoint_rpc = |store: &SessionStore| {
+            retention_approval.reconcile(
+                SourceRetention::Checkpoint,
+                &retention_state(store),
+                &layout(&initial),
+                json!({"id":capture.id}),
+            )
+        };
+        assert!(
+            reconcile_checkpoint_rpc(&store).is_err(),
+            "live checkpoint is not cleanup authority"
+        );
+        assert!(
+            retention_approval
+                .reconcile(
+                    SourceRetention::Checkpoint,
+                    &retention_state(&store),
+                    &layout(&initial),
+                    json!({"id":fresh.id}),
+                )
+                .is_err(),
+            "independent approval names a different checkpoint"
+        );
         let approval = Approval::open(&path, &actor).unwrap();
         assert!(Approval::open(&path, &actor).is_err());
         assert!(
@@ -1038,6 +1105,41 @@ mod tests {
             .agent_get(&actor, &restored.agent.canonical_ref)
             .unwrap();
         drop(approval);
+        // The currently bound controller's layout cannot serve as
+        // physical retention backing, even with valid target approval.
+        assert!(retention_approval
+            .reconcile(
+                SourceRetention::Checkpoint,
+                &retention_state(&store),
+                &layout(&repo),
+                json!({"id":capture.id}),
+            )
+            .is_err());
+        let controller_alias = root.join("controller-alias");
+        std::os::unix::fs::symlink(&repo, &controller_alias).unwrap();
+        assert!(retention_approval
+            .reconcile(
+                SourceRetention::Checkpoint,
+                &retention_state(&store),
+                &layout(&controller_alias),
+                json!({"id":capture.id}),
+            )
+            .is_err());
+        let mut wrong_project = retention_state(&store);
+        wrong_project.current_project_ref = "/d:other/i:other/p:other".into();
+        assert!(retention_approval
+            .reconcile(
+                SourceRetention::Checkpoint,
+                &wrong_project,
+                &layout(&initial),
+                json!({"id":capture.id}),
+            )
+            .is_err());
+        drop(wrong_project);
+        assert_eq!(
+            git(&executable, &repo, &["rev-parse", &reference]),
+            captured
+        );
         // Reject a substituted approval before a new cleanup claim.
         let mut wrong = config.clone();
         wrong["repositories"][0]["repository_identity"] = json!([0, 0]);
@@ -1080,10 +1182,16 @@ mod tests {
         );
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
-        Approval::open(&path, &actor)
-            .unwrap()
-            .reconcile(&store)
-            .unwrap();
+        assert_eq!(
+            reconcile_checkpoint_rpc(&store).unwrap(),
+            json!({"status":"settled"})
+        );
+        // Same resource operation is a factual no-op, with no second
+        // physical inspection. The original approval remains necessary.
+        assert_eq!(
+            reconcile_checkpoint_rpc(&store).unwrap(),
+            json!({"status":"settled"})
+        );
         assert!(git(&executable, &repo, &["for-each-ref", &reference]).is_empty());
         // Independent live checkpoint retention was never part of this cleanup.
         assert!(!git(
@@ -1125,9 +1233,22 @@ mod tests {
             .write_all(&serde_json::to_vec(&sandbox_config).unwrap())
             .unwrap();
         drop(sandbox_file);
+        let sandbox_retention_approval = crate::source_retention_rpc::RetentionApprovals {
+            sandbox_retention_approval: Some(sandbox_path.clone()),
+            ..Default::default()
+        };
+        let reconcile_sandbox_rpc = |store: &SessionStore| {
+            sandbox_retention_approval.reconcile(
+                SourceRetention::Sandbox,
+                &retention_state(store),
+                &layout(&initial),
+                json!({"ref":sandbox_ref,"rev":open_sandbox.rev+1}),
+            )
+        };
         let reconcile_sandbox = |store: &SessionStore| {
             crate::sandbox_retention::Approval::open(&sandbox_path, &actor)?.reconcile(store)
         };
+        assert!(reconcile_sandbox_rpc(&store).is_err());
         assert!(reconcile_sandbox(&store).is_err());
         assert!(destination.join("code").exists());
         store
@@ -1140,6 +1261,30 @@ mod tests {
             .sandbox_close(&actor, sandbox_ref, Some(open_sandbox.rev))
             .unwrap();
         assert_eq!(closed.rev, open_sandbox.rev + 1);
+        assert!(sandbox_retention_approval
+            .reconcile(
+                SourceRetention::Sandbox,
+                &retention_state(&store),
+                &layout(&destination),
+                json!({"ref":sandbox_ref,"rev":closed.rev}),
+            )
+            .is_err());
+        assert!(sandbox_retention_approval
+            .reconcile(
+                SourceRetention::Sandbox,
+                &retention_state(&store),
+                &layout(&initial),
+                json!({"ref":sandbox_ref,"rev":closed.rev+1}),
+            )
+            .is_err());
+        assert!(sandbox_retention_approval
+            .reconcile(
+                SourceRetention::Sandbox,
+                &retention_state(&store),
+                &layout(&initial),
+                json!({"ref":"/d:foreign/i:foreign/p:foreign/s:foreign","rev":closed.rev}),
+            )
+            .is_err());
         let mut stale = sandbox_config.clone();
         stale["sandbox_rev"] = json!(closed.rev + 1);
         fs::write(&sandbox_path, serde_json::to_vec(&stale).unwrap()).unwrap();
@@ -1174,7 +1319,12 @@ mod tests {
         drop(store);
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        let release_rpc = reconcile_sandbox_rpc(&store).unwrap();
         let released = reconcile_sandbox(&store).unwrap();
+        assert_eq!(release_rpc["ref"], released.canonical_ref);
+        assert_eq!(release_rpc["rev"], released.rev);
+        assert_eq!(release_rpc["sources"], json!([]));
+        assert_eq!(reconcile_sandbox_rpc(&store).unwrap(), release_rpc);
         assert_eq!(released.lifecycle, aw_store::SandboxLifecycle::Closed);
         assert_eq!(released.rev, closed.rev + 1);
         assert!(released.sources.is_empty());
