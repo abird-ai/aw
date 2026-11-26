@@ -72,7 +72,10 @@ impl VaultProcessProjectionClaim {
         entry.validate()?;
         name.validate()?;
         opaque(scope)?;
-        if projection == VaultProjection::Broker || grant_rev == 0 || grant_rev > i64::MAX as u64 {
+        if (projection == VaultProjection::Broker && !cfg!(target_os = "linux"))
+            || grant_rev == 0
+            || grant_rev > i64::MAX as u64
+        {
             return Err(Error::Denied(
                 "invalid original Vault Process projection selection",
             ));

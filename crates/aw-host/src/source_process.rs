@@ -283,7 +283,9 @@ async fn spawn_source_process<P, A>(
     deadline: Instant,
     control: &SourceProcessControl,
     outputs: Option<JobProcessOutputs>,
-    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
+    project: impl FnOnce(SpawnOnce<'_>, (P, ProcessToolAuthority<A>), SandboxEffectLaunch)
+        + Send
+        + 'static,
 ) -> std::result::Result<PipeProcess, PipeLaunchFailure>
 where
     P: Send + 'static,
@@ -296,72 +298,52 @@ where
         .with_custody(authority);
     // Do not reenter the ToolBinding read lock from the last probe.
     let cancelled = async move { signal.cancelled().await };
-    let fence = move |spawn: SpawnOnce<'_>, (_, authority): &(P, ProcessToolAuthority<A>)| {
-        project(spawn, authority, boundary)
+    let fence = move |spawn: SpawnOnce<'_>, custody: (P, ProcessToolAuthority<A>)| {
+        project(spawn, custody, boundary)
     };
-    match outputs {
-        Some(outputs) => {
-            PipeProcess::spawn_prepared_fenced_with_job_outputs_until(
-                launch, outputs, deadline, check, cancelled, fence,
-            )
-            .await
-        }
-        None => {
-            PipeProcess::spawn_prepared_fenced_until(launch, deadline, check, cancelled, fence)
-                .await
-        }
-    }
+    PipeProcess::spawn_prepared_owned_fenced_until(
+        launch, outputs, deadline, check, cancelled, fence,
+    )
+    .await
 }
 
-fn ordinary_projection<A: SandboxEffectAuthority>(
+fn ordinary_projection<P, A: SandboxEffectAuthority>(
     spawn: SpawnOnce<'_>,
-    authority: &ProcessToolAuthority<A>,
+    custody: (P, ProcessToolAuthority<A>),
     boundary: SandboxEffectLaunch,
 ) {
-    let _ = boundary.with_source_authority(authority, || {
+    let _ = boundary.with_source_authority(&custody.1, || {
         spawn.spawn();
         Ok(())
     });
 }
 
-fn signing_projection<A, S>(
+fn signing_projection<P, A, S>(
     registry: aw_agent_core::VaultProviderRegistryReader,
     handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
     selection: aw_store::SigningProcessProof,
     projection: aw_agent_core::VaultProjection,
-) -> impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static
+) -> impl FnOnce(SpawnOnce<'_>, (P, ProcessToolAuthority<A>), SandboxEffectLaunch) + Send + 'static
 where
+    P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
     S: aw_store::SecretStore + 'static,
 {
-    move |mut spawn, authority, boundary| {
+    move |mut spawn, custody, boundary| {
         // A refusal leaves the one-shot token unused. The same final
         // source/ToolBinding/Store fence also holds the live provider.
         let _ = aw_store::SigningVaultProvider::with_process_proof_for_projection(
             &registry,
             &handle,
             boundary,
-            authority,
+            &custody.1,
             selection,
             projection,
             |proof| {
                 // All reserved integration points belong to this provider,
                 // not only the selected transport. Reject ambiguous input.
-                for name in [
-                    aw_store::SIGNING_PROOF_ENV,
-                    aw_store::SIGNING_PROOF_FILE_ENV,
-                    aw_store::SIGNING_PROOF_SOCKET_ENV,
-                ] {
-                    spawn
-                        .require_reserved_env(name)
-                        .map_err(|_| Error::Denied("reserved Vault projection collision"))?;
-                }
-                let mut hex = [b'\n'; 65];
-                const DIGITS: &[u8; 16] = b"0123456789abcdef";
-                for (byte, pair) in proof.iter().zip(hex[..64].chunks_exact_mut(2)) {
-                    pair[0] = DIGITS[(byte >> 4) as usize];
-                    pair[1] = DIGITS[(byte & 15) as usize];
-                }
+                require_signing_environment(&spawn)?;
+                let hex = signing_hex(proof);
                 use aw_agent_core::VaultProjection;
                 match projection {
                     VaultProjection::Env => spawn.insert_reserved_env(
@@ -380,6 +362,82 @@ where
                 }
                 .map_err(|_| Error::Denied("Vault Process capability unavailable"))?;
                 spawn.spawn();
+                Ok(())
+            },
+        );
+    }
+}
+
+fn require_signing_environment(spawn: &SpawnOnce<'_>) -> Result<()> {
+    for name in [
+        aw_store::SIGNING_PROOF_ENV,
+        aw_store::SIGNING_PROOF_FILE_ENV,
+        aw_store::SIGNING_PROOF_SOCKET_ENV,
+        aw_store::SIGNING_BROKER_SOCKET_ENV,
+    ] {
+        spawn
+            .require_reserved_env(name)
+            .map_err(|_| Error::Denied("reserved Vault projection collision"))?;
+    }
+    Ok(())
+}
+
+fn signing_hex(proof: &[u8; 32]) -> [u8; 65] {
+    let mut hex = [b'\n'; 65];
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for (byte, pair) in proof.iter().zip(hex[..64].chunks_exact_mut(2)) {
+        pair[0] = DIGITS[(byte >> 4) as usize];
+        pair[1] = DIGITS[(byte & 15) as usize];
+    }
+    hex
+}
+
+#[cfg(target_os = "linux")]
+fn broker_projection<P, A, S>(
+    registry: aw_agent_core::VaultProviderRegistry,
+    handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
+    selection: aw_store::SigningProcessProof,
+) -> impl FnOnce(SpawnOnce<'_>, (P, ProcessToolAuthority<A>), SandboxEffectLaunch) + Send + 'static
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+    S: aw_store::SecretStore + 'static,
+{
+    move |spawn, custody, boundary| {
+        // Retain the actual pins before their authority, exactly as for
+        // the original launch. Only this live broker needs shared custody.
+        let custody = std::sync::Arc::new(std::sync::Mutex::new(custody));
+        let Ok(launch_guard) = custody.lock() else {
+            return;
+        };
+        let live = custody.clone();
+        let _ = aw_store::SigningVaultProvider::with_process_broker(
+            registry,
+            handle,
+            boundary,
+            &launch_guard.1,
+            selection,
+            |broker| {
+                require_signing_environment(&spawn)?;
+                spawn
+                    .spawn_with_request_socket(
+                        aw_store::SIGNING_BROKER_SOCKET_ENV,
+                        move |request, reply| {
+                            let denied = || std::io::Error::other("Vault broker request refused");
+                            if request != b'S' {
+                                return Err(denied());
+                            }
+                            let held = live.lock().map_err(|_| denied())?;
+                            broker
+                                .respond(&held.1, |proof| {
+                                    reply(&signing_hex(proof)).map_err(|_| {
+                                        Error::Denied("Vault broker response unavailable")
+                                    })
+                                })
+                                .map_err(|_| denied())
+                        },
+                    )
+                    .map_err(|_| Error::Denied("Vault broker capability unavailable"))?;
                 Ok(())
             },
         );
@@ -472,7 +530,9 @@ async fn run_fenced_source_process<P, A, F>(
     deadline: Instant,
     cancellation: CancellationToken,
     outputs: Option<JobProcessOutputs>,
-    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
+    project: impl FnOnce(SpawnOnce<'_>, (P, ProcessToolAuthority<A>), SandboxEffectLaunch)
+        + Send
+        + 'static,
     prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F> + Send + 'static,
 ) -> Result<SourceProcessCompletion>
 where
@@ -551,7 +611,9 @@ async fn start_fenced_source_process<P, A>(
     prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
-    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
+    project: impl FnOnce(SpawnOnce<'_>, (P, ProcessToolAuthority<A>), SandboxEffectLaunch)
+        + Send
+        + 'static,
 ) -> Result<SourceProcessStart>
 where
     P: Send + 'static,
@@ -712,7 +774,18 @@ mod tests {
     }
 
     fn fixture_command(id: &str) -> &'static str {
-        if id.starts_with("host:vault-") {
+        if id.starts_with("host:broker-") {
+            // Fixed reviewed builtin-only consumer. Two requests succeed;
+            // after the fixture's independent revoke, the next gets EOF.
+            r#"fd=$AW_VAULT_SIGNING_BROKER_FD
+               printf S >&"$fd" && IFS= read -r -u "$fd" first && [[ $first =~ ^[0-9a-f]{64}$ ]] || exit 30
+               printf S >&"$fd" && IFS= read -r -u "$fd" second && [[ $second == "$first" ]] || exit 31
+               printf ready > broker-ready
+               while [[ ! -f broker-resume ]]; do :; done
+               printf S >&"$fd" || exit 32
+               if IFS= read -r -u "$fd" refused; then exit 33; fi
+               printf done"#
+        } else if id.starts_with("host:vault-") {
             r#"[[ "$AW_VAULT_SIGNING_PROOF" =~ ^[0-9a-f]{64}$ ]] || exit 21; printf changed > code; printf done"#
         } else if id == "host:interrupted" {
             // Fixed single-child workload: shell builtins only. The marker
@@ -893,6 +966,10 @@ mod tests {
             "host:vault-mismatched-claim",
             "host:vault-downgrade",
             "host:vault-valid",
+            #[cfg(target_os = "linux")]
+            "host:broker-provider-revoke",
+            #[cfg(target_os = "linux")]
+            "host:broker-grant-revoke",
             "host:write",
             "host:unproven",
             "host:interrupted",
@@ -1423,6 +1500,173 @@ mod tests {
             SandboxEffectOutcome::Settled
         );
         let foreign_receipt = receipt;
+        #[cfg(target_os = "linux")]
+        let broker_revisions = {
+            use aw_agent_core::VaultProjection;
+            let mut broker_target = target.clone();
+            broker_target.name = SourceName::new("broker").unwrap();
+            broker_target.entry.entry = "broker".into();
+            broker_target.projection = VaultProjection::Broker;
+            for id in ["host:broker-provider-revoke", "host:broker-grant-revoke"] {
+                for name in ["broker-ready", "broker-resume"] {
+                    let path = source_root.join(name);
+                    if path.exists() {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                provider
+                    .provision(&store, &actor, broker_target.clone(), &[59; 32])
+                    .unwrap();
+                let rev = store
+                    .agent_vault_attach_signing(
+                        &actor,
+                        &reference,
+                        &broker_target.name,
+                        store.agent_get(&actor, &reference).unwrap().rev,
+                        &vault_registry.reader().unwrap(),
+                        &vault_handle,
+                        &broker_target.entry.entry,
+                    )
+                    .unwrap();
+                let selection = aw_store::SigningProcessProof {
+                    name: broker_target.name.clone(),
+                    entry: broker_target.entry.entry.clone(),
+                    scope: broker_target.scope.clone(),
+                    grant_rev: rev,
+                    challenge: b"reviewed live broker challenge".to_vec(),
+                };
+                let prepared = prepare(id, capture(), false)
+                    .unwrap()
+                    .with_vault_projection_claim(
+                        selection
+                            .projection_claim(
+                                &vault_handle.descriptor().provider,
+                                VaultProjection::Broker,
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let effect_id = prepared.plan().effect_id.clone();
+                let run = run_fenced_source_process(
+                    prepared,
+                    deadline(),
+                    CancellationToken::new(),
+                    None,
+                    broker_projection(vault_registry.clone(), vault_handle.clone(), selection),
+                    {
+                        let policy_lock = policy_lock.clone();
+                        let database = temp.0.join("sessions.sqlite3");
+                        let effect_id = effect_id.clone();
+                        move |terminal| {
+                            assert_eq!(terminal.exit, ProcessExit::Code(0));
+                            Ok(HeldProof {
+                                _guard: policy_lock.try_read_owned().unwrap(),
+                                database,
+                                effect_id,
+                                fact: "source.effect.quiescent",
+                            })
+                        }
+                    },
+                );
+                let revoke = async {
+                    tokio::time::timeout(Duration::from_secs(4), async {
+                        while !source_root.join("broker-ready").exists() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("actual child must consume both live broker replies");
+                    assert!(
+                        policy_lock.try_write().is_err(),
+                        "original launch pins and policy remain held"
+                    );
+                    let metadata = || {
+                        store
+                            .agent_vault_list_signing_metadata(
+                                &actor,
+                                &reference,
+                                &vault_registry.reader().unwrap(),
+                                &vault_handle,
+                                |_, _| Ok(()),
+                            )
+                            .unwrap()
+                    };
+                    let rows = metadata();
+                    let row = rows
+                        .iter()
+                        .find(|row| row.summary.name == broker_target.name)
+                        .unwrap();
+                    assert_eq!(row.summary.projection, VaultProjection::Broker);
+                    assert!(row.entry.is_none());
+                    let encoded = serde_json::to_value(row).unwrap();
+                    assert!(encoded.get("entry").is_none());
+                    assert!(encoded.get("scope").is_none());
+                    assert!(encoded.get("challenge").is_none());
+                    if id == "host:broker-provider-revoke" {
+                        provider.revoke(&broker_target.entry.entry).unwrap();
+                    } else {
+                        store
+                            .agent_vault_set(
+                                &actor,
+                                &reference,
+                                &broker_target.name,
+                                store.agent_get(&actor, &reference).unwrap().rev,
+                                None,
+                            )
+                            .unwrap();
+                    }
+                    let rows = metadata();
+                    if id == "host:broker-provider-revoke" {
+                        let row = rows
+                            .iter()
+                            .find(|row| row.summary.name == broker_target.name)
+                            .unwrap();
+                        assert!(row.entry.is_none());
+                    } else {
+                        assert!(rows
+                            .iter()
+                            .all(|row| row.summary.name != broker_target.name));
+                    }
+                    std::fs::write(source_root.join("broker-resume"), b"resume").unwrap();
+                };
+                let (completion, ()) = tokio::join!(run, revoke);
+                let completion = completion.unwrap();
+                let receipt = completion.receipt.unwrap();
+                assert_eq!(
+                    receipt.terminal.exit,
+                    ProcessExit::Code(0),
+                    "{:?}",
+                    receipt.output.stderr
+                );
+                assert_eq!(receipt.output.stdout.head, b"done");
+                assert_eq!(
+                    completion.quiescence.unwrap(),
+                    SandboxEffectOutcome::Settled
+                );
+                assert!(
+                    policy_lock.try_write().is_ok(),
+                    "broker retired before source proof completion"
+                );
+                final_records.push(
+                    finish_tool(
+                        &journal,
+                        id,
+                        ToolStatus::Succeeded,
+                        ToolOutput::text("done"),
+                    )
+                    .await,
+                );
+                assert_eq!(
+                    store
+                        .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, id)
+                        .unwrap(),
+                    Some(SandboxEffectOutcome::Settled)
+                );
+            }
+            2
+        };
+        #[cfg(not(target_os = "linux"))]
+        let broker_revisions = 0;
         let prepared = prepare("host:write", capture(), false).unwrap();
         let effect_id = prepared.plan().effect_id.clone();
         assert!(store
@@ -1478,7 +1722,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 1
+            sandbox.rev + 1 + broker_revisions
         );
         assert!(store
             .acquire_source_mutation_barrier(&set, "host:foreign-receipt")
@@ -1536,7 +1780,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 2
+            sandbox.rev + 2 + broker_revisions
         );
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), agent_before);
         assert_eq!(
@@ -1774,7 +2018,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 3
+            sandbox.rev + 3 + broker_revisions
         );
         // Source claims stay fenced until the original Run closure is
         // paired with the worker's recorded physical fact.
@@ -1832,7 +2076,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 4
+            sandbox.rev + 4 + broker_revisions
         );
         // No rewritten history, new tool receipt or blanket Run-hazard
         // acknowledgement from physical source settlement.
@@ -1863,7 +2107,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 4
+            sandbox.rev + 4 + broker_revisions
         );
         assert!(reopened.activate(&actor, &session.id, &branch.id).is_err());
     }

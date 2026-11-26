@@ -78,6 +78,23 @@ pub fn install_child_read_capability(
         ReadCapabilityKind::SealedFile => sealed_file(bytes)?,
         ReadCapabilityKind::OneShotSocket => one_shot_socket(bytes)?,
     };
+    let fd = install_child_fd(command, original)?;
+    Ok(match kind {
+        ReadCapabilityKind::SealedFile => format!("/proc/self/fd/{fd}"),
+        ReadCapabilityKind::OneShotSocket => fd.to_string(),
+    })
+}
+
+/// Connected anonymous request/reply socket. Only the exact child gets
+/// the peer descriptor; the host endpoint is nonblocking and CLOEXEC.
+pub fn install_child_request_socket(command: &mut Command) -> io::Result<(String, UnixStream)> {
+    let (host, child) = UnixStream::pair()?;
+    host.set_nonblocking(true)?;
+    let fd = install_child_fd(command, child.into())?;
+    Ok((fd.to_string(), host))
+}
+
+fn install_child_fd(command: &mut Command, original: OwnedFd) -> io::Result<i32> {
     // Ensure it cannot collide with stdin/out/err even in a host with
     // closed standard descriptors. The kernel selects an unoccupied fd.
     // SAFETY: original is a live owned descriptor, dup creates a new one.
@@ -88,10 +105,6 @@ pub fn install_child_read_capability(
     // SAFETY: successful dup returned a fresh owned descriptor.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     drop(original);
-    let locator = match kind {
-        ReadCapabilityKind::SealedFile => format!("/proc/self/fd/{fd}"),
-        ReadCapabilityKind::OneShotSocket => fd.to_string(),
-    };
     // SAFETY: capture the actual owned descriptor for the command's
     // lifetime. Only async-signal-safe fcntl calls in the forked child;
     // no allocation, locks, environment mutation, or parent FD mutation.
@@ -105,5 +118,5 @@ pub fn install_child_read_capability(
             Ok(())
         });
     }
-    Ok(locator)
+    Ok(fd)
 }

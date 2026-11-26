@@ -118,6 +118,7 @@ impl SigningProcessProjection {
             VaultProjection::Env => 0,
             VaultProjection::File if cfg!(target_os = "linux") => 1,
             VaultProjection::Socket if cfg!(target_os = "linux") => 2,
+            VaultProjection::Broker if cfg!(target_os = "linux") => 3,
             _ => return Err(Error::Denied("signing Process projection unavailable")),
         };
         let reader = registry.reader()?;
@@ -462,6 +463,22 @@ where
                         &signing.handle.descriptor().provider,
                         signing.projection,
                     )?)?;
+                #[cfg(target_os = "linux")]
+                if signing.projection == VaultProjection::Broker {
+                    return run_fenced_source_process(
+                        prepared,
+                        request.deadline,
+                        request.cancellation,
+                        Some(request.outputs),
+                        super::broker_projection(
+                            signing.registry.clone(),
+                            signing.handle.clone(),
+                            signing.selection.clone(),
+                        ),
+                        prove,
+                    )
+                    .await;
+                }
                 // The reader is live, not an authorization snapshot. Its
                 // typed provider and exact VaultGrant are checked inside the
                 // original source/Actor/Store final spawn fence.

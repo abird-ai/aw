@@ -26,7 +26,112 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: protected source/Vault disclosure custody and inherited history
+## Latest local implementation delta — 2026-11-27: live provider-owned signing broker in original Process
+
+Parent `5941d9f9cdc5dc9ad7fff51ab7d88d3212cd4d9a`; published AW main
+`0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only, scoped clean at entry. Store v60, product 0.15.0,
+Git recovery v4 and frozen release unchanged.
+
+- Linux connected anonymous request/reply socket uses the same private
+  inherited descriptor helper as the existing one-shot read capabilities.
+  Both parent-side descriptors retain CLOEXEC; only the exact child peer
+  inherits its descriptor. Host endpoint nonblocking, no named path,
+  listener, external helper, service or second Process lifetime.
+- `SpawnOnce::spawn_with_request_socket` moves the socket/handler into
+  the actual Spawned/Process owner only on successful original spawn.
+  Finite Process wait services the optional channel in its existing
+  cancellation/deadline/leader-ready select. No detached broker task.
+  Child EOF, malformed/refused request, reply failure or bounded request
+  exhaustion closes the channel. Cancel/deadline/leader readiness retires
+  it before stop/reap/drain and source proof. Original Linux spawn-lane
+  cancellation probe moves into the channel; check before request and
+  again immediately before actual reply. No borrowed non-Sync probe
+  across suspension. One byte per request, max 64, max reply 4096 bytes;
+  arm write readiness outside guard, one nonblocking guarded response,
+  no partial continuation or delayed proof queue. Yield between requests.
+  Interactive wait never retains an unserviced channel. Existing ordinary
+  spawn, streams, statuses and reaping remain owned by aw-process.
+  Tokio net feature enabled only for Linux in aw-process; lock unchanged.
+- Original `SandboxEffectLaunch` authorizes a crate-private non-cloneable
+  `SandboxEffectUse` only through the exact Broker launch path. It
+  exposes no spawn or settlement operation. Reuse the same original
+  intent/claim/complete lease pin, Store scope/writer, source binding,
+  provider, current grant rev and ToolBinding/Actor fence for each use.
+  Broker selected before the original claim via existing nonsecret
+  VaultProcessProjectionClaim (Linux). Existing Env/File/Socket one-shot
+  projection and direct host SigningBroker stay distinct.
+- `SigningProcessBroker` belongs to the original registered provider
+  and retains its selected exact policy, typed registry handle, fixed
+  host-selected challenge and original effect use fence. On every byte
+  'S' request re-acquire actual provider entry/key version and current
+  original grant; derive a domain-separated effect-bound HMAC, then
+  hold all authority through the actual bounded synchronous response.
+  No raw key, cached proof, child-selected entry/scope/challenge,
+  arbitrary message oracle, grant mutation or new ToolRecord. Reuse
+  shared Process-proof encoding helper, preserve previous proof domains.
+  `AW_VAULT_SIGNING_BROKER_FD` names the inherited descriptor; reply
+  64 lowercase hex bytes + LF. Reserve all four provider integration
+  names; collision refuses without fallback.
+- Registered Process and serial foreground Graph route explicitly
+  selects Broker on Linux through `SigningProcessProjection::for_projection`.
+  Driver must independently opt in to reviewed Broker consumption.
+  Adapter's existing fenced spawn seam can transfer the actual pins
+  by value; legacy borrowed wrappers remain. Retain original launch
+  pins and independent source authority (ordered custody) until broker
+  retirement, then existing worker/driver physical proof and original
+  direct/Graph settlement. No ordinary-route new custody allocation;
+  optional broker uses one boxed channel/handler and shared custody.
+- Real Host fixture: actual fixed builtin-only child receives two
+  valid identical effect-bound replies, then independent provider
+  withdrawal or removal of current Store grant causes the third request
+  to receive EOF. Original pins/authority remain held during live use
+  and retire before factual settlement. Existing independent authorized
+  Vault metadata View is exercised while active and after revoke:
+  unapproved entry/scope/challenge redacted; detached row absent.
+  No new public metadata/status or credential surface.
+- Real Actor fixture adds direct Broker call then native read/Broker
+  node/read/conditional skip Graph in one original Turn; two replies
+  per Process, only approved constant results, normal original custody
+  release/revision/Run recovery and later queued Input. Earlier Env,
+  one-shot file/socket, native/Process/Graph and protected history
+  cases retained. Shared Process fixture checks repeated responses,
+  invalid-request EOF, cancellation before actual spawn, cancellation
+  during callback before response, and handler custody retired before
+  the original receipt.
+
+Validation: locked/offline L5 strict affected all-target Clippy passed.
+All 300 selected tests passed: Process 10, Unix platform 14, Host source
+Process 2, Store Vault 2 / Sandbox owner 4 / history owner 5, adapter 259,
+Actor lifecycle 3 (56.62s), native executable 1 (34.19s). Durable and
+minimal all-target checks passed (existing dead-code warnings), executable
+reports aw 0.15.0. Scoped rustfmt and diff checks passed. Prior full Store
+272/277 result (five previously documented legacy failures) was not rerun;
+no full-workspace, pinned Nix or non-Linux qualification is claimed.
+
+Scope: fixed host-selected, derived signing proof broker on Linux
+reviewed finite registered Process and Graph consumers. Broker is an
+explicit grant kind, not a reinterpretation of one-shot Socket grant.
+Provider withdrawal/Store removal serialize against guarded response
+publication: no newly authorized reply after withdrawal, no retroactive
+erasure of already delivered or queued kernel bytes. The synchronous
+provider operation must be bounded; no network wait in the guard.
+No arbitrary message signing, interactive broker, raw credential
+projection, public service/listener, general OS isolation, cross-platform
+qualification or broader source/provider sharing. Driver must still
+exclude unauthorized capability handoff and independently prove
+permanent physical source quiescence. Existing actor-private disclosure
+ceiling and metadata owner remain; broader metadata/data Views and
+manifest-preserving legacy transfers remain held.
+
+Next: close remaining Phase 3 production Sandbox/Vault host RPC
+construction/capture/restore dispatch and physical retention authority;
+qualify broader provider/extension dispatch only under reviewed
+containment and independent disclosure contracts. Keep remaining
+legacy participant/shared/forked layouts, raw credentials and broader
+manifest transport explicitly pending. No push or pin promotion.
+
+## Previous local implementation delta — 2026-11-27: protected source/Vault disclosure custody and inherited history
 
 Parent `7be6b9ef59d3fe07f9c6b6f427570699ae57610f`; published AW main
 `0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen

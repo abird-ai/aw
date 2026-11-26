@@ -25,6 +25,8 @@ use std::{
 use thiserror::Error;
 #[cfg(target_os = "linux")]
 mod linux_spawn;
+#[cfg(target_os = "linux")]
+mod request_socket;
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -98,6 +100,8 @@ struct Spawned {
     platform: aw_platform::DirectScope,
     child: Child,
     pid: u32,
+    #[cfg(target_os = "linux")]
+    request_socket: Option<Box<request_socket::RequestSocket>>,
 }
 
 fn spawn_attached(command: &mut Command) -> Result<Spawned> {
@@ -133,6 +137,8 @@ fn spawn_attached(command: &mut Command) -> Result<Spawned> {
         platform,
         child,
         pid,
+        #[cfg(target_os = "linux")]
+        request_socket: None,
     })
 }
 
@@ -222,6 +228,33 @@ impl SpawnOnce<'_> {
             let _ = bytes;
             Err(Error::DeniedBeforeSpawn)
         }
+    }
+
+    /// Explicit bounded request/reply capability. No listener or task is
+    /// started here. Only a successful original spawn transfers the host
+    /// socket and handler into the Process owner.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_with_request_socket(
+        self,
+        name: &str,
+        handler: impl FnMut(u8, &mut request_socket::Reply<'_>) -> io::Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.require_reserved_env(name)?;
+        let (locator, socket) =
+            aw_platform::install_child_request_socket(self.command.as_std_mut())
+                .map_err(|_| Error::DeniedBeforeSpawn)?;
+        let socket = request_socket::RequestSocket::new(socket, handler)
+            .map_err(|_| Error::DeniedBeforeSpawn)?;
+        self.command.env(name, locator);
+        *self.outcome = Some(
+            (self.check)()
+                .and_then(|()| spawn_attached(self.command))
+                .map(|mut spawned| {
+                    spawned.request_socket = Some(Box::new(socket));
+                    spawned
+                }),
+        );
+        Ok(())
     }
 
     pub fn spawn(self) {
@@ -792,6 +825,8 @@ pub struct ProcessResult {
 
 /// Sole asynchronous owner of one Process/Job execution lifetime.
 pub struct Process {
+    #[cfg(target_os = "linux")]
+    request_socket: Option<Box<request_socket::RequestSocket>>,
     scope: Scope,
     stdin: Option<ChildStdin>,
     stdout: Reader,
@@ -858,6 +893,8 @@ impl Process {
             mut platform,
             mut child,
             pid,
+            #[cfg(target_os = "linux")]
+            request_socket,
         } = spawned;
 
         let Some(stdout_pipe) = child.stdout.take() else {
@@ -880,6 +917,8 @@ impl Process {
         let (stderr_reader, stderr_task) = Reader::start(stderr_pipe, stderr);
 
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            request_socket,
             scope: Scope::new(platform, child, pid),
             stdin,
             stdout: stdout_reader,
@@ -971,6 +1010,12 @@ impl Process {
         deadline: Duration,
     ) -> ProcessResult {
         let absolute = self.wait_deadline(deadline);
+        #[cfg(target_os = "linux")]
+        if let Some(socket) = self.request_socket.take() {
+            return self
+                .wait_with_request_socket(socket, cancellation, absolute)
+                .await;
+        }
         let timer = sleep_until(absolute);
         tokio::pin!(timer);
         let cancellation = cancellation;
@@ -996,12 +1041,63 @@ impl Process {
         self.finish(exit, stop, occupancy).await
     }
 
+    #[cfg(target_os = "linux")]
+    async fn wait_with_request_socket<C: Future<Output = ()>>(
+        mut self,
+        socket: Box<request_socket::RequestSocket>,
+        cancellation: C,
+        absolute: Instant,
+    ) -> ProcessResult {
+        // The socket future belongs to this wait, not a detached task.
+        // Drop it before any stop/reap/drain or source settlement.
+        enum End {
+            Ready(io::Result<()>),
+            Stop(StopReason),
+        }
+        let end = {
+            let service = async {
+                socket.serve(absolute, || self.scope.ready()).await;
+                // EOF/refusal retires the socket, not the Process.
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation => End::Stop(StopReason::Cancelled),
+                _ = sleep_until(absolute) => End::Stop(StopReason::Timeout),
+                ready = self.scope.wait_ready() => End::Ready(ready),
+                _ = service => unreachable!("request service cannot resolve the Process"),
+            }
+        };
+        let (exit, stop, occupancy) = match end {
+            End::Ready(Ok(())) => match self.settle_natural_exit().await {
+                Ok(settled) => settled,
+                Err(_) => {
+                    let (record, exit, occupancy) = self.stop(StopReason::RuntimeError).await;
+                    (exit, Some(record), occupancy)
+                }
+            },
+            End::Ready(Err(_)) | End::Stop(StopReason::RuntimeError) => {
+                let (record, exit, occupancy) = self.stop(StopReason::RuntimeError).await;
+                (exit, Some(record), occupancy)
+            }
+            End::Stop(reason) => {
+                let (record, exit, occupancy) = self.stop(reason).await;
+                (exit, Some(record), occupancy)
+            }
+        };
+        self.finish(exit, stop, occupancy).await
+    }
+
     pub async fn wait_interactive<C: core::future::Future<Output = ()>>(
         mut self,
         cancellation: C,
         deadline: Duration,
         mut input: ProcessInputReceiver,
     ) -> ProcessResult {
+        // Request sockets are qualified only for finite wait. Never retain
+        // a live but unserviced broker in an interactive wait.
+        #[cfg(target_os = "linux")]
+        self.request_socket.take();
         let cancellation = cancellation;
         tokio::pin!(cancellation);
         let deadline = sleep_until(self.wait_deadline(deadline));
@@ -1266,6 +1362,8 @@ impl Process {
 
     async fn stop(&mut self, reason: StopReason) -> (StopRecord, ProcessExit, Occupancy) {
         self.termination_attempted = true;
+        #[cfg(target_os = "linux")]
+        self.request_socket.take();
         self.stdin.take();
 
         if self.known_exit.is_some() || matches!(self.scope.ready(), Ok(true)) {
@@ -1330,6 +1428,8 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.request_socket.take();
         for reader in &self.readers {
             reader.abort();
         }
@@ -1586,6 +1686,113 @@ mod tests {
                     assert_eq!(result.output.stdout.head, b"ok");
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn request_socket_retires_with_original_process_and_rechecks_cancel_before_reply() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Retired(Arc<AtomicBool>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let bash = std::env::var_os("AW_BASH")
+            .or_else(|| option_env!("AW_DEFAULT_BASH").map(Into::into))
+            .or_else(|| {
+                ["/bin/bash", "/usr/bin/bash"]
+                    .into_iter()
+                    .find(|path| std::path::Path::new(path).is_file())
+                    .map(Into::into)
+            })
+            .expect("host-approved test Bash");
+        for (cancel_before_spawn, cancel_before_reply) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let retired = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let signal = Arc::new(Notify::new());
+            let replies = Arc::new(AtomicUsize::new(0));
+            let mut command = Command::new(&bash);
+            command.env_clear().args(["--noprofile", "--norc", "-c", if cancel_before_reply {
+                r#"fd=$AW_TEST_REQUEST; printf S >&"$fd"; IFS= read -r -u "$fd" unexpected; while :; do :; done"#
+            } else {
+                r#"fd=$AW_TEST_REQUEST
+                   printf S >&"$fd" && IFS= read -r -u "$fd" first && [[ $first == ok ]] || exit 30
+                   printf S >&"$fd" && IFS= read -r -u "$fd" second && [[ $second == ok ]] || exit 31
+                   printf X >&"$fd" || exit 32
+                   if IFS= read -r -u "$fd" unexpected; then exit 33; fi
+                   printf done"#
+            }]);
+            let witness = Retired(retired.clone());
+            let probe = cancelled.clone();
+            let handler_cancel = cancelled.clone();
+            let handler_signal = signal.clone();
+            let handler_replies = replies.clone();
+            let control = SpawnControl::new_fenced(
+                Instant::now() + Duration::from_secs(5),
+                move || probe.load(Ordering::Acquire),
+                std::future::pending(),
+                move |spawn| {
+                    if cancel_before_spawn {
+                        handler_cancel.store(true, Ordering::Release);
+                    }
+                    let _ = spawn.spawn_with_request_socket(
+                        "AW_TEST_REQUEST",
+                        move |request, reply| {
+                            let _held = &witness;
+                            if request != b'S' {
+                                return Err(io::Error::other("refused"));
+                            }
+                            if cancel_before_reply {
+                                handler_cancel.store(true, Ordering::Release);
+                                handler_signal.notify_one();
+                            }
+                            reply(b"ok\n")?;
+                            handler_replies.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        },
+                    );
+                },
+            );
+            let result = Process::spawn(
+                command,
+                SpawnOptions {
+                    control: Some(control),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if cancel_before_spawn {
+                assert!(matches!(result, Err(Error::CancelledBeforeSpawn)));
+                assert_eq!(replies.load(Ordering::Relaxed), 0);
+            } else {
+                let result = result
+                    .unwrap()
+                    .wait(signal.notified(), Duration::from_secs(5))
+                    .await;
+                if cancel_before_reply {
+                    assert_eq!(result.terminal.stop_reason(), Some(StopReason::Cancelled));
+                    assert_eq!(replies.load(Ordering::Relaxed), 0);
+                } else {
+                    assert_eq!(
+                        result.terminal.exit,
+                        ProcessExit::Code(0),
+                        "{:?}",
+                        result.output.stderr
+                    );
+                    assert_eq!(result.output.stdout.head, b"done");
+                    assert_eq!(replies.load(Ordering::Relaxed), 2);
+                }
+            }
+            assert!(
+                retired.load(Ordering::Acquire),
+                "request handler outlived original Process"
+            );
         }
     }
 

@@ -494,6 +494,51 @@ impl SandboxEffectLaunch {
         projection: aw_agent_core::VaultProjection,
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
+        if projection == aw_agent_core::VaultProjection::Broker {
+            return Err(Error::Denied(
+                "live broker requires its original Process capability",
+            ));
+        }
+        self.with_vault_use(
+            source,
+            registry,
+            vault,
+            expected_grant_rev,
+            projection,
+            operation,
+        )
+    }
+
+    /// The single original launch may transfer a non-cloneable live-use
+    /// capability to the actual Process. It cannot launch or settle.
+    pub(crate) fn with_vault_broker_launch<R>(
+        self,
+        source: &impl SandboxEffectAuthority,
+        registry: &aw_agent_core::VaultProviderRegistryReader,
+        vault: &impl crate::VaultGrantAuthority,
+        expected_grant_rev: u64,
+        operation: impl FnOnce(SandboxEffectUse) -> Result<R>,
+    ) -> Result<R> {
+        let launch = std::sync::Arc::new(self);
+        launch.with_vault_use(
+            source,
+            registry,
+            vault,
+            expected_grant_rev,
+            aw_agent_core::VaultProjection::Broker,
+            || operation(SandboxEffectUse(launch.clone())),
+        )
+    }
+
+    fn with_vault_use<R>(
+        &self,
+        source: &impl SandboxEffectAuthority,
+        registry: &aw_agent_core::VaultProviderRegistryReader,
+        vault: &impl crate::VaultGrantAuthority,
+        expected_grant_rev: u64,
+        projection: aw_agent_core::VaultProjection,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let target = &vault.policy().target;
         if projection != target.projection
             || self.vault_projection
@@ -524,7 +569,7 @@ impl SandboxEffectLaunch {
     }
 
     fn with_launch_in<R>(
-        self,
+        &self,
         source: &impl SandboxEffectAuthority,
         operation: impl FnOnce(&Transaction<'_>) -> Result<R>,
     ) -> Result<R> {
@@ -551,6 +596,35 @@ impl SandboxEffectLaunch {
 
     pub fn effect_id(&self) -> &str {
         &self.boundary.plan.effect_id
+    }
+}
+
+/// Original admitted Process live-use fence. Provider use is always
+/// revalidated through the same current intent, claim, source leases,
+/// ToolBinding/Actor fence, writer epoch and Store scope. No spawn API.
+pub(crate) struct SandboxEffectUse(std::sync::Arc<SandboxEffectLaunch>);
+
+impl SandboxEffectUse {
+    pub(crate) fn effect_id(&self) -> &str {
+        self.0.effect_id()
+    }
+
+    pub(crate) fn with_broker_use<R>(
+        &self,
+        source: &impl SandboxEffectAuthority,
+        registry: &aw_agent_core::VaultProviderRegistryReader,
+        vault: &impl crate::VaultGrantAuthority,
+        expected_grant_rev: u64,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        self.0.with_vault_use(
+            source,
+            registry,
+            vault,
+            expected_grant_rev,
+            aw_agent_core::VaultProjection::Broker,
+            operation,
+        )
     }
 }
 

@@ -25,7 +25,9 @@ mod process_observation;
 #[cfg(target_os = "linux")]
 mod process_projection;
 #[cfg(target_os = "linux")]
-pub use process_projection::{install_child_read_capability, ReadCapabilityKind};
+pub use process_projection::{
+    install_child_read_capability, install_child_request_socket, ReadCapabilityKind,
+};
 pub mod pty_poll;
 pub use aw_tools_fs_unix::scoped_fs;
 

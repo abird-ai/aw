@@ -376,6 +376,9 @@ const SIGNING_PROJECTIONS: &[VaultProjection] = &[
 pub const SIGNING_PROOF_ENV: &str = "AW_VAULT_SIGNING_PROOF";
 pub const SIGNING_PROOF_FILE_ENV: &str = "AW_VAULT_SIGNING_PROOF_FILE";
 pub const SIGNING_PROOF_SOCKET_ENV: &str = "AW_VAULT_SIGNING_PROOF_SOCKET_FD";
+/// Explicit live broker descriptor. Requests are fixed byte 'S', replies
+/// are the host-selected original-effect proof as 64 hex bytes plus LF.
+pub const SIGNING_BROKER_SOCKET_ENV: &str = "AW_VAULT_SIGNING_BROKER_FD";
 
 impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     /// Materialize only a domain-separated, exact-Process-bound proof. The
@@ -442,27 +445,133 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
                 &authority,
                 selection.grant_rev,
                 projection,
+                || project(&provider.process_proof(&authority, &selection, &effect, domain)?),
+            )
+        })
+    }
+}
+
+/// Live provider-owned signing capability for one original Process.
+/// No key or proof is cached; the child can request only the fixed
+/// host-selected challenge. The original Process owns this value and
+/// retires it with its anonymous request socket.
+pub struct SigningProcessBroker<S = LocalSecretStore> {
+    registry: VaultProviderRegistry,
+    handle: VaultProviderHandle<SigningVaultProvider<S>>,
+    selected: VaultGrantPolicy,
+    selection: SigningProcessProof,
+    effect: crate::sandbox_owner::SandboxEffectUse,
+}
+
+impl<S: SecretStore + 'static> SigningProcessBroker<S> {
+    /// Validate and publish under actual provider + original effect
+    /// authority. The callback must perform the bounded nonblocking
+    /// response write here, never queue a result for later disclosure.
+    pub fn respond<R>(
+        &self,
+        source: &impl SandboxEffectAuthority,
+        publish: impl FnOnce(&[u8; 32]) -> Result<R>,
+    ) -> Result<R> {
+        let registry = self.registry.reader()?;
+        let provider = registry.get(&self.handle)?;
+        provider.with_entry(&self.selection.entry, |authority| {
+            if authority.policy() != &self.selected {
+                return Err(Error::Denied("original Process broker authority changed"));
+            }
+            self.effect.with_broker_use(
+                source,
+                &registry,
+                &authority,
+                self.selection.grant_rev,
                 || {
-                    let signing_key = provider.signing_key(authority.entry)?;
-                    let mut mac = hmac::Context::with_key(&signing_key);
-                    mac.update(domain);
-                    for part in [
-                        authority.policy().store_id().as_bytes(),
-                        &authority.policy().restore_generation().to_be_bytes(),
-                        target.agent_ref.as_bytes(),
-                        target.actor.as_str().as_bytes(),
-                        target.name.as_str().as_bytes(),
-                        target.entry.entry.as_bytes(),
-                        target.scope.as_bytes(),
-                        effect.as_bytes(),
-                        &selection.grant_rev.to_be_bytes(),
-                        &selection.challenge,
-                    ] {
-                        mac.update(&(part.len() as u64).to_be_bytes());
-                        mac.update(part);
-                    }
-                    let proof = mac.sign();
-                    project(proof.as_ref().try_into().expect("HMAC-SHA256 tag length"))
+                    publish(&provider.process_proof(
+                        &authority,
+                        &self.selection,
+                        self.effect.effect_id(),
+                        b"aw-vault-live-process-broker-v1\0",
+                    )?)
+                },
+            )
+        })
+    }
+}
+
+impl<S: SecretStore + 'static> SigningVaultProvider<S> {
+    fn process_proof(
+        &self,
+        authority: &Authority<'_>,
+        selection: &SigningProcessProof,
+        effect: &str,
+        domain: &[u8],
+    ) -> Result<[u8; 32]> {
+        let policy = authority.policy();
+        let target = &policy.target;
+        let signing_key = self.signing_key(authority.entry)?;
+        let mut mac = hmac::Context::with_key(&signing_key);
+        mac.update(domain);
+        for part in [
+            policy.store_id().as_bytes(),
+            &policy.restore_generation().to_be_bytes(),
+            target.agent_ref.as_bytes(),
+            target.actor.as_str().as_bytes(),
+            target.name.as_str().as_bytes(),
+            target.entry.entry.as_bytes(),
+            target.scope.as_bytes(),
+            effect.as_bytes(),
+            &selection.grant_rev.to_be_bytes(),
+            &selection.challenge,
+        ] {
+            mac.update(&(part.len() as u64).to_be_bytes());
+            mac.update(part);
+        }
+        Ok(mac
+            .sign()
+            .as_ref()
+            .try_into()
+            .expect("HMAC-SHA256 tag length"))
+    }
+
+    /// Open one live Broker projection through the original fenced launch.
+    /// No child-selected entry, scope, challenge, revision or target.
+    pub fn with_process_broker<R>(
+        registry: VaultProviderRegistry,
+        handle: VaultProviderHandle<Self>,
+        launch: SandboxEffectLaunch,
+        source: &impl SandboxEffectAuthority,
+        selection: SigningProcessProof,
+        project: impl FnOnce(SigningProcessBroker<S>) -> Result<R>,
+    ) -> Result<R> {
+        if !cfg!(target_os = "linux") {
+            return Err(Error::Denied("live Process signing broker unavailable"));
+        }
+        selection.validate()?;
+        let reader = registry.reader()?;
+        let provider = reader.get(&handle)?;
+        let entry = selection.entry.clone();
+        provider.with_entry(&entry, |authority| {
+            let policy = authority.policy();
+            let target = &policy.target;
+            if target.name != selection.name
+                || target.scope != selection.scope
+                || target.projection != VaultProjection::Broker
+            {
+                return Err(Error::Denied("original Process broker selection changed"));
+            }
+            // Validate key version at launch as well as every use.
+            provider.signing_key(authority.entry)?;
+            launch.with_vault_broker_launch(
+                source,
+                &reader,
+                &authority,
+                selection.grant_rev,
+                |effect| {
+                    project(SigningProcessBroker {
+                        registry,
+                        handle,
+                        selected: policy.clone(),
+                        selection,
+                        effect,
+                    })
                 },
             )
         })

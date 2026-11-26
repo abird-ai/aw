@@ -13,6 +13,9 @@ aw-platform = { path = "../aw-platform", version = "=0.15.0" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "time", "sync", "signal"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1", features = ["net"] }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "=0.2.189"
 

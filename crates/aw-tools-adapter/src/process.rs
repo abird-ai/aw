@@ -1023,7 +1023,7 @@ impl PipeProcess {
             deadline,
             cancelled,
             cancelled_signal,
-            fence,
+            move |spawn, pins| fence(spawn, &pins),
         )
         .await
     }
@@ -1045,6 +1045,31 @@ impl PipeProcess {
             deadline,
             cancelled,
             cancelled_signal,
+            move |spawn, pins| fence(spawn, &pins),
+        )
+        .await
+    }
+
+    /// Transfer actual launch custody by value to the original fenced
+    /// projection. The callback may retain it in a Process-owned capability.
+    pub async fn spawn_prepared_owned_fenced_until<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        outputs: Option<JobProcessOutputs>,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>, P) + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        let target = match outputs {
+            Some((stdout, stderr)) => SpawnOutputTarget::Job { stdout, stderr },
+            None => SpawnOutputTarget::None,
+        };
+        Self::spawn_prepared_fenced_inner(
+            launch,
+            target,
+            deadline,
+            cancelled,
+            cancelled_signal,
             fence,
         )
         .await
@@ -1056,7 +1081,7 @@ impl PipeProcess {
         deadline: Instant,
         cancelled: impl Fn() -> bool + Send + 'static,
         cancelled_signal: impl Future<Output = ()> + Send + 'static,
-        fence: impl FnOnce(SpawnOnce<'_>, &P) + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>, P) + Send + 'static,
     ) -> std::result::Result<Self, PipeLaunchFailure> {
         let PreparedPipeLaunch {
             command,
@@ -1068,7 +1093,7 @@ impl PipeProcess {
             deadline,
             cancelled,
             cancelled_signal,
-            move |spawn| fence(spawn, &pins),
+            move |spawn| fence(spawn, pins),
         );
         Self::spawn_command_inner(
             command,

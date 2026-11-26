@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: protected source/Vault disclosure custody and inherited history (this checkpoint; local parent `7be6b9ef59d3fe07f9c6b6f427570699ae57610f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: live provider-owned signing broker in original Process (this checkpoint; local parent `5941d9f9cdc5dc9ad7fff51ab7d88d3212cd4d9a`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1862,12 +1862,26 @@ Current implementation: protected source/Vault disclosure custody and inherited 
       shell subscription, principal/remote-start downgrade, remote-view
       reconnect and downgrade); no new failure identified. 278 distinct
       selected tests green; full Store suite remains not green.
-      **Next:** live provider-owned broker/socket revocation and protected
-      metadata/Views, manifest-preserving legacy transfer/export, general
-      independent source/provider share policy and remaining production
-      dispatch, reviewed containment/extension and host RPC/retention.
-      Bounded one-shot proof socket is not live broker; raw file/env and
-      arbitrary secret exposure remain held. No arbitrary shell CLI
+      **Live provider-owned Broker:** explicitly selected Broker grant
+      (distinct from one-shot Socket), Linux connected anonymous duplex
+      socket and bounded fixed-challenge request/reply in original
+      finite Process wait. No listener/task/second lifetime; actual
+      launch pins held until retirement, original cancellation probe
+      rechecked before response. Non-cloneable original effect live-use
+      fence, exact source/lease/ToolBinding/Actor/Store/provider/grant
+      held through synchronous response. Shared proof derivation,
+      reserved integration collision refusal, no arbitrary message/key
+      export. Actual provider and Store revoke cuts, direct+Graph
+      consumers, invalid request/cancel cleanup, existing independently
+      authorized metadata redaction revalidated. 300 selected locked/offline tests passed;
+      strict affected Clippy, durable/minimal all-target and scoped format/diff
+      checks passed. Prior five known full-Store failures were not rerun.
+      **Next:** remaining production Sandbox/Vault host RPC construction/
+      capture/restore and physical retention authority, reviewed
+      containment/extension dispatch, protected broader metadata/Views,
+      manifest-preserving legacy transfer/export and independent source/
+      provider share policy. Raw file/env and arbitrary secret exposure
+      remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant
@@ -1888,7 +1902,7 @@ Current implementation: protected source/Vault disclosure custody and inherited 
       attachment/recovery/abandonment, replacement/recovery/continuation
       and exact named/final-source release, plus authenticated unused-Sandbox
       Git source setter are landed; do not repeat.
-      Remaining Vault production Process dispatch, raw credential projection and live socket/broker, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
+      Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.

@@ -169,7 +169,7 @@ fn launch(
     let fence = control
         .as_mut()
         .and_then(|control| control.launch_fence.take());
-    spawn_fenced(&mut command, fence, || {
+    let mut spawned = spawn_fenced(&mut command, fence, || {
         if reply.is_closed() {
             return Err(Error::OwnerGone(
                 "process spawn caller disappeared before launch",
@@ -184,7 +184,14 @@ fn launch(
             }
         }
         Ok(())
-    })
+    })?;
+    // Transfer the original cancellation probe, only for a live request
+    // channel. Recheck at the response boundary, even if a synchronous
+    // provider operation was already in progress when cancellation arrived.
+    if let Some(socket) = spawned.request_socket.as_mut() {
+        socket.set_cancellation(control.map(|control| control.cancelled));
+    }
+    Ok(spawned)
 }
 
 pub(crate) async fn spawn(command: Command, control: Option<SpawnControl>) -> Result<Spawned> {

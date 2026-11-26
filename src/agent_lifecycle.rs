@@ -1128,6 +1128,15 @@ mod tests {
             "printf vault-direct > graph-vault-socket-direct; printf graph-direct-stdout"
         );
 
+        const VAULT_BROKER_GRAPH_COMMAND: &str = concat!(
+            r#"fd=$AW_VAULT_SIGNING_BROKER_FD; printf S >&"$fd" && IFS= read -r -u "$fd" first && [[ ${#first} == 64 && $first != *[!0-9a-f]* ]] || exit 41; printf S >&"$fd" && IFS= read -r -u "$fd" second && [[ $second == "$first" ]] || exit 42; "#,
+            "printf graph-vault > graph-vault-broker-created; printf graph-stdout; printf graph-stderr >&2"
+        );
+        const VAULT_BROKER_DIRECT_COMMAND: &str = concat!(
+            r#"fd=$AW_VAULT_SIGNING_BROKER_FD; printf S >&"$fd" && IFS= read -r -u "$fd" first && [[ ${#first} == 64 && $first != *[!0-9a-f]* ]] || exit 41; printf S >&"$fd" && IFS= read -r -u "$fd" second && [[ $second == "$first" ]] || exit 42; "#,
+            "printf vault-direct > graph-vault-broker-direct; printf graph-direct-stdout"
+        );
+
         // A reviewed fixed builtin-only fixture, NOT a general shell
         // containment driver. It never interprets arbitrary model text.
         struct FixedProcessDriver {
@@ -1241,7 +1250,9 @@ mod tests {
                     VaultProjection::Socket => {
                         (VAULT_SOCKET_GRAPH_COMMAND, VAULT_SOCKET_DIRECT_COMMAND)
                     }
-                    VaultProjection::Broker => return Err(Error::Denied("not a proof consumer")),
+                    VaultProjection::Broker => {
+                        (VAULT_BROKER_GRAPH_COMMAND, VAULT_BROKER_DIRECT_COMMAND)
+                    }
                 };
                 let command = if arguments == &json!({"command":graph}) {
                     graph
@@ -1393,7 +1404,8 @@ mod tests {
                             "interrupt-process-graph-success"
                             | "interrupt-process-graph-vault-success"
                             | "interrupt-process-graph-vault-file-success"
-                            | "interrupt-process-graph-vault-socket-success",
+                            | "interrupt-process-graph-vault-socket-success"
+                            | "interrupt-process-graph-vault-broker-success",
                             0,
                         ) => Some(ToolCall {
                             id: "graph-direct-process".into(),
@@ -1402,6 +1414,7 @@ mod tests {
                                 "interrupt-process-graph-vault-success" => VAULT_DIRECT_COMMAND,
                                 "interrupt-process-graph-vault-file-success" => VAULT_FILE_DIRECT_COMMAND,
                                 "interrupt-process-graph-vault-socket-success" => VAULT_SOCKET_DIRECT_COMMAND,
+                                "interrupt-process-graph-vault-broker-success" => VAULT_BROKER_DIRECT_COMMAND,
                                 _ => GRAPH_DIRECT_COMMAND,
                             }}),
                         }),
@@ -1409,7 +1422,8 @@ mod tests {
                             "interrupt-process-graph-success"
                             | "interrupt-process-graph-vault-success"
                             | "interrupt-process-graph-vault-file-success"
-                            | "interrupt-process-graph-vault-socket-success",
+                            | "interrupt-process-graph-vault-socket-success"
+                            | "interrupt-process-graph-vault-broker-success",
                             1,
                         )
                         | (
@@ -1445,6 +1459,9 @@ mod tests {
                                 "interrupt-process-graph-vault-socket-success"
                                 | "interrupt-process-graph-vault-socket-collision" => {
                                     (VAULT_SOCKET_GRAPH_COMMAND, "graph-vault-socket-created")
+                                }
+                                "interrupt-process-graph-vault-broker-success" => {
+                                    (VAULT_BROKER_GRAPH_COMMAND, "graph-vault-broker-created")
                                 }
                                 _ => (VAULT_GRAPH_COMMAND, "graph-vault-created"),
                             };
@@ -3062,16 +3079,23 @@ mod tests {
                 "interrupt-process-graph-vault-socket-success",
                 "graph-vault-socket-created",
             ),
+            #[cfg(target_os = "linux")]
+            (
+                24,
+                "interrupt-process-graph-vault-broker-success",
+                "graph-vault-broker-created",
+            ),
         ] {
             let strict = message_id == 15;
             let inspect = message_id == 16;
             let vault_case = message_id >= 17;
             let refused = strict || matches!(message_id, 17 | 18 | 20 | 22);
-            let mixed = matches!(message_id, 14 | 19 | 21 | 23);
+            let mixed = matches!(message_id, 14 | 19 | 21 | 23 | 24);
             use aw_agent_core::VaultProjection;
             let delivery = match message_id {
                 20 | 21 => VaultProjection::File,
                 22 | 23 => VaultProjection::Socket,
+                24 => VaultProjection::Broker,
                 _ => VaultProjection::Env,
             };
             let observed_terminal = Arc::new(AtomicBool::new(false));
@@ -3351,6 +3375,7 @@ mod tests {
                 let direct = repo.join(match delivery {
                     VaultProjection::File => "graph-vault-file-direct",
                     VaultProjection::Socket => "graph-vault-socket-direct",
+                    VaultProjection::Broker => "graph-vault-broker-direct",
                     _ => "graph-vault-direct",
                 });
                 if mixed {
@@ -3574,8 +3599,8 @@ mod tests {
             );
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
-        let descriptor_calls = if cfg!(target_os = "linux") { 6 } else { 0 };
-        let descriptor_turns = if cfg!(target_os = "linux") { 4 } else { 0 };
+        let descriptor_calls = if cfg!(target_os = "linux") { 8 } else { 0 };
+        let descriptor_turns = if cfg!(target_os = "linux") { 5 } else { 0 };
         assert_eq!(calls.load(Ordering::SeqCst), 26 + descriptor_calls);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
