@@ -1095,13 +1095,23 @@ mod tests {
                         .iter()
                         .filter(|m| m.role == Role::Tool)
                         .collect();
-                    let call = match results.len() {
-                        0 => Some(ToolCall {
+                    let call = match (messages[user].content.as_str(), results.len()) {
+                        ("interrupt-read-before-claim", 0) => Some(ToolCall {
+                            id: "no-start-read".into(),
+                            name: "read".into(),
+                            arguments: json!({"path":"tracked"}),
+                        }),
+                        ("interrupt-write-before-claim", 0) => Some(ToolCall {
+                            id: "no-start-write".into(),
+                            name: "write".into(),
+                            arguments: json!({"path":"not-started","content":"must not exist"}),
+                        }),
+                        (_, 0) => Some(ToolCall {
                             id: "read-fixture".into(),
                             name: "read".into(),
                             arguments: json!({"path":"tracked"}),
                         }),
-                        1 => {
+                        (_, 1) => {
                             assert!(
                                 results[0].content.contains("fixture data"),
                                 "{:?}",
@@ -1113,7 +1123,7 @@ mod tests {
                                 arguments: json!({"path":"created","content":"native actor"}),
                             })
                         }
-                        2 => {
+                        (_, 2) => {
                             sink("done")?;
                             None
                         }
@@ -1401,23 +1411,169 @@ mod tests {
         drop(host);
         drop(store);
 
-        // Same durable open intent and pending ciphertext, but no live grant.
+        // The fixture is the independent approving host. Every restart
+        // uses a fresh decision over the exact committed Sandbox.
+        let mut refresh = |store: &SessionStore| {
+            let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            assert!(current.rev > sandbox.rev);
+            assert_eq!(current.sources, sandbox.sources);
+            config["sandbox_rev"] = json!(current.rev);
+            fs::write(
+                approvals.join("git-native.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            provision(store)
+        };
+        let mut grant_rev = grant.revision;
+        for (tool, sequence) in [("read", 3), ("write", 4)] {
+            // Same durable open intent and pending ciphertext, no live grant.
+            let store =
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap();
+            assert!(store.activate(&owner, &session, &branch).is_err());
+            let host = refresh(&store);
+            assert!(build(&store, &host).is_err());
+            grant_rev = host.publish_grant(&manager, grant_rev).unwrap().revision;
+            let (mut agent, source) = build(&store, &host).unwrap();
+            let (view, journal) = store.activate_with_source(&source).unwrap();
+            let turn_id = view.history.next_turn_id;
+            agent
+                .load_history(view.history, Some(Arc::new(journal)))
+                .unwrap();
+            let actor = actor_owner::Service::attach_for_agent_with_source(
+                store.clone(),
+                &agent,
+                source.clone(),
+            )
+            .unwrap();
+            let request_id = format!("fixture:no-start-{tool}");
+            actor
+                .enqueue_bound_text(
+                    &agent,
+                    &request_id,
+                    sequence,
+                    aw_store::QueueTarget::Auto,
+                    -1,
+                    &format!("interrupt-{tool}-before-claim"),
+                )
+                .unwrap();
+            assert_eq!(
+                actor
+                    .admit_next_queued(&agent)
+                    .unwrap()
+                    .unwrap()
+                    .request
+                    .request_id,
+                request_id,
+            );
+            let before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            // Lose the actual Actor immediately after the real journal
+            // acknowledgement, before the fixed native route is polled.
+            // No fake journal row, driver receipt, or production fault hook.
+            let task = tokio::spawn(async move {
+                actor
+                    .run_once(&mut agent, |event| {
+                        if let aw_agent_core::AgentEvent::ToolStarted { record, .. } = event {
+                            assert_eq!(record.call.name, tool);
+                            panic!("fixture lost original Actor after intent");
+                        }
+                        Ok(())
+                    })
+                    .await
+            });
+            let panic = task
+                .await
+                .expect_err("fixture must lose Actor")
+                .into_panic();
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"fixture lost original Actor after intent")
+            );
+            assert_eq!(
+                store
+                    .actor_queue_fact(&owner, &session, &request_id)
+                    .unwrap()
+                    .state,
+                aw_store::QueueState::Accepted,
+            );
+            assert_eq!(
+                store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
+                before,
+            );
+            drop(source);
+            drop(host);
+            drop(store);
+
+            // Actual exclusive Store restart reconstructs the original
+            // interrupted intent without requiring a live source approval.
+            let store =
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap();
+            let interrupted = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap();
+            let original = interrupted.history.turns.last().unwrap();
+            assert_eq!(original.id, turn_id);
+            assert_eq!(original.outcome, aw_agent_core::Outcome::Failed);
+            assert_eq!(original.tool_records.len(), 1);
+            assert_eq!(
+                original.tool_records[0].status,
+                aw_agent_core::ToolStatus::Interrupted
+            );
+            assert_eq!(original.invocations.len(), 1);
+            assert_eq!(interrupted.history.needs_reconciliation, tool == "write");
+            assert!(store
+                .sandbox_recover_tool_source_effect(
+                    &manager,
+                    &reference,
+                    turn_id,
+                    &original.tool_records[0].call.id,
+                    |_| panic!("unclaimed intent has no physical recovery custody"),
+                )
+                .is_err());
+            let result = store
+                .reconcile_native_turn(&manager, &reference, turn_id)
+                .unwrap();
+            assert_eq!(result.source_effects, 0);
+            assert_eq!(result.unclaimed_no_start, 1);
+            assert_eq!(result.hazard_cleared, tool == "write");
+            assert_eq!(result.input, aw_store::InputAdmissionState::Inspected);
+            assert_eq!(result.queue, Some(aw_store::QueueState::Inspected));
+            assert!(result.changed);
+            let replay = store
+                .reconcile_native_turn(&manager, &reference, turn_id)
+                .unwrap();
+            assert_eq!(replay.unclaimed_no_start, 1);
+            assert!(!replay.changed);
+            assert!(!replay.hazard_cleared);
+            let settled = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(settled.history.turns.last().unwrap()).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+            assert!(!settled.history.needs_reconciliation);
+            assert_eq!(
+                store
+                    .actor_queue_fact(&owner, &session, "fixture:next")
+                    .unwrap()
+                    .state,
+                aw_store::QueueState::Pending,
+            );
+            assert_eq!(
+                store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
+                before
+            );
+            assert!(!repo.join("not-started").exists());
+            assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
-        assert!(store.activate(&owner, &session, &branch).is_err());
-        // The fixture is the independent approving host. Observe the
-        // committed write's new Sandbox revision before approving again.
-        let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
-        assert!(current.rev > sandbox.rev);
-        assert_eq!(current.sources, sandbox.sources);
-        config["sandbox_rev"] = json!(current.rev);
-        fs::write(
-            approvals.join("git-native.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-        let host = provision(&store);
+        let host = refresh(&store);
         assert!(build(&store, &host).is_err());
-        host.publish_grant(&manager, grant.revision).unwrap();
+        host.publish_grant(&manager, grant_rev).unwrap();
         let router = Arc::new(agent_jobs::Router::new(store.clone(), owner.clone(), 8).unwrap());
         let activation = HostAgentActivation::new(
             store.clone(),
@@ -1435,8 +1591,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 2
-                            && v.history.turns[1].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 4
+                            && v.history.turns[3].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -1446,7 +1602,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

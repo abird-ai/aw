@@ -1014,7 +1014,7 @@ pub fn configure(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
-    Ok(configure_inner(builder, actor, options, None, false)?.builder)
+    Ok(configure_inner(builder, actor, options, None, None)?.builder)
 }
 
 pub struct ConfiguredLocalTools {
@@ -1031,7 +1031,7 @@ pub fn configure_with_runtime(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<ConfiguredLocalTools> {
-    configure_inner(builder, actor, options, None, false)
+    configure_inner(builder, actor, options, None, None)
 }
 
 /// Apply metadata hooks and configured limits through the original AW Agent
@@ -1044,7 +1044,7 @@ pub fn configure_with_toolset(
 ) -> Result<AgentBuilder> {
     let mut configured = options.clone();
     configured.limits = options.limits.with_toolset(toolset);
-    Ok(configure_inner(builder, actor, &configured, Some(toolset), false)?.builder)
+    Ok(configure_inner(builder, actor, &configured, Some(toolset), None)?.builder)
 }
 /// Register only explicit canonical native tools through the existing
 /// router/policy owner, without opening or reconciling a workspace root.
@@ -1054,8 +1054,9 @@ pub fn configure_routed_native(
     builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
+    route: Arc<dyn operation_router::OperationRouter>,
 ) -> Result<AgentBuilder> {
-    Ok(configure_inner(builder, actor, options, None, true)?.builder)
+    Ok(configure_inner(builder, actor, options, None, Some(route))?.builder)
 }
 
 fn configure_inner(
@@ -1063,9 +1064,9 @@ fn configure_inner(
     actor: PrincipalId,
     options: &LocalToolOptions,
     catalog: Option<&aw_tools::toolset::Toolset>,
-    routed_native: bool,
+    native_route: Option<Arc<dyn operation_router::OperationRouter>>,
 ) -> Result<ConfiguredLocalTools> {
-    if routed_native
+    if native_route.is_some()
         && (options.selected_tools.is_empty()
             || options.process_input
             || options.allow_agent_graph
@@ -1203,7 +1204,7 @@ fn configure_inner(
     builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
         ceiling: effective_concurrency.parallelism,
     }));
-    if routed_native {
+    if let Some(route) = native_route {
         let mut available = BTreeSet::new();
         let mut offered = OfferContext {
             selected: &selected,
@@ -1214,7 +1215,11 @@ fn configure_inner(
             catalog,
         };
         for tool in active_tools {
-            builder = offer(builder, RoutedNativeTool { tool, limits }, &mut offered)?;
+            let fixed = operation_router::RoutedTool::fixed(
+                Arc::new(RoutedNativeTool { tool, limits }),
+                route.clone(),
+            )?;
+            builder = offer_unrouted_shared(builder, Arc::new(fixed), &mut offered)?;
         }
         return Ok(ConfiguredLocalTools {
             builder: builder.tool_policy(policy),

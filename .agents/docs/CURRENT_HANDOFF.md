@@ -26,7 +26,86 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: exact whole-Run native recovery and Input/queue disposition
+## Latest local implementation delta — 2026-11-26: original claim-gated native no-start recovery
+
+Parent `7ea0980b07fc9e14556d284435fd7dbf5bb96140` (reconciled handoff;
+previous implementation `a747e78`). Published AW main remains `7b92686`.
+L5, clean at entry; Store v60, Git recovery v4, product 0.15.0 unchanged.
+
+- Positive original dispatch evidence, not an absent-claim heuristic:
+  `ToolClaimRoute::NativeSourceV1` is the versioned trusted-host executor
+  contract captured with the exact registered native Read/Write binding.
+  Only the fixed, non-replaceable original native route advertises it;
+  mutable router slots and ambient fallback never do. Native-only
+  registration binds the actual SourceFilesystemRoute directly through
+  the original adapter, with no second Tool/Process owner. Registry
+  revalidation includes the contract. The real source executor still
+  commits its existing complete-set barrier and original source-effect
+  claim before native worker execution.
+- The source-aware SQLite journal stamps the optional claim-route fact
+  into the immutable original ToolStarted source evidence in its original
+  admission transaction, using the live exact source execution binding.
+  Both SQLite and JSONL reject caller-supplied claim-route evidence.
+  Ordinary and legacy evidence deserializes with no marker; existing
+  claimed effects still use original source identity/release, and marked
+  effect admission checks the route against the live binding. This is
+  additive journal evidence, not a grant, an extra durable receipt, or
+  a new database schema. Old strict readers are not promised downgrade
+  compatibility with newly marked journal records.
+- Reuse the bounded original native-intent scan in exclusive owner
+  startup and terminal whole-Run reconciliation. An unclaimed original
+  direct native Read/Write is provably no-start only with its recorded
+  fixed route, no claim, no quiescence/release fact, no contradictory
+  original source-mutation lease and no successful terminal receipt.
+  Existing exact Run/Actor/Input/Store scope, original writer epoch,
+  current bound Git layout, hazard identity and terminal attachment gates
+  still apply. Unmarked, revised, unsupported, foreign or contradictory
+  intents remain held. Startup can attach the exact interrupted original
+  Run; it does not admit another Input. Terminal reconciliation requires
+  an exact ToolFinished or original interrupted Turn and every claimed
+  intent's positive original release. Interrupted read-only no-start
+  needs no write hazard, while interrupted write retains its original
+  possible_effect/hazard until whole-Run reconciliation.
+- `native-turn-reconcile` now reports `unclaimed_no_start` independently
+  from `source_effects` (actual released claims). Original Input/queue
+  disposition, idempotent payload retirement and exact hazard clearance
+  remain in the same owner transaction. No manufactured physical release,
+  automatic replay, provider/Turn rewrite, Sandbox revision, or new
+  approval/grant. The per-effect physical recovery consumer cannot take
+  custody of a never-claimed intent. Subsequent pending work still
+  requires fresh approved live execution.
+- Extend the real Git/Store/Actor lifecycle fixture: lose the Actor task
+  at its actual ToolStarted observer, after durable intent acknowledgement
+  but before native worker execution, for read and write separately.
+  Drop/reopen the exclusive Store, require original Interrupted Turn,
+  preserve immutable provider/Turn and pending Input, reject per-effect
+  recovery, settle original Input/queue as Inspected, clear only original
+  write hazard, replay without change, leave Sandbox/index/files unchanged,
+  then fresh grant executes only the later pending Input. No synthetic
+  journal rows or production fault hooks. This exercises exact task loss
+  and Store restart, not OS kill inside native filesystem mutation or at
+  this new pre-claim boundary. Retain the prior real process-kill executable
+  regression for already-claimed native effects. Existing router and
+  journal groups test fixed routing after slot clear and rejection of
+  forged trusted-host route proof.
+
+Validation (L5 Rust 1.95.0, locked/offline, final source): Agent lifecycle
+3/3 (11.44s), actual native_source_rpc 1/1 (18.44s), Host native/Process
+2/2, core journal 14/14, router 3/3, JSONL provenance 1/1 and SQLite
+provenance 1/1. Strict all-feature/all-target Clippy across core, adapter,
+Host, Store, JSONL and CLI passed. Durable-only and minimal all-target
+checks passed with feature-specific dead-code warnings. Actual CLI
+version/help, scoped rustfmt and diff checks passed. The initial CLI
+binary filter selected zero tests; the corrected library run above is
+actual Actor lifecycle evidence. Full workspace suite, pinned Nix and
+other native-platform qualification were not repeated.
+
+Next: exact linked Git checkout artifact/identity proof, independent
+Process quiescence and containment/recovery. Legacy unmarked native
+intents and unsupported Process/Graph/Job/participant routes remain held;
+no generic no-start promotion or phase promotion. Frozen dotlink unchanged.
+
+## Previous local implementation delta — 2026-11-26: exact whole-Run native recovery and Input/queue disposition
 
 Parent `7b5dae500bcf19e1af98c92eedc1e31256eb12fd` (pre-tool restart
 and native artifact recovery). Published AW main remains `7b92686`.

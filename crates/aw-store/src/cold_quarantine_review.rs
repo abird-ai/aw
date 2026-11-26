@@ -814,7 +814,8 @@ mod recent_correctness_review_tests {
                     source: Some(ToolSourceEvidence {
                         kind: "host".into(),
                         id: "trusted-host".into(),
-                        epoch: 0
+                        epoch: 0,
+                        claim_route: None,
                     }),
                 })
                 .unwrap(),

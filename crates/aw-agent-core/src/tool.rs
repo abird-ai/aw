@@ -413,8 +413,21 @@ impl ToolContext {
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>>;
+/// Versioned trusted executor contract, not a tool grant. A native-source
+/// V1 executor cannot perform a source operation before its original durable
+/// Sandbox claim commits. A replaceable or fallback route must not advertise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolClaimRoute {
+    NativeSourceV1,
+}
+
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Factual dispatch contract of this exact registered implementation.
+    fn claim_route(&self) -> Option<ToolClaimRoute> {
+        None
+    }
     /// Trusted host-selected model-visible result ceiling captured at tool
     /// registration. This is resource/presentation metadata, never authority.
     fn result_ceiling_bytes(&self) -> usize {
@@ -457,6 +470,7 @@ pub struct ToolBindingSnapshot {
     pub authority_revision: u64,
     pub source: ToolSource,
     pub effect: ToolEffect,
+    pub claim_route: Option<ToolClaimRoute>,
     pub execution_site: String,
 }
 
@@ -712,6 +726,7 @@ pub(crate) struct RegisteredTool {
     source: ToolSource,
     result_ceiling_bytes: usize,
     registered_revision: u64,
+    claim_route: Option<ToolClaimRoute>,
 }
 impl RegisteredTool {
     fn capability(&self) -> Result<Capability<'_>> {
@@ -743,6 +758,15 @@ impl ToolRegistry {
         source: ToolSource,
     ) -> Result<String> {
         let spec = tool.spec();
+        let claim_route = tool.claim_route();
+        if claim_route.is_some()
+            && (source != ToolSource::trusted_host()
+                || !matches!(spec.effect, ToolEffect::Read | ToolEffect::Write))
+        {
+            return Err(Error::Denied(
+                "claim-gated route requires a trusted native effect",
+            ));
+        }
         let result_ceiling_bytes = tool.result_ceiling_bytes();
         let max_result_ceiling = if source.kind == SourceKind::Host {
             MAX_AGENT_TOOL_RESULT_BYTES
@@ -796,6 +820,7 @@ impl ToolRegistry {
                 source,
                 result_ceiling_bytes,
                 registered_revision: next_revision,
+                claim_route,
             },
         );
         self.revision = next_revision;
@@ -838,6 +863,9 @@ impl ToolRegistry {
     }
     pub fn source_of(&self, name: &str) -> Option<&ToolSource> {
         self.tools.get(name).map(|item| &item.source)
+    }
+    fn claim_route_of(&self, name: &str) -> Option<ToolClaimRoute> {
+        self.tools.get(name).and_then(|item| item.claim_route)
     }
     pub fn effect_of(&self, name: &str) -> Option<&ToolEffect> {
         self.tools.get(name).map(|item| &item.spec.effect)
@@ -915,6 +943,7 @@ fn revalidate_binding_view(
         || binding.execution_site != view.policy.execution_site
         || view.registry.source_of(&binding.name) != Some(&binding.source)
         || view.registry.effect_of(&binding.name) != Some(&binding.effect)
+        || view.registry.claim_route_of(&binding.name) != binding.claim_route
         || !view.registry.allows(actor, &view.policy, &binding.name)
     {
         return Err(Error::Denied("captured tool binding is no longer live"));
@@ -1070,6 +1099,7 @@ impl ToolBindingAuthority {
                 authority_revision,
                 source,
                 effect,
+                claim_route: view.registry.claim_route_of(name),
                 execution_site: view.policy.execution_site.clone(),
             });
         }
@@ -1113,6 +1143,7 @@ impl ToolBindingAuthority {
             authority_revision,
             source,
             effect,
+            claim_route: view.registry.claim_route_of(name),
             execution_site: view.policy.execution_site.clone(),
         })
     }

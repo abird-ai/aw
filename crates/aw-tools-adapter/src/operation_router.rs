@@ -19,6 +19,11 @@ use std::{
 /// Host-private route for one exact original semantic operation. Implementations
 /// must revalidate all policy/delegate/payer/disclosure authority themselves.
 pub trait OperationRouter: Send + Sync {
+    /// Only a fixed, trusted route may publish this contract to the registry.
+    fn claim_route(&self, _operation: OperationId) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+        None
+    }
+
     fn execute<'a>(
         &'a self,
         operation: OperationId,
@@ -459,11 +464,24 @@ pub(crate) struct RoutedTool {
     original: Arc<dyn Tool>,
     operation: OperationId,
     spec: ToolSpec,
-    router: Arc<OperationRouterSlot>,
+    router: Route,
+}
+
+enum Route {
+    Slot(Arc<OperationRouterSlot>),
+    Fixed(Arc<dyn OperationRouter>),
 }
 
 impl RoutedTool {
     pub(crate) fn new(original: Arc<dyn Tool>, router: Arc<OperationRouterSlot>) -> Result<Self> {
+        Self::with_route(original, Route::Slot(router))
+    }
+
+    pub(crate) fn fixed(original: Arc<dyn Tool>, router: Arc<dyn OperationRouter>) -> Result<Self> {
+        Self::with_route(original, Route::Fixed(router))
+    }
+
+    fn with_route(original: Arc<dyn Tool>, router: Route) -> Result<Self> {
         let spec = original.spec();
         let operation = OperationId::from_model_name(&spec.name).ok_or(Error::Denied(
             "registered local tool has no canonical OperationId",
@@ -492,6 +510,13 @@ impl Tool for RoutedTool {
         self.spec.clone()
     }
 
+    fn claim_route(&self) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+        match &self.router {
+            Route::Fixed(router) => router.claim_route(self.operation),
+            Route::Slot(_) => None,
+        }
+    }
+
     fn is_available(&self) -> bool {
         self.original.is_available()
     }
@@ -506,7 +531,7 @@ impl Tool for RoutedTool {
 
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         let original = self.original.clone();
-        let router = self.router.clone();
+        let router = &self.router;
         let operation = self.operation;
         Box::pin(async move {
             if operation == OperationId::Batch && ctx.execution_scope.is_some() {
@@ -514,9 +539,12 @@ impl Tool for RoutedTool {
                     "batch cannot start while this work is owned by an active Graph node",
                 ));
             }
-            match router.current()? {
-                Some(router) => router.execute(operation, ctx, arguments, original).await,
-                None => original.execute(ctx, arguments).await,
+            match router {
+                Route::Fixed(router) => router.execute(operation, ctx, arguments, original).await,
+                Route::Slot(slot) => match slot.current()? {
+                    Some(router) => router.execute(operation, ctx, arguments, original).await,
+                    None => original.execute(ctx, arguments).await,
+                },
             }
         })
     }
@@ -711,10 +739,17 @@ mod tests {
         let router_calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(std::sync::Mutex::new(None));
         let slot = Arc::new(OperationRouterSlot::default());
-        slot.replace(Arc::new(Router {
+        let router = Arc::new(Router {
             calls: router_calls.clone(),
             seen: seen.clone(),
-        }))
+        });
+        slot.replace(router.clone()).unwrap();
+        let fixed = RoutedTool::fixed(
+            Arc::new(Echo {
+                calls: original_calls.clone(),
+            }),
+            router,
+        )
         .unwrap();
         let routed = RoutedTool::new(
             Arc::new(Echo {
@@ -737,5 +772,8 @@ mod tests {
         routed.execute(context(), &args).await.unwrap();
         assert_eq!(router_calls.load(Ordering::SeqCst), 1);
         assert_eq!(original_calls.load(Ordering::SeqCst), 2);
+        fixed.execute(context(), &args).await.unwrap();
+        assert_eq!(router_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(original_calls.load(Ordering::SeqCst), 3);
     }
 }

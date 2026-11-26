@@ -1561,6 +1561,11 @@ impl TurnJournal for JsonlCursor {
                 JournalEntry::ToolStarted { record, source } => {
                     record.call.validate_envelope()?;
                     if let Some(source) = source {
+                        if source.claim_route.is_some() {
+                            return Err(Error::Denied(
+                                "claim route evidence belongs to the original source journal",
+                            ));
+                        }
                         source.validate()?;
                     }
                     if record.status != aw_agent_core::ToolStatus::Running
@@ -2005,19 +2010,26 @@ mod tests {
         // execution merely by selecting the right tool name/arguments.
         for source in [
             aw_agent_core::ToolSourceEvidence {
+                claim_route: Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1),
+                ..aw_agent_core::ToolSourceEvidence::trusted_host()
+            },
+            aw_agent_core::ToolSourceEvidence {
                 kind: "unknown".into(),
                 id: "trusted-host".into(),
                 epoch: 1,
+                claim_route: None,
             },
             aw_agent_core::ToolSourceEvidence {
                 kind: "extension".into(),
                 id: "foreign".into(),
                 epoch: 9,
+                claim_route: None,
             },
             aw_agent_core::ToolSourceEvidence {
                 kind: "host".into(),
                 id: "trusted-host".into(),
                 epoch: 2,
+                claim_route: None,
             },
         ] {
             assert!(futures_lite::future::block_on(journal.append(

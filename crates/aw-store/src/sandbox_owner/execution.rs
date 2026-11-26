@@ -283,18 +283,20 @@ impl SandboxExecutionGuard<'_> {
         effect: &ToolEffect,
         site: &str,
         source: Option<&ToolSourceEvidence>,
-    ) -> Result<()> {
-        if !self.execution.bindings.iter().any(|binding| {
-            binding.name == name
-                && &binding.effect == effect
-                && binding.execution_site == site
-                && source == Some(&ToolSourceEvidence::from_source(&binding.source))
-        }) {
-            return Err(Error::Denied(
+    ) -> Result<Option<aw_agent_core::tool::ToolClaimRoute>> {
+        self.execution
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.name == name
+                    && &binding.effect == effect
+                    && binding.execution_site == site
+                    && source == Some(&ToolSourceEvidence::from_source(&binding.source))
+            })
+            .map(|binding| binding.claim_route)
+            .ok_or(Error::Denied(
                 "source execution tool differs from original native route",
-            ));
-        }
-        Ok(())
+            ))
     }
 }
 

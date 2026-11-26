@@ -5892,26 +5892,36 @@ async fn v33_denied_and_revised_tool_events_are_effect_free_and_source_pinned() 
     record.call = revised;
     // SourceEvidence is factually pinned by the original Agent and cannot
     // contradict the already source-granted host revision or be malformed.
+    // Route evidence is stamped only by the original source-aware journal,
+    // not by a caller that supplies an otherwise exact trusted-host source.
     for source in [
+        ToolSourceEvidence {
+            claim_route: Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1),
+            ..ToolSourceEvidence::trusted_host()
+        },
         ToolSourceEvidence {
             kind: "host".into(),
             id: "trusted-host".into(),
             epoch: 0,
+            claim_route: None,
         },
         ToolSourceEvidence {
             kind: "unknown".into(),
             id: "trusted-host".into(),
             epoch: 1,
+            claim_route: None,
         },
         ToolSourceEvidence {
             kind: "extension".into(),
             id: "untrusted".into(),
             epoch: 7,
+            claim_route: None,
         },
         ToolSourceEvidence {
             kind: "host".into(),
             id: "trusted-host".into(),
             epoch: 2,
+            claim_route: None,
         },
     ] {
         assert!(handle

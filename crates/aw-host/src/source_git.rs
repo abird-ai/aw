@@ -14,7 +14,6 @@ use crate::{
 use aw_agent_core::{
     Agent, AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
     SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext, ToolEffect,
-    ToolSourceEvidence,
 };
 use aw_git::{
     source_driver::{GitSourceDriver, GitSourceFreeLayout, GitSourceLocation},
@@ -661,7 +660,7 @@ impl GitNativeSourceResolver {
                 };
                 if &recovery.driver != expected_driver
                     || recovery.original.effect != effect
-                    || recovery.source != ToolSourceEvidence::trusted_host()
+                    || !recovery.source.is_trusted_host()
                     || tool == FsTool::Remove
                 {
                     return Err(Error::Denied(
@@ -940,10 +939,8 @@ impl GitNativeSourceHost {
                 "Git native host cannot replace another operation router",
             ));
         }
-        // A fresh slot belongs to this exact builder, not to the reusable
-        // options or a failed/retried activation.
-        let mut options = options.clone();
-        options.operation_router = Arc::new(Default::default());
+        // The native executor is fixed to this builder; reusable options
+        // cannot replace or clear the original claim-gated route.
         let host = self.clone();
         let route = Arc::new(SourceFilesystemRoute::new(
             store.clone(),
@@ -954,6 +951,6 @@ impl GitNativeSourceHost {
             options.limits,
             move |ctx, tool| host.resolve(ctx, tool),
         )?);
-        route.configure(builder, actor, &options)
+        route.configure(builder, actor, options)
     }
 }

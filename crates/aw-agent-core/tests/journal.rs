@@ -589,6 +589,7 @@ fn aw_p6_10e_original_tool_source_evidence_is_bounded_backward_readable_and_non_
             kind: kind.into(),
             id: id.into(),
             epoch,
+            claim_route: None,
         }
         .validate()
         .is_err());

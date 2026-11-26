@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact whole-Run native recovery and Input/queue disposition (this checkpoint; local parent `7b5dae500bcf19e1af98c92eedc1e31256eb12fd`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: original claim-gated native no-start recovery (this checkpoint; local parent `7ea0980b07fc9e14556d284435fd7dbf5bb96140`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1677,8 +1677,25 @@ Current implementation: exact whole-Run native recovery and Input/queue disposit
       durable/minimal targets, full executable/version/help,
       scoped fmt/diff passed. Signed `a747e78`; independent locked/offline
       all-feature executable native_source_rpc rerun 1/1 (19.82s).
-      **Next:** unclaimed intent proof, linked-layout and independent
-      Process recovery proof. Separately qualify legacy participant
+      **Original native no-start proof landed:** fixed claim-gated native
+      route contract in exact registered binding, original source journal
+      stamps optional ToolStarted route fact; reject caller-supplied proof.
+      Never infer no-start from missing claim alone. Exact original
+      marked intent with no contradictory custody/success can attach on
+      owner restart and reconcile through the same whole-Run owner;
+      actual claims still require original positive release. Unmarked and
+      unsupported intents refuse. Report no-start count separately; no
+      physical release fabrication, history rewrite or new grant. Real
+      Actor task loss after intent acknowledgement before read/write
+      worker, actual exclusive Store restart, immutable Turn and queue
+      disposition, exact replay and fresh-granted later Input only.
+      Agent lifecycle 3/3, executable recovery 1/1, Host native/Process
+      2/2, core journal 14/14, router 3/3, SQLite/JSONL provenance 1/1 each;
+      strict affected Clippy, durable/minimal checks, actual version/help
+      and scoped fmt/diff passed.
+      **Next:** linked-layout and independent Process recovery proof;
+      unmarked legacy native/Process no-start remains held. Separately
+      qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

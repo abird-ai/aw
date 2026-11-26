@@ -730,7 +730,13 @@ impl SessionHandle {
         *cursor = next;
         Ok(())
     }
-    fn append_sync(&self, turn_id: u64, entry: JournalEntry) -> Result<()> {
+    fn append_sync(&self, turn_id: u64, mut entry: JournalEntry) -> Result<()> {
+        if matches!(&entry, JournalEntry::ToolStarted { source: Some(evidence), .. } if evidence.claim_route.is_some())
+        {
+            return Err(Error::Denied(
+                "claim route evidence belongs to the original source journal",
+            ));
+        }
         let starts = matches!(
             &entry,
             JournalEntry::AuthoritySegmentStarted { .. }
@@ -771,7 +777,7 @@ impl SessionHandle {
             workspace_writer::verify_writer_epoch_for_session(&tx, &self.session, admitted_epoch)?;
             if let Some(source) = source.as_ref() {
                 source.require_in(&tx, &actor, &self.session, &branch.id, false)?;
-                match &entry {
+                match &mut entry {
                     JournalEntry::AuthoritySegmentStarted { segment }
                         if segment.boundary != AuthorityBoundaryKind::Input =>
                     {
@@ -782,12 +788,19 @@ impl SessionHandle {
                     JournalEntry::ToolStarted {
                         record,
                         source: evidence,
-                    } => source.require_tool(
-                        &record.call.name,
-                        &record.effect,
-                        &record.execution_site,
-                        evidence.as_ref(),
-                    )?,
+                    } => {
+                        let route = source.require_tool(
+                            &record.call.name,
+                            &record.effect,
+                            &record.execution_site,
+                            evidence.as_ref(),
+                        )?;
+                        // The immutable record and its route proof commit together,
+                        // before any native effect claim or worker can start.
+                        if let Some(evidence) = evidence {
+                            evidence.claim_route = route;
+                        }
+                    }
                     JournalEntry::ToolRevised { .. } => {
                         return Err(Error::Denied(
                             "native source argument revision is not enabled",

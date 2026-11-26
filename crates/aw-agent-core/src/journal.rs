@@ -27,6 +27,10 @@ pub struct ToolSourceEvidence {
     pub kind: String,
     pub id: String,
     pub epoch: u64,
+    /// Stamped by the original durable source journal from its exact live
+    /// registered route. Missing on legacy or ordinary intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_route: Option<crate::tool::ToolClaimRoute>,
 }
 impl ToolSourceEvidence {
     pub fn from_source(source: &ToolSource) -> Self {
@@ -39,12 +43,30 @@ impl ToolSourceEvidence {
             .into(),
             id: source.id.clone(),
             epoch: source.epoch,
+            claim_route: None,
         }
     }
     pub fn trusted_host() -> Self {
         Self::from_source(&ToolSource::trusted_host())
     }
+    /// Compare source identity independently from the factual dispatch contract.
+    pub fn matches_source(&self, source: &ToolSource) -> bool {
+        let kind = match source.kind {
+            SourceKind::Host => "host",
+            SourceKind::Mcp => "mcp",
+            SourceKind::Extension => "extension",
+        };
+        self.kind == kind && self.id == source.id && self.epoch == source.epoch
+    }
+    pub fn is_trusted_host(&self) -> bool {
+        self.matches_source(&ToolSource::trusted_host())
+    }
     pub fn validate(&self) -> Result<()> {
+        if self.claim_route.is_some() && !self.is_trusted_host() {
+            return Err(Error::Denied(
+                "claim-gated route requires trusted host source",
+            ));
+        }
         let kind = match self.kind.as_str() {
             "host" => SourceKind::Host,
             "mcp" => SourceKind::Mcp,

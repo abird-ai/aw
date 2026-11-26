@@ -265,8 +265,13 @@ where
                 "source route belongs to another tool authority or limit selection",
             ));
         }
-        let builder = aw_tools_adapter::configure_routed_native(builder, actor, options)?;
-        options.operation_router.install(self.clone())?;
+        if options.operation_router.is_installed()? {
+            return Err(Error::Denied(
+                "native source route cannot replace another router",
+            ));
+        }
+        let builder =
+            aw_tools_adapter::configure_routed_native(builder, actor, options, self.clone())?;
         Ok(builder.shared_extension(self))
     }
 
@@ -417,6 +422,15 @@ where
     A: SandboxEffectAuthority + Send + 'static,
     F: Fn(&ToolContext, FsTool) -> Result<NativeSourceAdmission<A>> + Send + Sync + 'static,
 {
+    fn claim_route(&self, operation: OperationId) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+        match operation {
+            OperationId::Fs(tool) if tool != FsTool::Remove => {
+                Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
+            }
+            _ => None,
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         operation: OperationId,

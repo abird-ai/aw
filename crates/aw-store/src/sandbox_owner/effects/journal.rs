@@ -218,7 +218,11 @@ pub(super) fn admit_in(
         || observed.record.call.name != binding.name
         || observed.record.effect != binding.effect
         || observed.record.execution_site != binding.execution_site
-        || observed.source != ToolSourceEvidence::from_source(&binding.source)
+        || !observed.source.matches_source(&binding.source)
+        || observed
+            .source
+            .claim_route
+            .is_some_and(|route| Some(route) != binding.claim_route)
         || (binding.effect == ToolEffect::Read
             && request
                 .sources
@@ -391,6 +395,14 @@ fn terminal_in(
     c: &Connection,
     observed: &Observation,
 ) -> Result<(SandboxToolTerminalRef, ToolRecord)> {
+    terminal_in_with(c, observed, true)
+}
+
+fn terminal_in_with(
+    c: &Connection,
+    observed: &Observation,
+    require_reconciliation: bool,
+) -> Result<(SandboxToolTerminalRef, ToolRecord)> {
     if let Some((seq, record)) = &observed.terminal {
         return Ok((SandboxToolTerminalRef::ToolFinished(*seq), record.clone()));
     }
@@ -419,7 +431,7 @@ fn terminal_in(
         .map_err(|_| Error::Storage("invalid original settled Run Turn"))?;
     if turn.id != observed.intent.turn_id
         || turn.outcome == Outcome::Completed
-        || !turn.needs_reconciliation
+        || (require_reconciliation && !turn.needs_reconciliation)
     {
         return Err(Error::Conflict(
             "original Turn did not preserve interrupted effect",
@@ -687,29 +699,45 @@ fn direct_run_in(
     })
 }
 
-/// No unclaimed ToolStarted (even read-only) is inferred to be no-start.
-fn require_pre_tool_run_in(
+/// Exclusive restart without a claim: exact pre-tool Run or an original
+/// fixed native route whose durable intent proves the claim-before-effect gate.
+fn require_unclaimed_run_in(
     c: &Connection,
     session: &str,
     branch: &str,
     run: &str,
     turn: u64,
 ) -> Result<()> {
-    let pre_tool: bool = db(c.query_row(
-        "SELECT r.possible_effect=0
-           AND NOT EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled')
-           AND NOT EXISTS(SELECT 1 FROM run_events e WHERE e.run_id=r.id
-                          AND e.kind IN ('tool_started','tool_finished','tool_revised'))
+    let (possible, hazard): (bool, bool) = db(c.query_row(
+        "SELECT r.possible_effect,
+           EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled')
          FROM runs r WHERE r.id=?1",
         [run],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     ))?;
-    if !pre_tool {
-        return Err(Error::Denied(
-            "unresolved Run lacks original source custody",
+    let original = direct_run_in(c, session, branch, run, turn)?;
+    let reference = agent_owner::canonical_ref(c, AgentKey::new(session, branch))?;
+    let (count, writes) = run_recovery::inspect_native_intents(
+        c,
+        run,
+        &reference,
+        turn,
+        &original.actor,
+        |observed| run_recovery::require_unclaimed_no_start(c, observed),
+    )?;
+    if writes != possible || (!writes && hazard) {
+        return Err(Error::Conflict(
+            "original unclaimed Run hazard differs from its intents",
         ));
     }
-    direct_run_in(c, session, branch, run, turn)?;
+    if count != 0 {
+        let (_, _, sandbox, _, _) = super::super::agent_project_and_layout(c, session, branch)?;
+        let sandbox = super::super::snapshot_with_sources(
+            c,
+            &sandbox.ok_or(Error::Denied("original native Run has no Sandbox"))?,
+        )?;
+        run_recovery::require_git_layout(&sandbox)?;
+    }
     Ok(())
 }
 
@@ -718,7 +746,7 @@ pub use run_recovery::NativeTurnReconciliation;
 
 /// Exclusive owner restart may expose source-bearing metadata for
 /// original journal recovery. Each unresolved Run must have its own
-/// original source custody, or prove the exact direct pre-tool Input.
+/// original source custody, or prove the exact direct pre-tool/claim-gated Input.
 /// This is not new admission or physical proof, and does not require
 /// an installed SourceDriver.
 pub(crate) fn require_owner_recovery_in(
@@ -787,7 +815,7 @@ pub(crate) fn require_owner_recovery_in(
             require_current_sandbox_in(c, key, &claim)?;
         }
         if count == 0 {
-            require_pre_tool_run_in(c, session, &branch, &run, turn)?;
+            require_unclaimed_run_in(c, session, &branch, &run, turn)?;
         }
     }
     Ok(())

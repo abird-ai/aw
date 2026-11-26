@@ -12,7 +12,7 @@ use aw_tools::filesystem::{access::Action, schema::Tool};
 use std::collections::BTreeSet;
 
 const NOTE: &str =
-    "Original native source effect releases verified; original Run retained, no replay";
+    "Original native source releases or claim-gated no-start verified; original Run retained, no replay";
 
 /// Data-only result of reconciliation, not a new execution receipt.
 /// Inspected Input/queue custody is not a successful Turn or provider proof.
@@ -20,33 +20,64 @@ const NOTE: &str =
 pub struct NativeTurnReconciliation {
     pub turn: u64,
     pub source_effects: usize,
+    pub unclaimed_no_start: usize,
     pub hazard_cleared: bool,
     pub input: InputAdmissionState,
     pub queue: Option<QueueState>,
     pub changed: bool,
 }
 
-/// Require every original effect's exact positive release. No missing
-/// claim, provider result, terminal ToolRecord or human note is proof.
-fn require_releases(
-    c: &Transaction<'_>,
-    run: &str,
-    agent: &str,
-    sandbox: &SandboxSnapshot,
-    turn: u64,
-    actor: &PrincipalId,
-) -> Result<(usize, bool)> {
-    let driver = DriverKey::builtin("native-filesystem")?;
+/// Only the original durable, fixed native executor contract proves that
+/// this particular intent could not enter the native worker without its
+/// claim. A generic trusted-host identity or absent claim is insufficient.
+pub(super) fn require_unclaimed_no_start(c: &Connection, observed: &Observation) -> Result<()> {
+    let effect_id = observed.intent.effect_id();
+    if observed.source.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
+        || claim_in(c, &effect_id)?.is_some()
+        || fact_in::<SandboxEffectOutcome>(c, &effect_id, QUIESCENT)?.is_some()
+        || fact_in::<Release>(c, &effect_id, RELEASED)?.is_some()
+        || observed
+            .terminal
+            .as_ref()
+            .is_some_and(|(_, record)| record.status == ToolStatus::Succeeded)
+    {
+        return Err(Error::Conflict(
+            "unclaimed intent lacks positive original no-start evidence",
+        ));
+    }
+    let leased: bool = db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
+          WHERE scope_kind='execution' AND scope_key GLOB 'source-mutation:*' AND run_id=?1)",
+        [&effect_id],
+        |row| row.get(0),
+    ))?;
+    if leased {
+        return Err(Error::Conflict(
+            "unclaimed native intent has contradictory source custody",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_git_layout(sandbox: &SandboxSnapshot) -> Result<()> {
     let git = DriverKey::builtin("git")?;
     if sandbox.sources.is_empty() || sandbox.sources.iter().any(|source| source.driver != git) {
         return Err(Error::Denied(
             "native Run recovery requires its original Git source layout",
         ));
     }
-    // Validate the complete original versioned binding digest without
-    // requiring a current driver registration or probing a checkout.
-    let bindings =
-        sandbox_owner::source_bindings::versioned_bindings_in(c, &sandbox.canonical_ref)?;
+    Ok(())
+}
+
+/// One bounded original intent scan for startup and terminal reconciliation.
+pub(super) fn inspect_native_intents(
+    c: &Connection,
+    run: &str,
+    agent: &str,
+    turn: u64,
+    actor: &PrincipalId,
+    mut inspect: impl FnMut(&Observation) -> Result<()>,
+) -> Result<(usize, bool)> {
     let mut query = db(c.prepare_cached(
         "SELECT seq,payload FROM run_events WHERE run_id=?1 ORDER BY seq LIMIT 513",
     ))?;
@@ -82,29 +113,13 @@ fn require_releases(
                 if observed.intent.run_id != run
                     || observed.intent.started_seq != seq
                     || &observed.intent.actor != actor
-                    || observed.source != ToolSourceEvidence::trusted_host()
-                    || observed.active
+                    || !observed.source.is_trusted_host()
                 {
                     return Err(Error::Denied(
                         "native intent differs from original settled Run",
                     ));
                 }
-                let claim = require_claim(c, &observed.intent)?;
-                if claim.driver != driver
-                    || claim.sandbox_ref != sandbox.canonical_ref
-                    || claim.sources.len() != sandbox.sources.len()
-                {
-                    return Err(Error::Denied(
-                        "Run effect differs from original complete native source custody",
-                    ));
-                }
-                verify_claim_bindings(&claim, bindings.clone())?;
-                let (terminal, _) = terminal_in(c, &observed)?;
-                if released_in(c, &observed, &terminal)?.is_none() {
-                    return Err(Error::Conflict(
-                        "original native effect has no positive source release",
-                    ));
-                }
+                inspect(&observed)?;
                 writes |= effect == ToolEffect::Write;
             }
             JournalEntry::ToolFinished { record } if !starts.contains(&record.call.id) => {
@@ -123,10 +138,65 @@ fn require_releases(
     Ok((starts.len(), writes))
 }
 
+/// Require each original effect's positive release or exact gated no-start.
+/// Neither case manufactures physical settlement, or changes old history.
+fn require_releases(
+    c: &Transaction<'_>,
+    run: &str,
+    agent: &str,
+    sandbox: &SandboxSnapshot,
+    turn: u64,
+    actor: &PrincipalId,
+) -> Result<(usize, usize, bool)> {
+    let driver = DriverKey::builtin("native-filesystem")?;
+    require_git_layout(sandbox)?;
+    // Validate the complete original versioned binding digest without
+    // requiring a current driver registration or probing a checkout.
+    let bindings =
+        sandbox_owner::source_bindings::versioned_bindings_in(c, &sandbox.canonical_ref)?;
+    let mut no_start = 0;
+    let (count, writes) = inspect_native_intents(c, run, agent, turn, actor, |observed| {
+        if observed.active {
+            return Err(Error::Denied("native Run is still active"));
+        }
+        if claim_in(c, &observed.intent.effect_id())?.is_none() {
+            require_unclaimed_no_start(c, observed)?;
+            let (_, record) =
+                terminal_in_with(c, observed, observed.record.effect != ToolEffect::Read)?;
+            if record.status == ToolStatus::Succeeded {
+                return Err(Error::Conflict(
+                    "unclaimed native intent cannot have succeeded",
+                ));
+            }
+            no_start += 1;
+            return Ok(());
+        }
+        let claim = require_claim(c, &observed.intent)?;
+        if claim.driver != driver
+            || claim.sandbox_ref != sandbox.canonical_ref
+            || claim.sources.len() != sandbox.sources.len()
+        {
+            return Err(Error::Denied(
+                "Run effect differs from original complete native source custody",
+            ));
+        }
+        verify_claim_bindings(&claim, bindings.clone())?;
+        let (terminal, _) = terminal_in(c, observed)?;
+        if released_in(c, observed, &terminal)?.is_none() {
+            return Err(Error::Conflict(
+                "original native effect has no positive source release",
+            ));
+        }
+        Ok(())
+    })?;
+    Ok((count - no_start, no_start, writes))
+}
+
 impl SessionStore {
     /// Reconcile only a terminal, attached direct native Run from a
     /// previous exclusive owner. All original effects must already have
-    /// positive release facts (or no tool intent). Current owner/writer
+    /// positive release facts, exact original claim-gated no-start, or no
+    /// tool intent. Current owner/writer
     /// and Agent/Project authority are rechecked in the same transaction.
     /// Preserve provider uncertainty, independent hazards and history.
     pub fn reconcile_native_turn(
@@ -199,7 +269,7 @@ impl SessionStore {
             {
                 return Err(Error::Conflict("settled native Run identity changed"));
             }
-            let (source_effects, writes) =
+            let (source_effects, unclaimed_no_start, writes) =
                 require_releases(&tx, &run, agent_ref, &sandbox, turn, &original.actor)?;
             if writes != possible {
                 return Err(Error::Conflict(
@@ -258,6 +328,7 @@ impl SessionStore {
             let result = NativeTurnReconciliation {
                 turn,
                 source_effects,
+                unclaimed_no_start,
                 hazard_cleared,
                 input,
                 queue: queue.as_ref().map(|fact| fact.state),

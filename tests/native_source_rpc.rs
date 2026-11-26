@@ -733,6 +733,7 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     assert!(!reconcile(99).status.success());
     let result = disposition(reconcile(4));
     assert_eq!(result["source_effects"], 0);
+    assert_eq!(result["unclaimed_no_start"], 0);
     assert_eq!(result["hazard_cleared"], false);
     assert_eq!(result["input"], "inspected");
     assert_eq!(result["queue"], "inspected");
@@ -1008,6 +1009,7 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     drop(store);
     let result = disposition(reconcile(5));
     assert_eq!(result["source_effects"], 2);
+    assert_eq!(result["unclaimed_no_start"], 0);
     assert_eq!(result["hazard_cleared"], true);
     assert_eq!(result["input"], "inspected");
     assert_eq!(result["queue"], "inspected");
