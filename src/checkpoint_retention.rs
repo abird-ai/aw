@@ -1734,7 +1734,8 @@ mod tests {
         )
         .is_err());
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let attached_recovered = attach(
             &store,
             &pending_attach_path,
@@ -1769,11 +1770,378 @@ mod tests {
         assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
+
+        // Independently retained version from a different actual backing.
+        // The fixture owns this private origin and retention throughout.
+        use crate::sandbox_source_attach::MaterializationMode::{Continue, Fresh, Recover};
+        let replacement_repo = root.join("replacement-origin");
+        aw_platform::ensure_private_dir(&replacement_repo).unwrap();
+        git(
+            &executable,
+            &replacement_repo,
+            &["init", "--initial-branch=main"],
+        );
+        git(
+            &executable,
+            &replacement_repo,
+            &["config", "user.name", "Fixture"],
+        );
+        git(
+            &executable,
+            &replacement_repo,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(replacement_repo.join("tracked"), b"replacement version").unwrap();
+        git(&executable, &replacement_repo, &["add", "tracked"]);
+        git(
+            &executable,
+            &replacement_repo,
+            &["commit", "--no-gpg-sign", "-m", "fixture"],
+        );
+        let replacement_binding = driver
+            .binding(
+                &replacement_repo,
+                location.name.clone(),
+                SourceAccess::ReadWrite,
+                CheckpointPolicy::Required,
+            )
+            .unwrap();
+        let replacement_capture = driver
+            .plan_capture(
+                &replacement_binding,
+                "cp_fixture_offline_replacement",
+                "op_fixture_offline_replacement",
+            )
+            .unwrap();
+        let replacement_version = driver.execute_capture(&replacement_capture).unwrap();
+        let replacement_anchor =
+            aw_agent_core::SourceAnchor::try_from(&replacement_version).unwrap();
+        let replacement_location = GitSourceLocation {
+            name: location.name.clone(),
+            repository: replacement_repo.clone(),
+            repository_identity: DirectoryIdentity::open(&replacement_repo)
+                .unwrap()
+                .identity()
+                .unwrap(),
+        };
+        let replacement_config = |snapshot: &aw_store::SandboxSnapshot| {
+            json!({
+                "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+                "store_generation":store.local_process_info().unwrap().store_generation,
+                "manager":actor,"sandbox":snapshot.canonical_ref,"sandbox_rev":snapshot.rev,
+                "anchor":replacement_anchor,"destination_root":snapshot.tool_root,
+                "destination_identity":DirectoryIdentity::open(&snapshot.tool_root).unwrap().identity().unwrap(),
+                "repositories":[replacement_location],"replaced_repository":location
+            })
+        };
+        let config = replacement_config(&attached);
+        let gap_config = replacement_config(&attached_recovered);
+        let replacement_path = approvals.join("replace.json");
+        let gap_path = approvals.join("replace-gap.json");
+        for (path, value) in [(&replacement_path, &config), (&gap_path, &gap_config)] {
+            let mut file = aw_platform::open_private_new(path).unwrap();
+            file.write_all(&serde_json::to_vec(value).unwrap()).unwrap();
+        }
+        let replace = |store: &SessionStore, path: &Path, sandbox: &str, id: &str, mode| {
+            crate::sandbox_source_attach::replace(store, &actor, path, sandbox, id, mode)
+        };
+        let abandon_replacement = |store: &SessionStore, path: &Path, sandbox: &str, id: &str| {
+            crate::sandbox_source_attach::abandon_replacement(store, &actor, path, sandbox, id)
+        };
+        let old_file = attach_root.join("code/tracked");
+        fs::write(&old_file, b"independent edit").unwrap();
+        assert!(replace(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace",
+            Fresh
+        )
+        .is_err());
+        assert_eq!(fs::read(&old_file).unwrap(), b"independent edit");
+        fs::write(&old_file, b"dirty checkpoint").unwrap();
+        let mut wrong = config.clone();
+        wrong["replaced_repository"] = json!(replacement_location);
+        fs::write(&replacement_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(replace(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace",
+            Fresh
+        )
+        .is_err());
+        fs::write(&replacement_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(attach(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace",
+            false
+        )
+        .is_err());
+        let interrupt_replacement = |store: &SessionStore,
+                                     snapshot: &aw_store::SandboxSnapshot,
+                                     id: &str,
+                                     release: bool| {
+            let prepared = store
+                .sandbox_prepare_replacement(
+                    &actor,
+                    &snapshot.canonical_ref,
+                    snapshot.rev,
+                    id,
+                    replacement_anchor.clone(),
+                    |attachment, prepare_id| {
+                        let (old, descriptor) = attachment.replaced().unwrap();
+                        let target = snapshot.tool_root.join("code");
+                        let parent_identity =
+                            DirectoryIdentity::open(&snapshot.tool_root)?.identity()?;
+                        driver.plan_restore_replacing_approved(
+                            &GitRestoreLocation {
+                                name: location.name.clone(),
+                                repository: replacement_repo.clone(),
+                                repository_identity: replacement_location.repository_identity,
+                                target: target.clone(),
+                                parent_identity,
+                            },
+                            &replacement_version,
+                            prepare_id,
+                            &GitRestoreLocation {
+                                name: location.name.clone(),
+                                repository: repo.clone(),
+                                repository_identity: location.repository_identity,
+                                target,
+                                parent_identity,
+                            },
+                            &descriptor.prepared,
+                            &old.binding,
+                        )
+                    },
+                )
+                .unwrap();
+            if release {
+                prepared.revalidate().unwrap();
+                let (old, descriptor) = prepared.observation().replaced().unwrap();
+                driver
+                    .verify_replacement_untouched(
+                        &descriptor.prepared,
+                        &old.binding,
+                        prepared.source(),
+                    )
+                    .unwrap();
+                driver
+                    .release_restored_materialization(&descriptor.prepared, &old.binding)
+                    .unwrap();
+                driver.require_restore_absent(prepared.source()).unwrap();
+            }
+            prepared.mark_unknown().unwrap();
+        };
+        interrupt_replacement(&store, &attached, "fixture:replace-abandon", false);
+        let mut permitted = config.clone();
+        permitted["allow_continuation"] = json!(true);
+        fs::write(&replacement_path, serde_json::to_vec(&permitted).unwrap()).unwrap();
+        assert!(replace(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace-abandon",
+            Continue
+        )
+        .is_err());
+        assert_eq!(fs::read(&old_file).unwrap(), b"dirty checkpoint");
+        abandon_replacement(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace-abandon",
+        )
+        .unwrap();
+        fs::write(&replacement_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let replaced = replace(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace",
+            Fresh,
+        )
+        .unwrap();
+        assert_eq!(replaced.rev, attached.rev + 1);
+        assert_eq!(replaced.sources[0].binding_rev, replaced.rev);
+        assert_eq!(replaced.layout_digest, attached.layout_digest);
+        assert_eq!(fs::read(&old_file).unwrap(), b"replacement version");
+        abandon_replacement(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace-abandon",
+        )
+        .unwrap();
+        assert!(abandon_replacement(
+            &store,
+            &replacement_path,
+            &attached.canonical_ref,
+            "fixture:replace"
+        )
+        .is_err());
+
+        // Stop after exact predecessor release. Inspect-only recovery and
+        // abandonment cannot recreate or discard the old logical row.
+        interrupt_replacement(&store, &attached_recovered, "fixture:replace-gap", true);
+        assert!(!attach_pending_root.join("code").exists());
+        assert!(replace(
+            &store,
+            &gap_path,
+            &pending_empty.canonical_ref,
+            "fixture:replace-gap",
+            Recover
+        )
+        .is_err());
+        assert!(abandon_replacement(
+            &store,
+            &gap_path,
+            &pending_empty.canonical_ref,
+            "fixture:replace-gap"
+        )
+        .is_err());
+        assert!(replace(
+            &store,
+            &gap_path,
+            &pending_empty.canonical_ref,
+            "fixture:replace-gap",
+            Continue
+        )
+        .is_err());
+        assert_eq!(
+            store
+                .sandbox_get(&actor, &pending_empty.canonical_ref)
+                .unwrap(),
+            attached_recovered
+        );
+        assert!(store
+            .sandbox_close(
+                &actor,
+                &pending_empty.canonical_ref,
+                Some(attached_recovered.rev)
+            )
+            .is_err());
+        let mut continuation = gap_config.clone();
+        continuation["allow_continuation"] = json!(true);
+        let mut wrong = continuation.clone();
+        wrong["sandbox_rev"] = json!(attached_recovered.rev + 1);
+        fs::write(&gap_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(replace(
+            &store,
+            &gap_path,
+            &pending_empty.canonical_ref,
+            "fixture:replace-gap",
+            Continue
+        )
+        .is_err());
+        assert!(store
+            .sandbox_recover_attachment_exact(
+                &actor,
+                &pending_empty.canonical_ref,
+                "fixture:replace-gap",
+                SandboxMaterializationRequest {
+                    expected_rev: attached_recovered.rev,
+                    anchor,
+                    replace: true
+                }
+            )
+            .is_err());
+        fs::write(&gap_path, serde_json::to_vec(&continuation).unwrap()).unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let gap_replaced = replace(
+            &store,
+            &gap_path,
+            &pending_empty.canonical_ref,
+            "fixture:replace-gap",
+            Continue,
+        )
+        .unwrap();
+        assert_eq!(gap_replaced.rev, attached_recovered.rev + 1);
+        assert_eq!(
+            fs::read(attach_pending_root.join("code/tracked")).unwrap(),
+            b"replacement version"
+        );
+        assert_eq!(
+            replace(
+                &store,
+                &gap_path,
+                &pending_empty.canonical_ref,
+                "fixture:replace-gap",
+                Continue
+            )
+            .unwrap(),
+            gap_replaced
+        );
+        assert_eq!(
+            store.agent_list(&actor, project, None, 64).unwrap(),
+            agents_before
+        );
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+                .unwrap(),
+            checkpoints_before
+        );
+        assert_eq!(
+            git(
+                &executable,
+                &repo,
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            ),
+            retained_refs
+        );
+        assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
+        assert_eq!(
+            git(
+                &executable,
+                &replacement_repo,
+                &["rev-parse", &replacement_version.retention_ref()]
+            ),
+            replacement_version.captured_commit
+        );
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.
+        fs::rename(&replacement_repo, root.join("moved-replacement-origin")).unwrap();
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            replace(
+                &store,
+                &replacement_path,
+                &empty.canonical_ref,
+                "fixture:replace",
+                Fresh
+            )
+            .unwrap()
+            .rev,
+            replaced.rev
+        );
+        assert_eq!(
+            replace(
+                &store,
+                &gap_path,
+                &pending_empty.canonical_ref,
+                "fixture:replace-gap",
+                Continue
+            )
+            .unwrap()
+            .rev,
+            gap_replaced.rev
+        );
+        abandon_replacement(
+            &store,
+            &replacement_path,
+            &empty.canonical_ref,
+            "fixture:replace-abandon",
+        )
+        .unwrap();
         assert_eq!(
             attach(
                 &store,
@@ -1784,7 +2152,7 @@ mod tests {
             )
             .unwrap()
             .rev,
-            attached.rev
+            replaced.rev
         );
         assert_eq!(
             attach(
@@ -1796,7 +2164,7 @@ mod tests {
             )
             .unwrap()
             .rev,
-            attached_recovered.rev
+            gap_replaced.rev
         );
         abandon_attach(
             &store,

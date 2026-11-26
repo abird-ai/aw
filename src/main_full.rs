@@ -162,6 +162,12 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_source_attach::Args,
     },
+    /// Replace an exact original managed source in an unused Sandbox.
+    #[cfg(feature = "workspace")]
+    SandboxSourceReplace {
+        #[command(flatten)]
+        args: sandbox_source_attach::ReplaceArgs,
+    },
     /// Offline reconciliation of exact managed Git sources in a closed Sandbox.
     #[cfg(feature = "workspace")]
     SandboxRetention {
@@ -1741,6 +1747,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::SandboxCreate { args } => sandbox_create::run(args),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxSourceAttach { args } => sandbox_source_attach::run(args),
+        #[cfg(feature = "workspace")]
+        TopCommand::SandboxSourceReplace { args } => sandbox_source_attach::run_replace(args),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         #[cfg(feature = "workspace")]

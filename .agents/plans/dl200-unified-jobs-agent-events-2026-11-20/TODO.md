@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact offline Git source attachment (this checkpoint; parent `8532f5e12a02477e22c4cb9ab5938c076935d39a`, retained-version baseline). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact offline Git source replacement (this checkpoint; parent `6974a4b35ad5281326eb1237bb846c0c7ce74029`, source attachment). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1534,6 +1534,17 @@ Current implementation: exact offline Git source attachment (this checkpoint; pa
       Grouped offline lifecycle 1/1, Store Sandbox 4/4, Host lifecycle 1/1;
       strict affected Clippy, durable library/minimal checks, full CLI
       and required/mode-conflict smoke, scoped fmt/diff passed.
+      **Unused-Sandbox Git replacement consumer landed:** shared attachment
+      approval/owner, explicit original old origin plus complete incoming/
+      sibling layout and exact original anchor/CAS fingerprint. Separate
+      continuation flag and default-deny host continuation decision;
+      original exact request checked before recovery reclaim, inspect-only
+      ordinary recovery, intact predecessor required for abandonment, actual
+      driver-proven post-release continuation, no blind retry or new owner.
+      Terminal replay under original semantic approval without Git/layout.
+      Grouped offline lifecycle 1/1, Store Sandbox 4/4, Host lifecycle 1/1;
+      strict affected Clippy, durable library/minimal checks, full CLI
+      and required/mode-conflict smoke, scoped fmt/diff passed.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1550,7 +1561,8 @@ Current implementation: exact offline Git source attachment (this checkpoint; pa
       recovery/abandonment and narrow offline checkpoint/closed Sandbox
       retention reconciliation, standalone Git derivation and retained-version
       baseline construction/recovery/abandonment and unused-Sandbox
-      attachment/recovery/abandonment are landed; do not repeat.
+      attachment/recovery/abandonment and replacement/recovery/continuation
+      are landed; do not repeat.
       Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.

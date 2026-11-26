@@ -19,7 +19,106 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: exact offline Git source attachment
+## Latest local implementation delta — 2026-11-26: exact offline Git source replacement
+
+Parent: `6974a4b35ad5281326eb1237bb846c0c7ce74029` (source
+attachment), signature verified. Original Agent/Turn journal and
+resource CLI owners remain occupied; independent unused-Sandbox
+replacement consumer, L5 only. No source-bearing runtime activation.
+
+- Production workspace-feature `aw sandbox-source-replace --state-dir
+  <existing private Store> <approval.json> <canonical-Sandbox> <request-id>`.
+  Shares attachment's original Project SandboxSourceAttach Prepared/
+  barrier/inspection/publication owner and existing replacement
+  fingerprint (Sandbox, original expected rev, exact incoming anchor,
+  separate replace domain). Stable namespace
+  `cli:sandbox-source-replace:<request-id>`.
+  Mutually exclusive `--agent-recover` (inspect only),
+  `--agent-abandon` (reject only an intact exact original predecessor
+  with no incoming registration), and `--agent-continue`
+  (explicit driver-proven post-release continuation of the original
+  operation). No fresh preparation or rematerialization in normal
+  recovery. After a genuine post-release gap the old logical binding
+  and original revision remain fenced; only exact continuation may
+  repair the gap, never abandonment of that old row. Fresh retries
+  of unresolved/Rejected claims refuse. Terminal Applied or Rejected
+  replay requires original semantic approval, not physical layout
+  or installed Git, and never touches later resources.
+- Reuse attachment private v1 approval fields; replacement additionally
+  **requires** `replaced_repository: GitSourceLocation` naming the
+  selected incoming anchor's name but the exact original origin, and
+  optionally `allow_continuation: true` (default false). The final
+  `repositories` set contains all unchanged sibling origins plus
+  incoming origin. The old origin decision is explicit disposal
+  permission, not inferred from a binding or incoming anchor. The
+  original host authenticates current OS manager, exclusive Store
+  generation, Project writer, exact open unused Sandbox revision and
+  complete protected named-child layout. Current independent authority
+  must cover both origins, retained versions, administration,
+  materializations and other backing dependencies; all existing
+  ordinary private-checkout/disjoint-layout/external-writer exclusions
+  apply. Attachment rejects replacement-only approval fields (a null
+  old origin and false continuation retain legacy semantics).
+  `--agent-continue` requires a renewed approval explicitly enabling
+  continuation; already Applied replay does not need this additional
+  effect permission. No extra request scope or persistent continuation
+  authority, no generic retry or prune. Replaced location is pinned
+  in the same lease-backed `PinnedGitLayout` at the already selected
+  destination and parent identity; the actual driver verifies original
+  Applied descriptor and unchanged predecessor, incoming version,
+  exact sibling identities and final predecessor release. No new
+  retention acquisition, deletion of baseline refs, or inferred grant.
+- `sandbox_recover_attachment_exact` shares the original receipt
+  recovery before any reclaim; exact request checks revision, anchor
+  and operation fingerprint. The existing exact inspection wrapper
+  delegates to it. `continue_sandbox_replacement_exact` shares
+  the existing driver proof/continuation, rejects attach mode before
+  reclaim and holds the actual renewed fence through revalidation,
+  driver effect/inspection, final publication or Unknown. Untouched
+  predecessor, modified or ambiguous incoming, unaccounted backing,
+  changed descriptor or missing independent authority refuses. Actual
+  driver reuses original candidate and existing exact partial cleanup;
+  completed incoming is preserved. Successful publication advances
+  the original Sandbox and selected binding once, preserves siblings
+  and layout, and records existing release provenance. No new schema,
+  driver recovery format, receipt, Agent, checkpoint, grant, tool,
+  resource owner or RPC.
+
+Validation (L5, Rust 1.95.0): production all-feature binary type-check;
+grouped real offline Git/SQLite lifecycle 1/1 (79.81s), Store Sandbox
+owner 4/4, Host source-checkpoint lifecycle 1/1 (197.79s). Existing
+grouped fixture proves real independent different-backing replacement,
+modified predecessor and wrong old-origin refusal, attach/replace
+approval separation, untouched original candidate continuation refusal
+and exact abandonment, fresh replacement with one revision advance,
+post-release gap preserves original logical binding/revision and rejects
+inspect-only recovery/abandonment, default-deny continuation, changed
+request refusal before reclaim, explicit renewed continuation after
+restart, terminal replay without Git/physical origins and old Rejected
+replay after later publication. Original and incoming retained refs,
+original HEAD/index/content, layout, Agent and public checkpoint lists
+preserved. Existing Host multi-source/partial replacement recovery
+regression passed. Strict affected all-feature/all-target Clippy,
+durable library/minimal all-target checks, full binary build, actual
+replacement and attachment help, required args, continuation conflict
+and attach continuation rejection smoke passed. Scoped fmt/diff and
+signed exact commit checked. Prior durable-only non-workspace binary
+blocker, feature-specific warnings and broad CLI inventory discrepancy
+remain; unchanged Process suites and pinned Nix/native-platform
+qualification not rerun. Only isolated fixture effects; no real user
+source mutation.
+
+Next: exact source-aware Actor/Turn admission when original journal
+owners are available. Otherwise production exact source release
+(including final-source removal) using the original release claim
+and factual provenance, including replay after settlement without
+physical reinspection. Standalone creation/derive, attachment and
+replacement are now actual offline consumers; do not repeat them.
+Broader linked checkout policy, mixed providers, ephemeral assets,
+bound-Agent structural mutation, source-bearing Actor/Process
+admission and Sandbox host RPCs remain held.
+
+## Previous local implementation delta — 2026-11-26: exact offline Git source attachment
 
 Parent: `8532f5e12a02477e22c4cb9ab5938c076935d39a` (standalone
 retained-version Sandbox baseline), signature verified. Original Agent/

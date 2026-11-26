@@ -1,4 +1,4 @@
-//! Offline source attachment. The original Project mutation/Prepared
+//! Offline source materialization (attachment or replacement). The original Project mutation/Prepared
 //! owner retains all custody and publication authority.
 use crate::git_maintenance::{
     open_private_approval, pin_named_layout, require_existing_store, require_named_destination,
@@ -29,9 +29,25 @@ pub(crate) struct Args {
     /// Inspect and publish the original prepared materialization.
     #[arg(long = "agent-recover", conflicts_with = "abandon")]
     recover: bool,
-    /// Reconcile only the original unpublished incoming materialization.
+    /// Reconcile the original unpublished candidate; replacement requires an intact predecessor.
     #[arg(long = "agent-abandon", conflicts_with = "recover")]
     abandon: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ReplaceArgs {
+    #[command(flatten)]
+    common: Args,
+    /// Explicitly continue the original post-release gap under renewed authority.
+    #[arg(long = "agent-continue", conflicts_with_all = ["recover", "abandon"])]
+    continue_effect: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterializationMode {
+    Fresh,
+    Recover,
+    Continue,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +64,13 @@ struct Config {
     destination_root: PathBuf,
     destination_identity: (u64, u64),
     repositories: Vec<GitSourceLocation>,
+    /// Explicit independent disposal approval of the old origin, at the
+    /// same named destination as the incoming version.
+    #[serde(default)]
+    replaced_repository: Option<GitSourceLocation>,
+    /// Separately approve exact continuation, not general retry.
+    #[serde(default)]
+    allow_continuation: bool,
 }
 
 struct Approval {
@@ -57,7 +80,13 @@ struct Approval {
 }
 
 impl Approval {
-    fn open(store: &SessionStore, actor: &PrincipalId, sandbox: &str, path: &Path) -> Result<Self> {
+    fn open(
+        store: &SessionStore,
+        actor: &PrincipalId,
+        sandbox: &str,
+        path: &Path,
+        replace: bool,
+    ) -> Result<Self> {
         let directory = path
             .parent()
             .ok_or(Error::Denied("attachment approval directory required"))?;
@@ -66,6 +95,8 @@ impl Approval {
             || &config.manager != actor
             || config.sandbox != sandbox
             || config.sandbox_rev == 0
+            || config.replaced_repository.is_some() != replace
+            || (!replace && config.allow_continuation)
         {
             return Err(Error::Denied(
                 "attachment approval differs from host manager or Sandbox",
@@ -90,6 +121,14 @@ impl Approval {
             ));
         }
         validate_named_locations(&mut config.repositories)?;
+        if let Some(old) = &mut config.replaced_repository {
+            validate_named_locations(std::slice::from_mut(old))?;
+            if old.name != config.anchor.name {
+                return Err(Error::Denied(
+                    "replacement approval names another old source",
+                ));
+            }
+        }
         if !config
             .repositories
             .iter()
@@ -108,7 +147,7 @@ impl Approval {
         SandboxMaterializationRequest {
             expected_rev: self.config.sandbox_rev,
             anchor: &self.config.anchor,
-            replace: false,
+            replace: self.config.replaced_repository.is_some(),
         }
     }
 
@@ -120,8 +159,9 @@ impl Approval {
             || snapshot.tool_root != c.destination_root
             || snapshot.working_directory != c.destination_root
             || attachment.anchor() != &c.anchor
-            || attachment.replaced().is_some()
-            || c.repositories.len() != attachment.bindings().len() + 1
+            || attachment.replaced().is_some() != c.replaced_repository.is_some()
+            || c.repositories.len()
+                != attachment.bindings().len() + usize::from(c.replaced_repository.is_none())
         {
             return Err(Error::Denied(
                 "attachment approval differs from the exact original layout or source",
@@ -130,7 +170,10 @@ impl Approval {
         // Check the full final named set, not just the incoming target.
         // Existing materialization identity and original provenance are
         // then verified by the same Git host that owns execution.
-        let mut existing = attachment.bindings().iter();
+        let mut existing = attachment
+            .bindings()
+            .iter()
+            .filter(|binding| binding.binding.name != c.anchor.name);
         for location in &c.repositories {
             if location.name != c.anchor.name
                 && !existing
@@ -143,17 +186,22 @@ impl Approval {
         if existing.next().is_some() {
             return Err(Error::Denied("attachment approval omits a retained source"));
         }
-        let fence = pin_named_layout(
+        let protected = [c.store_directory.as_path(), self.directory.as_path()];
+        let mut fence = pin_named_layout(
             &self.lease,
             &c.destination_root,
             c.destination_identity,
             &c.repositories,
-            &[&c.store_directory, &self.directory],
+            &protected,
             true,
         )?;
-        // Before a new effect, no pre-existing incoming child can be
-        // adopted. Recovery uses the original Prepared descriptor only.
-        if !recover {
+        if let Some(old) = &c.replaced_repository {
+            fence.pin_replaced_origin(old, &protected)?;
+        }
+        // Before a new attachment, no pre-existing incoming child can
+        // be adopted. Replacement instead proves its exact predecessor
+        // using the original Applied descriptor in the Git host.
+        if !recover && c.replaced_repository.is_none() {
             match std::fs::symlink_metadata(c.destination_root.join(c.anchor.name.as_str())) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error.into()),
@@ -176,39 +224,101 @@ pub(crate) fn attach(
     request_id: &str,
     recover: bool,
 ) -> Result<SandboxSnapshot> {
-    // Unlike standalone creation, attachment's exact incoming anchor and
-    // original CAS revision are semantic request inputs. Read the approval
-    // before replay, but never inspect a physical layout or driver on replay.
-    let approval = Approval::open(store, actor, sandbox, path)?;
+    materialize(
+        store,
+        actor,
+        path,
+        sandbox,
+        request_id,
+        false,
+        if recover {
+            MaterializationMode::Recover
+        } else {
+            MaterializationMode::Fresh
+        },
+    )
+}
+
+pub(crate) fn replace(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    sandbox: &str,
+    request_id: &str,
+    mode: MaterializationMode,
+) -> Result<SandboxSnapshot> {
+    materialize(store, actor, path, sandbox, request_id, true, mode)
+}
+
+fn materialize(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    sandbox: &str,
+    request_id: &str,
+    replace: bool,
+    mode: MaterializationMode,
+) -> Result<SandboxSnapshot> {
+    // Unlike standalone creation, the exact anchor and original CAS
+    // revision are semantic request inputs. Read the approval before
+    // replay, but never inspect a physical layout or driver on replay.
+    let approval = Approval::open(store, actor, sandbox, path, replace)?;
     let c = &approval.config;
-    match store.sandbox_replay_attachment(actor, sandbox, c.sandbox_rev, request_id, &c.anchor) {
+    let replay = if replace {
+        store.sandbox_replay_replacement(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
+    } else {
+        store.sandbox_replay_attachment(actor, sandbox, c.sandbox_rev, request_id, &c.anchor)
+    };
+    let recover = mode != MaterializationMode::Fresh;
+    match replay {
         Ok(Some(result)) => return Ok(result),
         Ok(None) if recover => {
-            return Err(Error::Denied("original prepared attachment unavailable"))
+            return Err(Error::Denied(
+                "original prepared materialization unavailable",
+            ))
         }
         Ok(None) => (),
         Err(Error::Conflict(_)) if recover => (),
         Err(error) => return Err(error),
     }
+    if mode == MaterializationMode::Continue && (!replace || !c.allow_continuation) {
+        return Err(Error::Denied(
+            "replacement continuation requires explicit host approval",
+        ));
+    }
     let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
     let host = GitCheckpointRestoreHost::new(store, &handle);
-    if recover {
-        host.resume_sandbox_attachment_exact(
+    match mode {
+        MaterializationMode::Recover => host.resume_sandbox_attachment_exact(
             actor,
             sandbox,
             request_id,
             approval.request(),
             |attachment, _| approval.fence(attachment, true),
-        )
-    } else {
-        host.attach_sandbox_source(
+        ),
+        MaterializationMode::Continue => host.continue_sandbox_replacement_exact(
+            actor,
+            sandbox,
+            request_id,
+            approval.request(),
+            |attachment, _| approval.fence(attachment, true),
+        ),
+        MaterializationMode::Fresh if replace => host.replace_sandbox_source(
             actor,
             sandbox,
             c.sandbox_rev,
             request_id,
             c.anchor.clone(),
             |attachment| approval.fence(attachment, false),
-        )
+        ),
+        MaterializationMode::Fresh => host.attach_sandbox_source(
+            actor,
+            sandbox,
+            c.sandbox_rev,
+            request_id,
+            c.anchor.clone(),
+            |attachment| approval.fence(attachment, false),
+        ),
     }
 }
 
@@ -219,7 +329,28 @@ pub(crate) fn abandon(
     sandbox: &str,
     request_id: &str,
 ) -> Result<()> {
-    let approval = Approval::open(store, actor, sandbox, path)?;
+    abandon_in(store, actor, path, sandbox, request_id, false)
+}
+
+pub(crate) fn abandon_replacement(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    sandbox: &str,
+    request_id: &str,
+) -> Result<()> {
+    abandon_in(store, actor, path, sandbox, request_id, true)
+}
+
+fn abandon_in(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    sandbox: &str,
+    request_id: &str,
+    replace: bool,
+) -> Result<()> {
+    let approval = Approval::open(store, actor, sandbox, path, replace)?;
     if store.sandbox_replay_abandoned_attachment(actor, sandbox, request_id, approval.request())? {
         return Ok(());
     }
@@ -234,22 +365,46 @@ pub(crate) fn abandon(
 }
 
 pub(crate) fn run(args: Args) -> Result<u8> {
+    run_in(args, false, false)
+}
+
+pub(crate) fn run_replace(args: ReplaceArgs) -> Result<u8> {
+    run_in(args.common, true, args.continue_effect)
+}
+
+fn run_in(args: Args, replacing: bool, continuing: bool) -> Result<u8> {
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
-    let id = format!("cli:sandbox-source-attach:{}", args.request_id);
+    let operation = if replacing { "replace" } else { "attach" };
+    let id = format!("cli:sandbox-source-{operation}:{}", args.request_id);
     if args.abandon {
-        abandon(&store, &actor, &args.approval, &args.sandbox, &id)?;
+        if replacing {
+            abandon_replacement(&store, &actor, &args.approval, &args.sandbox, &id)?;
+        } else {
+            abandon(&store, &actor, &args.approval, &args.sandbox, &id)?;
+        }
         super::print_json(&serde_json::json!({"status":"rejected"}))?;
     } else {
-        let result = attach(
-            &store,
-            &actor,
-            &args.approval,
-            &args.sandbox,
-            &id,
-            args.recover,
-        )?;
+        let result = if replacing {
+            let mode = if continuing {
+                MaterializationMode::Continue
+            } else if args.recover {
+                MaterializationMode::Recover
+            } else {
+                MaterializationMode::Fresh
+            };
+            replace(&store, &actor, &args.approval, &args.sandbox, &id, mode)?
+        } else {
+            attach(
+                &store,
+                &actor,
+                &args.approval,
+                &args.sandbox,
+                &id,
+                args.recover,
+            )?
+        };
         super::print_json(&super::sandbox_snapshot_value(&result, true))?;
     }
     Ok(0)

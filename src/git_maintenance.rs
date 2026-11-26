@@ -119,17 +119,55 @@ pub(crate) struct PinnedGitLayout<'a> {
     _lease: &'a File,
     locations: Vec<GitRestoreLocation>,
     pins: Vec<DirectoryIdentity>,
+    replaced: Option<GitRestoreLocation>,
 }
 
 impl PinnedGitLayout<'_> {
     pub(crate) fn retain_directory(&mut self, pin: DirectoryIdentity) {
         self.pins.push(pin);
     }
+
+    /// The separately approved original origin for one replacement.
+    /// Its destination and parent identity come from the already pinned
+    /// final named layout, never from a second caller-selected target.
+    pub(crate) fn pin_replaced_origin(
+        &mut self,
+        old: &GitSourceLocation,
+        protected: &[&Path],
+    ) -> Result<()> {
+        if self.replaced.is_some() {
+            return Err(Error::Denied("replacement origin already selected"));
+        }
+        let incoming = self
+            .locations
+            .iter()
+            .find(|location| location.name == old.name)
+            .ok_or(Error::Denied("replacement origin names another source"))?;
+        let root = incoming
+            .target
+            .parent()
+            .ok_or(Error::Denied("replacement destination has no parent"))?;
+        let mut exclusions = protected.to_vec();
+        exclusions.push(root);
+        self.pins.extend(pin_private_checkout(old, &exclusions)?);
+        self.replaced = Some(GitRestoreLocation {
+            name: old.name.clone(),
+            repository: old.repository.clone(),
+            repository_identity: old.repository_identity,
+            target: incoming.target.clone(),
+            parent_identity: incoming.parent_identity,
+        });
+        Ok(())
+    }
 }
 
 impl GitRestoreFence for PinnedGitLayout<'_> {
     fn locations(&self) -> &[GitRestoreLocation] {
         &self.locations
+    }
+
+    fn replaced_location(&self) -> Option<&GitRestoreLocation> {
+        self.replaced.as_ref()
     }
 }
 
@@ -195,5 +233,6 @@ pub(crate) fn pin_named_layout<'a>(
         _lease: lease,
         locations,
         pins,
+        replaced: None,
     })
 }

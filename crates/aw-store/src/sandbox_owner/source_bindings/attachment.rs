@@ -946,6 +946,21 @@ impl SessionStore {
             .inspect(inspect)
     }
 
+    /// Reclaim the original exact request for inspection or explicit
+    /// driver-proven continuation, never a new preparation.
+    pub fn sandbox_recover_attachment_exact(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+    ) -> Result<PreparedSandboxAttachment<'_>> {
+        self.resume_attachment(actor, sandbox, request_id, false, Some(request))?
+            .ok_or(Error::Conflict(
+                "materialization has no unresolved candidate",
+            ))
+    }
+
     /// Recover only the original semantic attachment request, before
     /// reclaiming its source claim or invoking physical inspection.
     pub fn sandbox_inspect_attachment_exact(
@@ -960,10 +975,7 @@ impl SessionStore {
             &PreparedSourceOperation,
         ) -> Result<RecoveryInspection<SourceBinding>>,
     ) -> Result<InspectedSandboxAttachment<'_>> {
-        self.resume_attachment(actor, sandbox, request_id, false, Some(request))?
-            .ok_or(Error::Conflict(
-                "materialization has no unresolved candidate",
-            ))?
+        self.sandbox_recover_attachment_exact(actor, sandbox, request_id, request)?
             .inspect(inspect)
     }
 

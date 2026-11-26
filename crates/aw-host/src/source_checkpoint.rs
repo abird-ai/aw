@@ -1384,9 +1384,44 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
-        let prepared = self
-            .store
-            .sandbox_recover_attachment(actor, sandbox, request_id)?;
+        self.continue_sandbox_replacement_in(actor, sandbox, request_id, None, authorize)
+    }
+
+    /// Explicit continuation of the exact original replacement request.
+    /// Refuse changed revision, anchor or operation before reclaiming
+    /// custody; the driver still proves the precise post-release gap.
+    pub fn continue_sandbox_replacement_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        if !request.replace {
+            return Err(Error::Denied(
+                "continuation requires an exact replacement request",
+            ));
+        }
+        self.continue_sandbox_replacement_in(actor, sandbox, request_id, Some(request), authorize)
+    }
+
+    fn continue_sandbox_replacement_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: Option<SandboxMaterializationRequest<'_>>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let prepared = match request {
+            Some(request) => self
+                .store
+                .sandbox_recover_attachment_exact(actor, sandbox, request_id, request),
+            None => self
+                .store
+                .sandbox_recover_attachment(actor, sandbox, request_id),
+        }?;
         let authorized = (|| {
             if prepared.observation().replaced().is_none() {
                 return Err(Error::Denied("not a replacement"));
