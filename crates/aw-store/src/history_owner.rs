@@ -545,14 +545,24 @@ fn base_row(connection: &Connection, base_id: &str) -> Result<HistoryBaseRef> {
     ))
 }
 
-fn inherited_parent_for_seal(
+// Current HistoryBase may include a seal of this Agent's own local
+// history (e.g. audience expansion). That immutable seal is a disclosure/
+// retention root, not a second inherited copy of the same local nodes.
+fn inherited_base_for_branch(
     connection: &Connection,
     current_base: Option<&str>,
     session_id: &str,
     branch_id: &str,
 ) -> Result<Option<String>> {
     let mut cursor = current_base.map(str::to_owned);
+    let mut depth = 0;
     while let Some(base_id) = cursor {
+        depth += 1;
+        if depth > crate::MAX_SESSION_NODES {
+            return Err(Error::Limit(
+                "HistoryBase ancestry exceeds projection bound",
+            ));
+        }
         let (parent, span_session, span_branch): (Option<String>, String, String) = db(connection
             .query_row(
                 "SELECT b.parent_base_id,s.backing_session_id,s.backing_branch_id
@@ -644,7 +654,9 @@ pub(crate) fn effective_history(
         params![session.id, branch.id],
         |row| row.get(0),
     ))?;
-    let Some(base_id) = base_id else {
+    let Some(base_id) =
+        inherited_base_for_branch(connection, base_id.as_deref(), &session.id, &branch.id)?
+    else {
         return context::projected_history(connection, session, branch);
     };
     let mut nodes = inherited_projected_nodes(connection, &base_id)?;
@@ -735,7 +747,9 @@ impl SessionStore {
         ))?;
 
         let mut out = BTreeMap::new();
-        if let Some(base_id) = base_id {
+        if let Some(base_id) =
+            inherited_base_for_branch(&connection, base_id.as_deref(), session_id, &branch.id)?
+        {
             for span in inherited_span_chain(&connection, &base_id)? {
                 let (source_agent, nodes) = verified_span_nodes(&connection, &span)?;
                 collect_turn_provenance(&mut out, &wanted, &source_agent, nodes)?;
@@ -805,7 +819,7 @@ fn seal_boundary_in(
         |row| Ok((row.get(0)?, row.get(1)?)),
     ))?;
     let parent_base =
-        inherited_parent_for_seal(connection, current_base.as_deref(), session_id, branch_id)?;
+        inherited_base_for_branch(connection, current_base.as_deref(), session_id, branch_id)?;
 
     let projected = projected_node_digests(connection, session_id, head)?;
     if projected.is_empty() {
@@ -2922,6 +2936,94 @@ mod tests {
                 "inherited history is not copied into the new Session"
             );
         }
+
+        // A disclosure seal of a fork's own continuation must not turn
+        // the local suffix into a second inherited history prefix.
+        let (_, inherited_handle) = store
+            .activate(&owner, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        inherited_handle
+            .begin(TurnStart {
+                turn_id: 2,
+                prompt: "local continuation".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        inherited_handle
+            .finish(Turn {
+                id: 2,
+                prompt: "local continuation".into(),
+                answer: "local answer".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(owner.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        let newcomer = PrincipalId::new("internal:fixture:fork-newcomer").unwrap();
+        let rev = store
+            .agent_public_revision(&owner, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        store
+            .set_agent_collaboration_access(
+                &owner,
+                &inherited.id,
+                &inherited_branch.id,
+                &newcomer,
+                crate::SessionParticipationPermissions {
+                    view: true,
+                    ..Default::default()
+                },
+                rev,
+            )
+            .unwrap();
+        let view = store
+            .read_agent_branch_view(&newcomer, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        assert_eq!(
+            view.history
+                .turns
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(view.history.next_turn_id, 3);
+        let provenance = store
+            .agent_turn_provenance(&newcomer, &inherited.id, &inherited_branch.id, &[1, 2])
+            .unwrap();
+        assert_eq!(provenance[&1], source_provenance);
+        assert_eq!(provenance[&2].original_agent, inherited_ref);
+        let (again, again_branch) = store
+            .create_agent_from_agent_history(
+                &owner,
+                &inherited.id,
+                &inherited_branch.id,
+                "refork after audience expansion",
+                binding(),
+                AgentHistoryForkAccess::Private,
+            )
+            .unwrap();
+        let again_view = store
+            .read_agent_branch_view(&owner, &again.id, &again_branch.id)
+            .unwrap();
+        assert_eq!(
+            again_view
+                .history
+                .turns
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
 
         let current_source_rev = store
             .agent_public_revision(&owner, &source.id, &source_branch.id)

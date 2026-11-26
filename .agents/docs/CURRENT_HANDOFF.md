@@ -19,7 +19,80 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: live native source Actor/Turn admission
+## Latest local implementation delta — 2026-11-26: reconcile committed queue revision and local history projection
+
+Parent `e34da446d08157a87cac72a65175511fb34c5905` (live native
+source Actor/Turn admission); published AW main remains `7b92686`.
+L5, clean at entry. No new durable schema, receipt, owner or mode.
+
+- Reproduced both earlier Actor qualification failures with retained
+  pre-native-change test executable `aw-0e4d37c92bc526ba` (mtime
+  2026-11-25 12:13 UTC; lacks the new native Actor test), with the same
+  assertion/permission failure sites. Exact parent source comparison
+  confirms the queue acceptance and Agent ACL binding paths were
+  unchanged by e34da44. The old binary is historical reproduction,
+  not a rebuilt or cryptographically attributed exact parent.
+- Ordinary encrypted queue publication in the original immediate
+  transaction now requires exact branch and open lifecycle (held
+  admission still permits staging/queueing), checks optional original
+  Agent revision, appends the Pending fact and advances the same
+  branch's authoritative Agent rev once. No schema, new index or
+  receipt. `actor_queue_enqueue_minted_at_revision` shares the original
+  owner with existing unconditional/direct enqueue APIs. Self and
+  delegated-parent jobs_send compatibility CAS now reaches the
+  actual transaction; normal additive model-facing input has no CAS
+  requirement. Original prior exact request replay still occurs
+  before fresh CAS; rejected or repeated custody does not advance
+  rev. Delegated capacity reservation/cleanup unchanged. Prepared
+  construction and staged input Send retain their original publication
+  owner and rev behavior, so no double increment or per-item rev fanout.
+- Shared Session/Agent regression now demonstrates Session
+  participation alone cannot read the exact Agent binding; explicitly
+  grant View+Submit via the existing Agent ACL/HistoryGrant owner.
+  No automatic synchronization, grant broadening or public Session
+  authority resurrection. This uncovered actual duplicated history
+  after same-Agent audience expansion: the current HistoryBase may
+  seal the Agent's own local span for disclosure/retention, but it is
+  not a second inherited data prefix. Reuse the existing self-span
+  skipping selector (renamed `inherited_base_for_branch`, bounded)
+  for effective history and factual Turn provenance as well as sealing.
+  Verify actual inherited spans as before; append the original local
+  projection once. Existing exact settled-Turn lookup, local immutable
+  nodes, HistoryGrant pointer, retained seals and manifest authorization
+  are preserved. No new persistence or lazy writes. Extend existing
+  real fork lifecycle with inherited seed, local Turn, new audience,
+  exact original provenance and refork; both Turns appear once.
+- The older explicit participant dispatch still uses its legacy
+  Session participation/audience evidence. This slice corrects the
+  fixture's independent Agent binding grant and actual history owner,
+  not a full legacy participant execution/access_generation cutover.
+  Keep that separate qualification item; do not infer source-bearing
+  or shared execution from the corrected test. Native source execution
+  remains deliberately exact owner-only.
+
+Validation (final source, L5 Rust 1.95.0): full Actor owner suite
+46/46 (44.06s; both previous failures now pass); History owner 4/4
+(2.38s), Store queue 8/8 (13.01s), staged input plan 1/1,
+checkpoint owner 4/4, Agent lifecycle 3/3 (actual native source Turn/
+restart included), stable child lifecycle 2/2. Strict affected
+Store/Host/CLI all-feature/all-target Clippy, durable-only and minimal
+all-target checks, full all-feature CLI build (35.94s incremental)
+and actual version smoke `aw 0.15.0` passed; prior link timeout resolved.
+Existing feature-specific dead-code warnings remain. Scoped rustfmt/
+diff and exact signed checkpoint. No full workspace test-suite,
+pinned Nix or cross-platform qualification claimed. No parent rebuild;
+historical earlier-binary reproduction and source comparison as above.
+
+Next: explicit production configured Git source-root activation
+through the existing CLI/stdio owner, without ambient root realization
+or implicit grant/admission. Reuse `GitNativeSourceHost::build_execution`,
+`SandboxExecution`, original SessionHandle and Actor service. Keep
+live withdrawal and incomplete-Turn recovery, legacy participant
+Agent ACL/evidence cutover, broader Job/Process/Graph/extension
+containment and independent physical recovery held until individually
+qualified. No frozen dotlink changes.
+
+## Previous local implementation delta — 2026-11-26: live native source Actor/Turn admission
 
 Parent `7b926864bd0aa1a733323933f56eacdf68b88e72` (formatting)
 and `fdcdb549` (EventInput forwarding) are signed, published to AW main;

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: live native source Actor/Turn admission (this checkpoint; published parent `7b926864bd0aa1a733323933f56eacdf68b88e72`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: queue revision and local HistoryBase projection correction (this checkpoint; local parent `e34da446d08157a87cac72a65175511fb34c5905`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1598,8 +1598,24 @@ Current implementation: live native source Actor/Turn admission (this checkpoint
       all-target checks green. Broader Actor 44/46: legacy queue-revision
       and shared-session Agent permission failures at unchanged sites;
       parent not independently re-run, qualification unresolved (see handoff).
-      **Next:** reconcile legacy qualification; production explicit configured source-root CLI/stdio
-      activation and live withdrawal/restart reconciliation. No generic
+      **Actor qualification corrective checkpoint:** historical pre-native
+      binary reproduces both legacy failures. Ordinary Pending queue
+      publication advances exact Agent rev once, optional compatibility
+      CAS in original transaction; no revision change on replay/refusal,
+      no staged Send/construction double increment. Shared fixture
+      grants explicit Agent ACL independently of Session participation.
+      Own local disclosure seal no longer duplicates inherited history;
+      use same actual inherited-base selector for projection/provenance/
+      sealing, preserve original immutable grants and exact Turn lookup.
+      Final Actor 46/46, History 4/4, Store queue 8/8, staged plan 1/1,
+      checkpoint 4/4, Agent lifecycle 3/3, stable child 2/2; strict affected
+      Clippy, durable/minimal targets, full all-feature executable and
+      actual version smoke, scoped fmt/diff passed. Prior timeout resolved.
+      Historical binary reproduction is not an exact parent rebuild.
+      **Next:** production explicit configured source-root CLI/stdio
+      activation and live withdrawal/restart reconciliation; separately
+      qualify legacy participant Agent ACL/access_generation dispatch.
+      No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and

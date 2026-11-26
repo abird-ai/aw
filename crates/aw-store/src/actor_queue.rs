@@ -598,7 +598,7 @@ impl SessionStore {
         request: ActorQueueRequest,
         payload: &str,
     ) -> Result<ActorQueueFact> {
-        self.actor_queue_enqueue_inner(owner, request, payload, false)
+        self.actor_queue_enqueue_inner(owner, request, payload, false, None)
     }
 
     /// P6-9D2A: original journaled Agent's explicitly Host/Write-granted
@@ -614,12 +614,25 @@ impl SessionStore {
         request: ActorQueueRequest,
         payload: &str,
     ) -> Result<ActorQueueFact> {
+        self.actor_queue_enqueue_minted_at_revision(owner, request, payload, None)
+    }
+
+    /// Optional host Agent CAS at the actual queue acceptance transaction.
+    /// Ordinary additive input requires no revision. Neither a failed CAS
+    /// nor an existing request advances the Agent or accepts new custody.
+    pub fn actor_queue_enqueue_minted_at_revision(
+        &self,
+        owner: &PrincipalId,
+        request: ActorQueueRequest,
+        payload: &str,
+        expected_rev: Option<u64>,
+    ) -> Result<ActorQueueFact> {
         if request.message_id != 0 {
             return Err(Error::Denied(
                 "host-minted queued Input rejects caller-supplied message sequence",
             ));
         }
-        self.actor_queue_enqueue_inner(owner, request, payload, true)
+        self.actor_queue_enqueue_inner(owner, request, payload, true, expected_rev)
     }
 
     fn actor_queue_enqueue_inner(
@@ -628,6 +641,7 @@ impl SessionStore {
         mut request: ActorQueueRequest,
         payload: &str,
         mint_sequence: bool,
+        expected_rev: Option<u64>,
     ) -> Result<ActorQueueFact> {
         if mint_sequence {
             request.message_id = 1;
@@ -646,7 +660,21 @@ impl SessionStore {
             let mut conn = self.connection()?;
             let tx = db(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
             writer(&tx, owner, &request.session_id, request.writer_epoch)?;
-            branch_in(&tx, &request.session_id, &request.branch_id)?;
+            let branch = branch_in(&tx, &request.session_id, &request.branch_id)?;
+            if branch.id != request.branch_id {
+                return Err(Error::Denied(
+                    "queued Input requires its exact Agent branch",
+                ));
+            }
+            let agent = crate::agent_owner::AgentKey::new(&request.session_id, &request.branch_id);
+            if crate::agent_owner::lifecycle(&tx, agent)?.0 != "open" {
+                return Err(Error::Denied("Agent is closing or closed"));
+            }
+            if let Some(expected) = expected_rev {
+                if crate::agent_owner::revision(&tx, agent)? != expected {
+                    return Err(Error::Conflict("stale Agent revision"));
+                }
+            }
             let all = events(&tx, &request.session_id)?;
             if all
                 .iter()
@@ -688,6 +716,13 @@ impl SessionStore {
                 note: None,
             };
             audit_fact(&tx, owner, &fact)?;
+            crate::agent_owner::changed(
+                &tx,
+                crate::agent_owner::AgentKey::new(
+                    &fact.request.session_id,
+                    &fact.request.branch_id,
+                ),
+            )?;
             db(tx.commit())?;
             Ok(fact)
         })();

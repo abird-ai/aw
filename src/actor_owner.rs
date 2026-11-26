@@ -2080,7 +2080,7 @@ impl Service {
             "agent:{:x}",
             Sha256::digest(caller.canonical_ref().as_bytes())
         );
-        let fact = match self.store.actor_queue_enqueue_minted(
+        let fact = match self.store.actor_queue_enqueue_minted_at_revision(
             &self.owner,
             ActorQueueRequest {
                 request_id: request_id.clone(),
@@ -2094,6 +2094,7 @@ impl Service {
                 priority: 0,
             },
             text,
+            expected_revision,
         ) {
             Ok(fact) => fact,
             Err(error) => {
@@ -2326,14 +2327,7 @@ impl Service {
 
         self.verify_model_observation(ctx)?;
         self.require_model_tool_grant("jobs_send", &aw_agent_core::ToolEffect::Control)?;
-        let current_revision =
-            self.store
-                .agent_public_revision(&self.owner, &self.session, &self.branch)?;
-        if expected_revision.is_some_and(|revision| revision != current_revision) {
-            return Err(Error::Conflict("stale Agent revision"));
-        }
-
-        let fact = self.store.actor_queue_enqueue_minted(
+        let fact = self.store.actor_queue_enqueue_minted_at_revision(
             &self.owner,
             ActorQueueRequest {
                 request_id,
@@ -2347,6 +2341,7 @@ impl Service {
                 priority: 0,
             },
             text,
+            expected_revision,
         )?;
         // The queue commit is already factual at this point. If the owner is
         // revoked now, the Tool attempt is uncertain and must never enqueue a
@@ -4705,6 +4700,30 @@ mod tests {
             shared.owner, alice,
             "sharing must not change the Session resource owner"
         );
+        // Legacy Session participation is backing authority, not a
+        // live grant to the authoritative Agent ACL.
+        assert!(f
+            .store
+            .agent_binding(&bob, &session_id, &branch_id)
+            .is_err());
+        let rev = f
+            .store
+            .agent_public_revision(&alice, &session_id, &branch_id)
+            .unwrap();
+        f.store
+            .set_agent_collaboration_access(
+                &alice,
+                &session_id,
+                &branch_id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    submit: true,
+                    ..Default::default()
+                },
+                rev,
+            )
+            .unwrap();
         let bob_binding = f
             .store
             .agent_binding(&bob, &session_id, &branch_id)
@@ -8244,11 +8263,21 @@ mod tests {
             .unwrap();
         assert!(first.request_id.starts_with("jq_"));
         assert_eq!(first.state, aw_store::QueueState::Pending);
+        let after = store
+            .agent_public_revision(&owner.owner, &owner.session, &owner.branch)
+            .unwrap();
+        assert_eq!(after, before + 1);
         let duplicate = owner
             .jobs_queue_text(&context, &canonical, Some(before), "continue once")
             .unwrap();
         assert_eq!(duplicate.request_id, first.request_id);
         assert_eq!(owner.queue_list().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .agent_public_revision(&owner.owner, &owner.session, &owner.branch)
+                .unwrap(),
+            after
+        );
 
         assert!(owner
             .jobs_queue_text(&context, &canonical, Some(before), "changed replay body")
@@ -8259,6 +8288,12 @@ mod tests {
             Err(Error::Conflict("stale Agent revision"))
         ));
         assert_eq!(owner.queue_list().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .agent_public_revision(&owner.owner, &owner.session, &owner.branch)
+                .unwrap(),
+            after
+        );
         let public = serde_json::to_string(&owner.queue_list().unwrap()).unwrap();
         assert!(!public.contains("continue once"));
 
