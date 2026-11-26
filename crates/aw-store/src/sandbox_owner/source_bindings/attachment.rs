@@ -315,6 +315,27 @@ fn fingerprint(sandbox: &str, rev: u64, anchor: &SourceAnchor, replace: bool) ->
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Exact semantic identity for explicit inspection/abandonment. Unlike
+/// a fresh Project baseline, the incoming anchor and revision are request
+/// inputs, not a later host-selected configuration.
+#[derive(Clone, Copy)]
+pub struct SandboxMaterializationRequest<'a> {
+    pub expected_rev: u64,
+    pub anchor: &'a SourceAnchor,
+    pub replace: bool,
+}
+
+impl SandboxMaterializationRequest<'_> {
+    fn require_original(self, sandbox: &str, receipt: &ConstructionPreparation) -> Result<()> {
+        if receipt.fingerprint
+            != fingerprint(sandbox, self.expected_rev, self.anchor, self.replace)?
+        {
+            return Err(Error::Conflict("attachment request differs from original"));
+        }
+        Ok(())
+    }
+}
+
 fn owner(store: &SessionStore) -> Result<()> {
     if store.inner.mode != StoreMode::OwnerLock {
         return Err(Error::Denied(
@@ -589,6 +610,19 @@ impl InspectedSandboxAttachment<'_> {
     }
 }
 
+fn rejected_attachment_in(c: &Connection, receipt: &ConstructionPreparation) -> Result<bool> {
+    if receipt.state != PreparationState::Rejected {
+        return Ok(false);
+    }
+    // The Rejected fact was committed only by fenced reconciliation.
+    // Check immutable indexed custody, not the old Sandbox revision:
+    // a later successful attachment may legitimately advance that rev.
+    if construction_receipt::source_claim_by_id_in(c, receipt.candidate.prepare_id())? != *receipt {
+        return Err(Error::Storage("original attachment claim changed"));
+    }
+    Ok(true)
+}
+
 impl SessionStore {
     pub fn sandbox_replay_attachment(
         &self,
@@ -628,9 +662,12 @@ impl SessionStore {
         let result = match receipt {
             None => None,
             Some(receipt) => {
-                if receipt.fingerprint != fingerprint(sandbox, expected_rev, anchor, replace)? {
-                    return Err(Error::Conflict("attachment request differs from original"));
+                SandboxMaterializationRequest {
+                    expected_rev,
+                    anchor,
+                    replace,
                 }
+                .require_original(sandbox, &receipt)?;
                 if receipt.state != PreparationState::Applied
                     || receipt.result_ref.as_deref() != Some(sandbox)
                 {
@@ -801,19 +838,47 @@ impl SessionStore {
         })
     }
 
+    /// A Rejected attachment is terminal even if the unchanged old
+    /// layout has subsequently acquired other bindings. Verify the exact
+    /// original indexed claim, never re-observe a later layout as custody.
+    pub fn sandbox_replay_abandoned_attachment(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+    ) -> Result<bool> {
+        owner(self)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let (_, receipt) = prior(&tx, actor, sandbox, request_id)?;
+        let receipt = receipt.ok_or(Error::Denied("original attachment unavailable"))?;
+        request.require_original(sandbox, &receipt)?;
+        let rejected = rejected_attachment_in(&tx, &receipt)?;
+        if !rejected && !receipt.state.unresolved() {
+            return Err(Error::Conflict("published attachment cannot be abandoned"));
+        }
+        db(tx.commit())?;
+        Ok(rejected)
+    }
+
     fn resume_attachment(
         &self,
         actor: &PrincipalId,
         sandbox: &str,
         request_id: &str,
         abandon: bool,
+        exact: Option<SandboxMaterializationRequest<'_>>,
     ) -> Result<Option<PreparedSandboxAttachment<'_>>> {
         owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (_, receipt) = prior(&tx, actor, sandbox, request_id)?;
         let receipt = receipt.ok_or(Error::Denied("original attachment unavailable"))?;
-        if abandon && receipt.state == PreparationState::Rejected {
+        if let Some(request) = exact {
+            request.require_original(sandbox, &receipt)?;
+        }
+        if abandon && rejected_attachment_in(&tx, &receipt)? {
             return Ok(None);
         }
         if !receipt.state.unresolved() {
@@ -860,7 +925,7 @@ impl SessionStore {
         sandbox: &str,
         request_id: &str,
     ) -> Result<PreparedSandboxAttachment<'_>> {
-        self.resume_attachment(actor, sandbox, request_id, false)?
+        self.resume_attachment(actor, sandbox, request_id, false, None)?
             .ok_or(Error::Conflict(
                 "materialization has no unresolved candidate",
             ))
@@ -881,6 +946,47 @@ impl SessionStore {
             .inspect(inspect)
     }
 
+    /// Recover only the original semantic attachment request, before
+    /// reclaiming its source claim or invoking physical inspection.
+    pub fn sandbox_inspect_attachment_exact(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+        inspect: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &SandboxAttachment,
+            &PreparedSourceOperation,
+        ) -> Result<RecoveryInspection<SourceBinding>>,
+    ) -> Result<InspectedSandboxAttachment<'_>> {
+        self.resume_attachment(actor, sandbox, request_id, false, Some(request))?
+            .ok_or(Error::Conflict(
+                "materialization has no unresolved candidate",
+            ))?
+            .inspect(inspect)
+    }
+
+    /// Reconcile only the exact unpublished request and its original
+    /// prepared descriptor; no recovery of an Applied attachment.
+    pub fn sandbox_abandon_attachment_exact<F>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &SandboxAttachment,
+            &PreparedSourceOperation,
+        ) -> Result<F>,
+    ) -> Result<()> {
+        match self.resume_attachment(actor, sandbox, request_id, true, Some(request))? {
+            Some(prepared) => prepared.abandon(reconcile),
+            None => Ok(()),
+        }
+    }
+
     pub fn sandbox_abandon_attachment<F>(
         &self,
         actor: &PrincipalId,
@@ -892,7 +998,7 @@ impl SessionStore {
             &PreparedSourceOperation,
         ) -> Result<F>,
     ) -> Result<()> {
-        match self.resume_attachment(actor, sandbox, request_id, true)? {
+        match self.resume_attachment(actor, sandbox, request_id, true, None)? {
             Some(prepared) => prepared.abandon(reconcile),
             None => Ok(()),
         }

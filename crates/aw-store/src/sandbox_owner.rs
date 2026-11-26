@@ -35,7 +35,8 @@ pub use grants::{
 };
 pub(crate) mod source_bindings;
 pub use source_bindings::{
-    InspectedSandboxAttachment, PreparedSandboxAttachment, SandboxAttachment, SandboxSourceRelease,
+    InspectedSandboxAttachment, PreparedSandboxAttachment, SandboxAttachment,
+    SandboxMaterializationRequest, SandboxSourceRelease,
 };
 pub use source_bindings::{SourceBindingCompatibility, SourceBindingSummary};
 pub(crate) use source_bindings::{RETENTION_CLEANUP_PREFIX, SOURCE_RELEASE_PREFIX};

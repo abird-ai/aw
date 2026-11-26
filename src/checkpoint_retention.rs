@@ -1433,7 +1433,8 @@ mod tests {
         let unpublished = interrupt_baseline(&store, &baseline_discard, "fixture:baseline-discard");
         fs::write(&baseline_path, serde_json::to_vec(&discard_config).unwrap()).unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         abandon_baseline(&store, &baseline_path, "fixture:baseline-discard").unwrap();
         assert!(store.sandbox_get(&actor, &unpublished).is_err());
         assert_eq!(fs::read_dir(&baseline_discard).unwrap().count(), 0);
@@ -1473,11 +1474,337 @@ mod tests {
         assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
+
+        // Qualify the production first-source attachment under the original
+        // empty-layout reservation. The existing Host test covers the
+        // complete multi-source, replacement and partial release owners.
+        use aw_store::SandboxMaterializationRequest;
+        let attach_root = root.join("attach-first-source");
+        let attach_pending_root = root.join("attach-pending");
+        for target in [&attach_root, &attach_pending_root] {
+            aw_platform::ensure_private_dir(target).unwrap();
+        }
+        let empty = store
+            .sandbox_create_fresh(&actor, project, &layout(&attach_root))
+            .unwrap();
+        let pending_empty = store
+            .sandbox_create_fresh(&actor, project, &layout(&attach_pending_root))
+            .unwrap();
+        let anchor = &baseline.anchors[0];
+        let attach_config = |snapshot: &aw_store::SandboxSnapshot| {
+            json!({"version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+                "store_generation":store.local_process_info().unwrap().store_generation,
+                "manager":actor,"sandbox":snapshot.canonical_ref,"sandbox_rev":snapshot.rev,
+                "anchor":anchor,"destination_root":snapshot.tool_root,
+                "destination_identity":DirectoryIdentity::open(&snapshot.tool_root).unwrap().identity().unwrap(),
+                "repositories":[location]})
+        };
+        let attach_path = approvals.join("attach.json");
+        let pending_attach_path = approvals.join("attach-pending.json");
+        let config = attach_config(&empty);
+        let pending_config = attach_config(&pending_empty);
+        let mut file = aw_platform::open_private_new(&attach_path).unwrap();
+        file.write_all(&serde_json::to_vec(&config).unwrap())
+            .unwrap();
+        drop(file);
+        let mut file = aw_platform::open_private_new(&pending_attach_path).unwrap();
+        file.write_all(&serde_json::to_vec(&pending_config).unwrap())
+            .unwrap();
+        drop(file);
+        let attach = |store: &SessionStore, path: &Path, sandbox: &str, id: &str, recover: bool| {
+            crate::sandbox_source_attach::attach(store, &actor, path, sandbox, id, recover)
+        };
+        let abandon_attach = |store: &SessionStore, path: &Path, sandbox: &str, id: &str| {
+            crate::sandbox_source_attach::abandon(store, &actor, path, sandbox, id)
+        };
+        let mut stale = config.clone();
+        stale["sandbox_rev"] = json!(empty.rev + 1);
+        fs::write(&attach_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach",
+            false
+        )
+        .is_err());
+        fs::write(&attach_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let held = lock_private_approval(&attach_path).unwrap();
+        assert!(attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach",
+            false
+        )
+        .is_err());
+        drop(held);
+        let foreign = attach_root.join("foreign");
+        fs::write(&foreign, b"keep").unwrap();
+        assert!(attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach",
+            false
+        )
+        .is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        fs::remove_file(&foreign).unwrap();
+        assert!(store
+            .sandbox_prepare_attachment(
+                &actor,
+                &parent.canonical_ref,
+                parent.rev,
+                "fixture:bound-attach",
+                anchor.clone(),
+                |_, _| panic!("bound Sandbox reached planner")
+            )
+            .is_err());
+
+        let interrupt_attach =
+            |store: &SessionStore, snapshot: &aw_store::SandboxSnapshot, id: &str| {
+                let prepared = store
+                    .sandbox_prepare_attachment(
+                        &actor,
+                        &snapshot.canonical_ref,
+                        snapshot.rev,
+                        id,
+                        anchor.clone(),
+                        |_, prepare_id| {
+                            driver.plan_restore_approved(
+                                &GitRestoreLocation {
+                                    name: location.name.clone(),
+                                    repository: location.repository.clone(),
+                                    repository_identity: location.repository_identity,
+                                    target: snapshot.tool_root.join("code"),
+                                    parent_identity: DirectoryIdentity::open(&snapshot.tool_root)?
+                                        .identity()?,
+                                },
+                                &retained_anchor,
+                                prepare_id,
+                            )
+                        },
+                    )
+                    .unwrap();
+                prepared.revalidate().unwrap();
+                driver.execute_restore(prepared.source()).unwrap();
+                prepared.mark_unknown().unwrap();
+            };
+        interrupt_attach(&store, &empty, "fixture:attach-abandon");
+        let edited = attach_root.join("code/tracked");
+        fs::write(&edited, b"independent edit").unwrap();
+        assert!(abandon_attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach-abandon"
+        )
+        .is_err());
+        assert_eq!(fs::read(&edited).unwrap(), b"independent edit");
+        assert_eq!(
+            store.sandbox_get(&actor, &empty.canonical_ref).unwrap(),
+            empty
+        );
+        assert!(store
+            .create(&actor, "reserved first-source", layout(&attach_root))
+            .is_err());
+        fs::write(&edited, b"dirty checkpoint").unwrap();
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        abandon_attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach-abandon",
+        )
+        .unwrap();
+        assert!(fs::read_dir(&attach_root).unwrap().next().is_none());
+        assert!(attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach-abandon",
+            false
+        )
+        .is_err());
+        let attached = attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach",
+            false,
+        )
+        .unwrap();
+        assert_eq!(attached.rev, empty.rev + 1);
+        assert_eq!(attached.sources.len(), 1);
+        assert_eq!(attached.sources[0].binding_rev, attached.rev);
+        assert_eq!(attached.layout_digest, empty.layout_digest);
+        assert_eq!(
+            fs::read(attach_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        // Terminal replay never takes custody of the subsequently attached source.
+        abandon_attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach-abandon",
+        )
+        .unwrap();
+        assert_eq!(
+            attach(
+                &store,
+                &attach_path,
+                &empty.canonical_ref,
+                "fixture:attach",
+                false
+            )
+            .unwrap(),
+            attached
+        );
+        assert!(
+            abandon_attach(&store, &attach_path, &empty.canonical_ref, "fixture:attach").is_err()
+        );
+
+        interrupt_attach(&store, &pending_empty, "fixture:attach-pending");
+        let mut wrong = anchor.clone();
+        wrong.identity = head.clone();
+        for selection in [
+            SandboxMaterializationRequest {
+                expected_rev: pending_empty.rev,
+                anchor: &wrong,
+                replace: false,
+            },
+            SandboxMaterializationRequest {
+                expected_rev: pending_empty.rev + 1,
+                anchor,
+                replace: false,
+            },
+            SandboxMaterializationRequest {
+                expected_rev: pending_empty.rev,
+                anchor,
+                replace: true,
+            },
+        ] {
+            assert!(store
+                .sandbox_inspect_attachment_exact(
+                    &actor,
+                    &pending_empty.canonical_ref,
+                    "fixture:attach-pending",
+                    selection,
+                    |_, _, _| panic!("wrong request reached inspector")
+                )
+                .is_err());
+        }
+        let mut wrong_config = pending_config.clone();
+        wrong_config["anchor"]["identity"] = json!(head);
+        fs::write(
+            &pending_attach_path,
+            serde_json::to_vec(&wrong_config).unwrap(),
+        )
+        .unwrap();
+        assert!(attach(
+            &store,
+            &pending_attach_path,
+            &pending_empty.canonical_ref,
+            "fixture:attach-pending",
+            true
+        )
+        .is_err());
+        assert!(abandon_attach(
+            &store,
+            &pending_attach_path,
+            &pending_empty.canonical_ref,
+            "fixture:attach-pending"
+        )
+        .is_err());
+        fs::write(
+            &pending_attach_path,
+            serde_json::to_vec(&pending_config).unwrap(),
+        )
+        .unwrap();
+        assert!(attach(
+            &store,
+            &pending_attach_path,
+            &pending_empty.canonical_ref,
+            "fixture:attach-pending",
+            false
+        )
+        .is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let attached_recovered = attach(
+            &store,
+            &pending_attach_path,
+            &pending_empty.canonical_ref,
+            "fixture:attach-pending",
+            true,
+        )
+        .unwrap();
+        assert_eq!(attached_recovered.rev, pending_empty.rev + 1);
+        assert_eq!(
+            fs::read(attach_pending_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            store.agent_list(&actor, project, None, 64).unwrap(),
+            agents_before
+        );
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+                .unwrap(),
+            checkpoints_before
+        );
+        assert_eq!(
+            git(
+                &executable,
+                &repo,
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            ),
+            retained_refs
+        );
+        assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            attach(
+                &store,
+                &attach_path,
+                &empty.canonical_ref,
+                "fixture:attach",
+                false
+            )
+            .unwrap()
+            .rev,
+            attached.rev
+        );
+        assert_eq!(
+            attach(
+                &store,
+                &pending_attach_path,
+                &pending_empty.canonical_ref,
+                "fixture:attach-pending",
+                true
+            )
+            .unwrap()
+            .rev,
+            attached_recovered.rev
+        );
+        abandon_attach(
+            &store,
+            &attach_path,
+            &empty.canonical_ref,
+            "fixture:attach-abandon",
+        )
+        .unwrap();
         assert_eq!(
             create_baseline(
                 &store,

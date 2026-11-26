@@ -11,8 +11,8 @@ use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
     InspectedCheckpointRestore, InspectedSandboxAttachment, InspectedSandboxCreate,
     PreparedSandboxAttachment, SandboxAttachment, SandboxCreateFrom, SandboxCreateSources,
-    SandboxRecoverySelection, SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore,
-    VersionedSourceBinding,
+    SandboxMaterializationRequest, SandboxRecoverySelection, SandboxSnapshot, SandboxSourceRelease,
+    SessionBinding, SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -1423,20 +1423,46 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
+        self.resume_sandbox_attachment_in(actor, sandbox, request_id, None, authorize)
+    }
+
+    pub fn resume_sandbox_attachment_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.resume_sandbox_attachment_in(actor, sandbox, request_id, Some(request), authorize)
+    }
+
+    fn resume_sandbox_attachment_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: Option<SandboxMaterializationRequest<'_>>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
         let mut fence = None;
-        let inspected = self.store.sandbox_inspect_attachment(
-            actor,
-            sandbox,
-            request_id,
-            |registry, attachment, prepared| {
-                let approval = authorize(attachment, prepared)?;
-                let driver = registry.get(self.driver)?;
-                verify_attachment(&driver, attachment, prepared, &approval)?;
-                let result = driver.inspect_restore(prepared)?;
-                fence = Some(approval);
-                Ok(result)
-            },
-        )?;
+        let inspect = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                       attachment: &SandboxAttachment,
+                       prepared: &PreparedSourceOperation| {
+            fence = Some(authorize(attachment, prepared)?);
+            let approval = fence.as_ref().expect("approved");
+            let driver = registry.get(self.driver)?;
+            verify_attachment(&driver, attachment, prepared, approval)?;
+            driver.inspect_restore(prepared)
+        };
+        let inspected = match request {
+            Some(request) => self
+                .store
+                .sandbox_inspect_attachment_exact(actor, sandbox, request_id, request, inspect),
+            None => self
+                .store
+                .sandbox_inspect_attachment(actor, sandbox, request_id, inspect),
+        }?;
         self.publish_attachment(
             inspected,
             &fence.expect("successful attachment inspection called inspector"),
@@ -1470,29 +1496,56 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
     ) -> Result<()> {
-        self.store.sandbox_abandon_attachment(
-            actor,
-            sandbox,
-            request_id,
-            |registry, attachment, prepared| {
-                let fence = authorize(attachment, prepared)?;
-                let driver = registry.get(self.driver)?;
-                verify_attachment(&driver, attachment, prepared, &fence)?;
-                if let Some((old, source)) = attachment.replaced() {
-                    // Only an intact original with no new registration
-                    // may reject a replacement. Never lose the old row.
-                    driver.verify_replacement_untouched(
-                        &source.prepared,
-                        &old.binding,
-                        prepared,
-                    )?;
-                } else {
-                    driver.release_prepared_restore(prepared)?;
-                    attachment_location(&driver, attachment, &fence)?;
-                }
-                Ok(fence)
-            },
-        )
+        self.abandon_sandbox_attachment_in(actor, sandbox, request_id, None, authorize)
+    }
+
+    pub fn abandon_sandbox_attachment_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: SandboxMaterializationRequest<'_>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<()> {
+        self.abandon_sandbox_attachment_in(actor, sandbox, request_id, Some(request), authorize)
+    }
+
+    fn abandon_sandbox_attachment_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        request: Option<SandboxMaterializationRequest<'_>>,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<()> {
+        // Keep the actual guard even when verification/cleanup fails, until
+        // the Store has factually settled Unknown or Rejected.
+        let mut fence = None;
+        let reconcile = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                         attachment: &SandboxAttachment,
+                         prepared: &PreparedSourceOperation| {
+            fence = Some(authorize(attachment, prepared)?);
+            let approval = fence.as_ref().expect("approved");
+            let driver = registry.get(self.driver)?;
+            verify_attachment(&driver, attachment, prepared, approval)?;
+            if let Some((old, source)) = attachment.replaced() {
+                // Only an intact original with no new registration
+                // may reject a replacement. Never lose the old row.
+                driver.verify_replacement_untouched(&source.prepared, &old.binding, prepared)?;
+            } else {
+                driver.release_prepared_restore(prepared)?;
+                attachment_location(&driver, attachment, approval)?;
+            }
+            Ok(())
+        };
+        match request {
+            Some(request) => self
+                .store
+                .sandbox_abandon_attachment_exact(actor, sandbox, request_id, request, reconcile),
+            None => self
+                .store
+                .sandbox_abandon_attachment(actor, sandbox, request_id, reconcile),
+        }
     }
 
     /// Remove one original managed source from an unused open Sandbox.

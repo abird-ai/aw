@@ -23,6 +23,8 @@ mod sandbox_create;
 mod sandbox_derive;
 #[cfg(feature = "workspace")]
 mod sandbox_retention;
+#[cfg(feature = "workspace")]
+mod sandbox_source_attach;
 mod skill_package;
 mod source_metadata;
 #[cfg(all(feature = "team", target_os = "linux"))]
@@ -153,6 +155,12 @@ enum TopCommand {
     SandboxDerive {
         #[command(flatten)]
         args: sandbox_derive::Args,
+    },
+    /// Attach an exact retained Git version to an unused Sandbox.
+    #[cfg(feature = "workspace")]
+    SandboxSourceAttach {
+        #[command(flatten)]
+        args: sandbox_source_attach::Args,
     },
     /// Offline reconciliation of exact managed Git sources in a closed Sandbox.
     #[cfg(feature = "workspace")]
@@ -1731,6 +1739,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::SandboxDerive { args } => sandbox_derive::run(args),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxCreate { args } => sandbox_create::run(args),
+        #[cfg(feature = "workspace")]
+        TopCommand::SandboxSourceAttach { args } => sandbox_source_attach::run(args),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         #[cfg(feature = "workspace")]

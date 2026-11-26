@@ -19,7 +19,103 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: offline retained-version Project Sandbox creation
+## Latest local implementation delta — 2026-11-26: exact offline Git source attachment
+
+Parent: `8532f5e12a02477e22c4cb9ab5938c076935d39a` (standalone
+retained-version Sandbox baseline), signature verified. Original Agent/
+Turn journal and resource CLI owners remain occupied. Independent
+unused-Sandbox attachment consumer, L5 only; no Agent/runtime activation.
+
+- Production workspace-feature `aw sandbox-source-attach --state-dir
+  <existing private Store> <approval.json> <canonical-Sandbox> <request-id>`
+  uses the original SandboxSourceAttach Project receipt and existing
+  named-source publication. Mutually exclusive `--agent-recover`
+  (inspect/publish original effects) and `--agent-abandon` (reconcile
+  only the original unpublished incoming worktree). Namespace
+  `cli:sandbox-source-attach:<request-id>`. No replacement or removal
+  is admitted by this command; occupied name refuses.
+  Unlike standalone create/derive, the original attachment fingerprint
+  includes exact incoming anchor and expected Sandbox revision, so
+  terminal replay still requires the independent private approval
+  containing those semantic inputs. Applied replay returns the current
+  redacted Sandbox snapshot, no driver/layout access. Rejected replay
+  verifies the original indexed Prepared/current Rejected fact, not a
+  later current layout; a later successful attachment may legitimately
+  advance the old Sandbox revision. No cleanup can target that later
+  source. Fresh unresolved/Rejected retry and Applied abandonment refuse.
+- Private v1 JSON:
+  `{version,store_directory,store_id,store_generation,manager,sandbox,
+  sandbox_rev,anchor,destination_root,destination_identity,repositories}`.
+  Manager authenticated local OS principal, active exclusive Store scope,
+  original current Project writer, exact open unused Sandbox/rev
+  required. `anchor` is exact existing SourceAnchor for a retained
+  required Git version; no newly acquired retention, branch/HEAD
+  selection or implicit source permission. `repositories` covers
+  complete sorted final named layout (all old origins and incoming
+  origin); exact original Applied descriptors and retained siblings
+  verified by Git host. Shared private approval lease and pinned Git
+  layout: cwd=tool_root=destination_root, ordinary private origin
+  checkouts, disjoint existing private named-child layout. Fresh
+  incoming target must be absent, foreign files/links refused; recovery
+  uses original descriptors, not new path discovery. Only unused
+  Sandboxes, including the empty first-source layout or originally
+  managed siblings, qualify. Original Store rejects bound/shared/
+  active/unresolved layouts and preserves first-source layout
+  reservation plus source barrier. Independent host excludes all
+  outside users/writers, aliases, mounts, other Stores, backing and
+  retention users through operation and interruption; no physical
+  containment claim. Approval is separate from any native execution,
+  checkpoint history, retention cleanup or metadata grant.
+- Reusable `SandboxMaterializationRequest {expected_rev,anchor,replace}`
+  checks original semantic fingerprint before recovery reclaim;
+  `sandbox_inspect_attachment_exact` and
+  `sandbox_abandon_attachment_exact` share existing original receipt
+  and barrier owner. Exact Rejected replay checks immutable indexed
+  claim; the original transactional Rejected fact is authoritative
+  even after unrelated later revisions. Existing SDK methods remain
+  available. Shared Git attachment inspection/abandonment now retain
+  the actual independently authorized physical guard outside the
+  inspector/reconciler callback through Unknown settlement on error
+  as well as successful publication/cleanup (including existing SDK
+  replacement). No reexecution, adoption of a new candidate or
+  physical cleanup of any Applied resource. First attachment increments
+  original Sandbox rev and binding rev once, retains exact layout,
+  other binding identities and source retention. No new schema,
+  receipt, resource owner, Agent, checkpoint, grant, model tool or RPC.
+
+Validation (L5, Rust 1.95.0): production all-feature binary type-check;
+grouped real offline Git/SQLite lifecycle 1/1 (57.11s), Store Sandbox
+owner 4/4, Host source-checkpoint lifecycle 1/1 (164.82s). Existing
+grouped fixture proves exact first-source attachment, stale revision/
+busy approval/foreign destination refusal, bound-Sandbox refusal before
+planning, original unresolved layout reservation, edited unpublished
+candidate preserved through failed cleanup, exact repair/restart
+abandonment, subsequent fresh attach and old Rejected replay without
+touching the new binding, changed anchor/revision/replacement request
+refusal before inspection, original interrupted candidate publication
+after restart, terminal replay with original approval but no Git or
+physical origin. Parent content/HEAD/index, retained refs, Agent and
+public checkpoint lists unchanged. Existing Host multi-source,
+replacement and partial cleanup regression passed. Strict affected
+all-feature/all-target Clippy, durable library/minimal all-target
+checks, full binary build, actual CLI help/required args and mutually
+exclusive mode smoke passed. Scoped fmt/diff and signed exact commit
+checked. Prior durable-only non-workspace binary blocker, feature-specific
+warnings and broad CLI inventory discrepancy remain; unchanged Process
+suites and pinned Nix/native-platform qualification not rerun. Only
+isolated fixture effects; no real user source mutation.
+
+Next: exact source-aware Actor/Turn admission when original journal
+owners are available. Otherwise production unused-Sandbox replacement
+(including separately authorized post-release-gap continuation and
+original old+incoming origin fences), or exact final-source release
+through original release claim and factual event. Attachment is
+now a real offline consumer; do not duplicate it. Broader linked
+checkouts, mixed providers, ephemeral assets, bound-Agent structural
+mutation, Sandbox host RPCs and source-bearing Actor/Process admission
+remain held.
+
+## Previous local implementation delta — 2026-11-26: offline retained-version Project Sandbox creation
 
 Parent: `bab8987c86260e906a8266f5c4763c0615698a77` (standalone
 Git derive), signature verified. Original Agent/Turn journal and resource

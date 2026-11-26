@@ -16,7 +16,10 @@ use std::collections::BTreeSet;
 pub(crate) const RETENTION_CLEANUP_PREFIX: &str = "sandbox-retention:";
 mod attachment;
 pub(crate) use attachment::AttachmentBoundary;
-pub use attachment::{InspectedSandboxAttachment, PreparedSandboxAttachment, SandboxAttachment};
+pub use attachment::{
+    InspectedSandboxAttachment, PreparedSandboxAttachment, SandboxAttachment,
+    SandboxMaterializationRequest,
+};
 mod release;
 pub use release::SandboxSourceRelease;
 pub(crate) use release::SOURCE_RELEASE_PREFIX;
