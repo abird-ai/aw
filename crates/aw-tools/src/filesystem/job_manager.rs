@@ -4306,8 +4306,10 @@ mod tests {
                             sequence: start_sequence,
                         },
                         terminal: ProcessTerminal {
-                            exit: ProcessExit::Code(i32::MIN + coordinate as i32),
-                            stop: None,
+                            exit: ProcessExit::Signal(i32::MIN + coordinate as i32),
+                            stop: Some(crate::execution_stop::StopRecord::stopped(
+                                crate::execution_stop::StopReason::RuntimeError,
+                            )),
                             occupancy: crate::filesystem::runner::Occupancy::Unknown,
                             output: ProcessOutputMeta {
                                 stdout_bytes: u64::MAX,
@@ -4330,6 +4332,17 @@ mod tests {
                 .unwrap();
         }
         let rendered = manager.render_job_status("max-status").unwrap();
+        assert_eq!(
+            rendered.lines().count(),
+            crate::filesystem::batch::MAX_OPS + 1
+        );
+        assert!(rendered
+            .lines()
+            .skip(1)
+            .all(|line| line.contains("exit=signal:")
+                && line.contains("stop=runtime_error")
+                && line.contains("truncated=stdout,stderr")
+                && line.contains("incomplete=stdout,stderr")));
         assert!(
             rendered.len() <= MAX_COMPACT_JOB_STATUS_BYTES,
             "compact status grew to {} bytes: {rendered}",

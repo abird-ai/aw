@@ -217,11 +217,11 @@ pub use sandbox_owner::{
     PreparedSandboxEffect, SandboxAttachment, SandboxCreateFrom, SandboxCreateSources,
     SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease, SandboxEffectOrigin,
     SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxExecution,
-    SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle,
-    SandboxMaterializationRequest, SandboxPolicyEvidence, SandboxRecoverySelection,
-    SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease, SandboxToolRecovery,
-    SandboxToolRecoverySelection, SandboxToolTerminalRef, SourceBindingCompatibility,
-    SourceBindingSummary, SourceTurnReconciliation,
+    SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus, SandboxGraphNodeRecovery,
+    SandboxLifecycle, SandboxMaterializationRequest, SandboxPolicyEvidence,
+    SandboxRecoverySelection, SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease,
+    SandboxToolRecovery, SandboxToolRecoverySelection, SandboxToolTerminalRef,
+    SourceBindingCompatibility, SourceBindingSummary, SourceTurnReconciliation,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact foreground native Graph node source custody (this checkpoint; local parent `b41d1507cdc8147254bf723936c1d8708f5d9ee5`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: exact native Graph physical recovery and compact Job status (this checkpoint; local parent `d10ab7b5033f25524aca30961ca464c3f5f3d16d`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1779,11 +1779,28 @@ Current implementation: exact foreground native Graph node source custody (this 
       shared Job suite 88/89: unchanged 64-Process-node compact status fixture
       exceeds 8 KiB (8,458 bytes); assertion retained, parent not independently
       executed, correction open. 363 passed, one failed overall.
-      **Next:** correct the compact Job status bound before broader Job
-      qualification; independent Graph node physical recovery using the original
-      native artifact owner, then qualified Process-containing Graph and
-      extension dispatch, reviewed actual containment driver, then Vault
-      projection and remaining host RPC/retention. No arbitrary shell CLI
+      **Compact Job status correction + exact native Graph physical
+      recovery:** original shared 8 KiB bound preserved with exact compact
+      affected-stream lists; direct result and typed receipt unchanged.
+      Strengthened original worst-case assertion; shared Job 89/89,
+      runner 4/4 passed. One original Store recovery transaction for direct
+      and exact claimed Graph node; actual outer records plus exact native
+      node recovery view, no fabricated receipts. Shared original Git/
+      artifact inspector holds independent pins through positive proof/
+      release/revision commit. Missing proof refuses recorded-only recovery;
+      fresh claimed no-start denied; exact replay no inspection. Private
+      native recovery approval v3 selects exact Graph node; v1/v2 stay direct.
+      Real Stage fault + Graph write/Actor loss, wrong selector/physical
+      identity refusal and actual owned artifact cleanup, unowned lookalike,
+      original Turn/queue and index preserved; Actor lifecycle 3/3,
+      adapter 259/259, Host 2/2 passed. Standalone Store
+      4/4, actual executable 1/1 (v3 selector refuses direct tool),
+      strict affected Clippy, durable/minimal checks, version/help and
+      scoped fmt/diff passed. 362 selected tests green. Private offline
+      recovery settlement preserves original live node callback boundary.
+      **Next:** qualified Process-containing foreground Graph and extension
+      dispatch, reviewed actual containment driver, then Vault projection
+      and remaining host RPC/retention. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant

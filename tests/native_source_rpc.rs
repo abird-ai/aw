@@ -982,6 +982,13 @@ fn exercise_native_root_stdio(linked: bool) {
             .output()
             .unwrap()
     };
+    // A Graph-node selector cannot reinterpret the original direct write.
+    let mut wrong = recover_config.clone();
+    wrong["version"] = json!(3);
+    wrong["node"] = json!(1);
+    fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(!recover().status.success());
+    assert!(stage.is_file());
     let mut wrong = recover_config.clone();
     wrong["artifact_state_identity"] = json!([0, 0]);
     fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();

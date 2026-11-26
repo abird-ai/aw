@@ -26,7 +26,98 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: exact foreground native Graph node source custody
+## Latest local implementation delta — 2026-11-26: exact native Graph physical recovery and compact Job status
+
+Parent `d10ab7b5033f25524aca30961ca464c3f5f3d16d`. Published AW main
+`3eb2da22`; dotlink main `85ceccc1`; frozen release `576d0a1a`.
+L5 only; clean at entry. Store v60 and product 0.15.0 unchanged.
+
+- Fix the prior 64-node compact Job status overflow without widening
+  the 8 KiB control/result minimum. The shared Process status detail
+  reports affected streams as `truncated=stdout|stderr|stdout,stderr`
+  and `incomplete=stdout|stderr|stdout,stderr` (omitted when neither).
+  Retain original exit/signal, semantic stop and Graph status. The full
+  typed terminal and direct ShellNode result retain the exact prior
+  counts and boolean fields. Format into one String. Strengthen the
+  original assertion with distinct maximum-length signed signals,
+  longest semantic stop reason and both stream flags; verify every
+  coordinate and its evidence still fit. Shared Job 89/89, runner 4/4
+  passed, resolving the previous one failure.
+- One original recovery transaction handles direct tool effects and
+  exact native Graph coordinates. Existing recorded-only Graph recovery
+  delegates to the same owner without an inspector. New
+  `sandbox_recover_graph_node_exact` checks original immutable Graph,
+  task/Job binding and sealed node/coordinate, driver, actor/site,
+  requested effect and exact bound Sandbox before replay/inspection.
+  `SandboxToolRecovery` carries the actual original outer records and
+  optional `SandboxGraphNodeRecovery` (binding, native tool, arguments);
+  no fabricated peer ToolRecord, new node transition or history. Fresh
+  proof may settle a claimed node, not assert no-start. Existing release
+  or positive proof replays without a physical inspector. Absent proof
+  remains held unless the independently authorized inspector succeeds.
+- Reclaim the existing whole original named-source barrier before
+  inspection. Final release rechecks the original claim and closed
+  outer logical boundary, complete original binding digest and current
+  Sandbox; record positive quiescence with the actual recovery actor
+  and original node release, advance writable revision, retire the
+  exact barrier in one transaction. Failure/Unknown holds custody.
+  Reuse the existing native worker's proof/commit and Job callback's
+  release helper. Private recovery settlement alone can close a node
+  with missing callback; the public live lease still refuses positive
+  Graph settlement outside the original node callback. No change to
+  direct release encodings, schema, Run
+  owner or broader hazard/queue disposition.
+- `GitNativeSourceResolver::recover_configured_graph_node` uses the same
+  actual native/Git driver, independently approved checkout/backing
+  pins and original artifact namespace as direct recovery. Keep proof
+  guard and verified materializations through the original release.
+  Existing `native-source-recover` accepts explicit private approval
+  v3 with 1-based `node` coordinate (ordinary or linked); v1/v2 direct
+  approvals remain exact, no node selector. No general Graph activation
+  or native-turn-reconcile scope expansion.
+- Existing grouped real Actor regression adds a fourth Graph cut. A
+  deliberately unresolved Stage reservation in the real private
+  artifact registry prevents positive quiescence on the actual node
+  write. Lose Actor after the original interrupted outer receipt,
+  reopen Store, keep later Input pending. Reject recorded-only
+  recovery, wrong effect on released sibling, fresh false no-start,
+  and wrong physical checkout identity; preserve artifact, revision
+  and Run hazard on refusal. Real configured Git inspector cleans
+  only registered Stage, leaves unowned lookalike, actual write and
+  Git index intact, commits one positive source revision/release.
+  Exact replay does not inspect; whole-Run reconciliation preserves
+  original immutable Turn, releases original hazard/Input/queue only.
+  Original native/Process/mixed/Graph proof-only cuts retained.
+
+Validation (L5 locked/offline): shared Job 89/89 and runner 4/4;
+Actor lifecycle 3/3 (24.65s final, nine deliberate caught Actor losses).
+Adapter 259/259 (1.38s), Host native/Process 2/2 (6.19s final).
+Standalone Store Sandbox owner 4/4 (2.05s final), actual native
+executable 1/1 (35.42s final, ordinary and linked layouts, v3 selector
+refuses direct tool). Strict affected all-feature/all-target Clippy,
+durable/minimal all-target checks (existing feature-specific warnings),
+actual CLI version/help and scoped fmt/diff passed. 362 distinct
+selected tests passed. Full workspace/pinned Nix/other platforms
+not repeated.
+
+Scope: fixed serial foreground native Graph; physical inspection
+requires original independent private layout/artifact authority and
+permanent worker quiescence. Fixture fault at Stage boundary + Actor
+loss, not actual OS crash inside arbitrary native mutation. Positive
+Graph physical recovery qualified in the embedding host; CLI v3
+selector is separately checked against direct recovery. Other physical
+layouts/platforms, Process Graphs, arbitrary shell containment,
+background/interactive and extensions remain unqualified.
+No push, pin change or frozen 017 modification.
+
+Next: qualify Process nodes in the original foreground Graph under
+combined constructor/peer authority and the existing actual receipt/
+independent quiescence proof. Keep per-node claims, exact recovery
+selection and original Job transitions; no ambient shell fallback.
+Then remaining Vault projection, production containment/host RPC
+and retention gates. Phase 3 remains underway.
+
+## Previous local implementation delta — 2026-11-26: exact foreground native Graph node source custody
 
 Parent `b41d1507cdc8147254bf723936c1d8708f5d9ee5` (mixed direct native/Process
 composition); published AW main `3eb2da2280dd1f2860e1303d64297e0710d7e93f`,

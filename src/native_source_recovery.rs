@@ -46,6 +46,9 @@ struct Config {
     sandbox: String,
     turn: u64,
     call: String,
+    /// V3 selects an exact original foreground native Graph node.
+    #[serde(default)]
+    node: Option<usize>,
     base: PathBuf,
     base_identity: (u64, u64),
     // The recovery approval lives in the independently protected,
@@ -78,7 +81,13 @@ impl Approval {
             "native recovery approval requires its original artifact directory",
         ))?;
         let has_linked = config.repositories.iter().any(|repo| repo.linked.is_some());
-        if !matches!((config.version, has_linked), (1, false) | (2, true))
+        let valid_selector = match (config.version, config.node) {
+            (1, None) => !has_linked,
+            (2, None) => has_linked,
+            (3, Some(node)) => (1..=aw_tools::filesystem::batch::MAX_OPS).contains(&node),
+            _ => false,
+        };
+        if !valid_selector
             || &config.manager != manager
             || config.store_generation == 0
             || config.turn == 0
@@ -130,23 +139,29 @@ impl Approval {
     fn recover(&self, store: &SessionStore) -> Result<SandboxEffectOutcome> {
         let c = &self.config;
         require_store_scope(store, &c.store_directory, &c.store_id, c.store_generation)?;
-        GitNativeSourceResolver::recover_configured(
-            store,
-            &c.manager,
-            NativeSourceRecoveryTarget {
-                agent_ref: &c.agent,
-                turn_id: c.turn,
-                call_id: &c.call,
-            },
-            &c.sandbox,
-            |recovery| Ok((self.fence(store, recovery)?, self.artifact_state.clone())),
-        )
+        let target = NativeSourceRecoveryTarget {
+            agent_ref: &c.agent,
+            turn_id: c.turn,
+            call_id: &c.call,
+        };
+        let authorize = |recovery: &SandboxToolRecovery| {
+            Ok((self.fence(store, recovery)?, self.artifact_state.clone()))
+        };
+        match c.node {
+            Some(node) => GitNativeSourceResolver::recover_configured_graph_node(
+                store, &c.manager, target, node, &c.sandbox, authorize,
+            ),
+            None => GitNativeSourceResolver::recover_configured(
+                store, &c.manager, target, &c.sandbox, authorize,
+            ),
+        }
     }
 
     fn fence(&self, store: &SessionStore, recovery: &SandboxToolRecovery) -> Result<Fence> {
         let c = &self.config;
         let sandbox = store.sandbox_get(&c.manager, &c.sandbox)?;
         if recovery.agent_ref != c.agent
+            || recovery.node.as_ref().map(|node| node.binding.coordinate) != c.node
             || recovery.sandbox_ref != c.sandbox
             || sandbox.tool_root != c.base
             || sandbox.working_directory != c.base
@@ -214,10 +229,14 @@ pub(crate) fn run(path: &Path) -> Result<u8> {
     let approval = Approval::open(path, &manager)?;
     let store = aw::sessions::open_sqlite_owner(&approval.config.store_directory)?;
     let outcome = approval.recover(&store)?;
-    super::print_json(&serde_json::json!({
+    let mut result = serde_json::json!({
         "ref": approval.config.agent, "turn": approval.config.turn, "call": approval.config.call,
         "outcome": outcome, "scope": "source_effect_only"
-    }))?;
+    });
+    if let Some(node) = approval.config.node {
+        result["node"] = serde_json::json!(node);
+    }
+    super::print_json(&result)?;
     Ok(if outcome == SandboxEffectOutcome::Unknown {
         3
     } else {

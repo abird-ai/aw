@@ -20,8 +20,8 @@ use std::future::Future;
 
 pub(crate) mod journal;
 pub use journal::{
-    NativeTurnReconciliation, SandboxToolRecovery, SandboxToolRecoverySelection,
-    SandboxToolTerminalRef, SourceTurnReconciliation,
+    NativeTurnReconciliation, SandboxGraphNodeRecovery, SandboxToolRecovery,
+    SandboxToolRecoverySelection, SandboxToolTerminalRef, SourceTurnReconciliation,
 };
 
 /// A live decision of the trusted policy/tool authority owner. Implementors
@@ -542,7 +542,7 @@ impl SandboxEffectLease {
         ))?;
         let mut connection = self.barrier.store().connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        journal::record_quiescence_in(&tx, intent, outcome)?;
+        journal::record_quiescence_in(&tx, intent, &self.actor, outcome)?;
         self.barrier
             .settle_in(&tx, SourceMutationOutcome::Unknown)?;
         db(tx.commit())
@@ -552,9 +552,19 @@ impl SandboxEffectLease {
     /// factual settlement. Unknown preserves all source hazards. A known
     /// settled write-capable effect advances Sandbox rev once with release.
     pub fn settle(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        self.settle_with(outcome, false)
+    }
+
+    // Only the original offline recovery owner may consume independently
+    // established proof for a closed Graph without its node callback.
+    fn settle_recovered(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        self.settle_with(outcome, true)
+    }
+
+    fn settle_with(self, outcome: SandboxEffectOutcome, recovery: bool) -> Result<()> {
         let mut connection = self.barrier.store().connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        match self.settle_in(&tx, outcome) {
+        match self.settle_in(&tx, outcome, recovery) {
             Ok(()) => db(tx.commit()),
             Err(error) => {
                 db(tx.rollback())?;
@@ -565,10 +575,15 @@ impl SandboxEffectLease {
         }
     }
 
-    fn settle_in(&self, tx: &Transaction<'_>, outcome: SandboxEffectOutcome) -> Result<()> {
+    fn settle_in(
+        &self,
+        tx: &Transaction<'_>,
+        outcome: SandboxEffectOutcome,
+        recovery: bool,
+    ) -> Result<()> {
         if let Some(intent) = &self.intent {
             if outcome != SandboxEffectOutcome::Unknown {
-                journal::release_in(tx, intent, &self.actor, outcome)?;
+                journal::release_in(tx, intent, &self.actor, outcome, recovery)?;
             }
         }
         self.settle_sources_in(tx, outcome)

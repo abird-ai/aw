@@ -218,6 +218,43 @@ fn node_claim(
     Ok(Some(claim))
 }
 
+pub(super) fn recovery_claim_in(
+    c: &Connection,
+    observed: &Observation,
+    coordinate: usize,
+) -> Result<(Claim, SandboxGraphNodeRecovery)> {
+    let graph = original_graph(observed)?;
+    let task = original_task(c, observed)?;
+    let claim = node_claim(c, observed, &graph, graph.fingerprint(), &task, coordinate)?
+        .ok_or(Error::Conflict("original Graph node has no source custody"))?;
+    let binding = claim
+        .intent
+        .node
+        .as_ref()
+        .ok_or(Error::Conflict("original Graph node identity missing"))?;
+    require_sibling_job(c, observed, binding)?;
+    let step = &graph.steps()[coordinate - 1];
+    let tool = step.tool.native().ok_or(Error::Denied(
+        "Graph recovery requires original native node",
+    ))?;
+    let node = SandboxGraphNodeRecovery {
+        binding: binding.clone(),
+        tool,
+        arguments: step.arguments.clone(),
+    };
+    if node.effect() == ToolEffect::Read
+        && claim
+            .sources
+            .iter()
+            .any(|source| source.access == SourceAccess::ReadWrite)
+    {
+        return Err(Error::Conflict(
+            "original Graph read has contradictory write custody",
+        ));
+    }
+    Ok((claim, node))
+}
+
 fn unclaimed(c: &Connection, effect_id: &str) -> Result<()> {
     if fact_in::<SandboxEffectOutcome>(c, effect_id, QUIESCENT)?.is_some()
         || fact_in::<Release>(c, effect_id, RELEASED)?.is_some()
@@ -251,7 +288,7 @@ fn require_outcome_status(outcome: SandboxEffectOutcome, primary: Primary) -> Re
     }
 }
 
-fn released(
+pub(super) fn released(
     c: &Connection,
     observed: &Observation,
     claim: &Claim,
@@ -290,7 +327,7 @@ fn released(
 }
 
 // Graph claims are always on the original complete named source set.
-fn verify_complete_claim(
+pub(super) fn verify_complete_claim(
     c: &Connection,
     claim: &Claim,
     sandbox: &crate::SandboxSnapshot,
@@ -417,6 +454,43 @@ pub(super) fn require_startup_claims(
     Ok(())
 }
 
+fn require_release_boundary(
+    tx: &Transaction<'_>,
+    observed: &Observation,
+    claim: &Claim,
+) -> Result<()> {
+    if released(tx, observed, claim)?.is_some() {
+        return Err(Error::Conflict("original Graph node already released"));
+    }
+    let (session, branch) = agent_owner::key_for_ref(tx, &observed.intent.agent_ref)?;
+    require_current_sandbox_in(tx, AgentKey::new(&session, &branch), claim)?;
+    let sandbox = crate::sandbox_owner::snapshot_with_sources(tx, &claim.sandbox_ref)?;
+    verify_complete_claim(tx, claim, &sandbox)
+}
+
+fn append_node_release(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    intent: &Intent,
+    terminal: SandboxToolTerminalRef,
+    outcome: SandboxEffectOutcome,
+) -> Result<()> {
+    if outcome == SandboxEffectOutcome::Unknown
+        || fact_in::<SandboxEffectOutcome>(tx, &intent.effect_id(), QUIESCENT)? != Some(outcome)
+    {
+        return Err(Error::Conflict(
+            "Graph source release lacks exact physical proof",
+        ));
+    }
+    append_fact(
+        tx,
+        &intent.effect_id(),
+        RELEASED,
+        actor,
+        &Release::new(terminal, outcome),
+    )
+}
+
 fn release_node_in(
     store: &SessionStore,
     tx: &Transaction<'_>,
@@ -426,29 +500,49 @@ fn release_node_in(
     terminal: SandboxToolTerminalRef,
     outcome: SandboxEffectOutcome,
 ) -> Result<()> {
-    if outcome == SandboxEffectOutcome::Unknown
-        || fact_in::<SandboxEffectOutcome>(tx, &claim.intent.effect_id(), QUIESCENT)?
-            != Some(outcome)
-        || released(tx, observed, claim)?.is_some()
-    {
-        return Err(Error::Conflict(
-            "Graph source release lacks exact physical proof",
-        ));
-    }
-    let (session, branch) = agent_owner::key_for_ref(tx, &observed.intent.agent_ref)?;
-    require_current_sandbox_in(tx, AgentKey::new(&session, &branch), claim)?;
-    let sandbox = crate::sandbox_owner::snapshot_with_sources(tx, &claim.sandbox_ref)?;
-    verify_complete_claim(tx, claim, &sandbox)?;
+    require_release_boundary(tx, observed, claim)?;
     let sources = recovery_sources_in(store, tx, claim)?;
     let lease = reclaim_in(store, tx, actor, claim.intent.clone(), claim, &sources)?;
-    append_fact(
-        tx,
-        &claim.intent.effect_id(),
-        RELEASED,
-        actor,
-        &Release::new(terminal, outcome),
-    )?;
+    append_node_release(tx, actor, &claim.intent, terminal, outcome)?;
     lease.settle_sources_in(tx, outcome)
+}
+
+/// Same source release owner for an offline inspector's already-held
+/// lease. Reobserve the exact original claim/closed constructor; never
+/// invent the missing JobManager terminal transition. A fresh positive
+/// proof records only physical settlement of the original effect.
+pub(super) fn release_recovered_in(
+    tx: &Transaction<'_>,
+    intent: &Intent,
+    actor: &PrincipalId,
+    outcome: SandboxEffectOutcome,
+) -> Result<()> {
+    let coordinate = intent
+        .node
+        .as_ref()
+        .ok_or(Error::Conflict("original Graph node identity missing"))?
+        .coordinate;
+    let observed = observe(tx, &intent.agent_ref, intent.turn_id, &intent.call_id)?;
+    let (claim, _) = recovery_claim_in(tx, &observed, coordinate)?;
+    if observed.active || claim.intent != *intent {
+        return Err(Error::Denied(
+            "Graph recovery differs from closed original node",
+        ));
+    }
+    let terminal = terminal_in(tx, &observed)?.0;
+    require_release_boundary(tx, &observed, &claim)?;
+    match fact_in::<SandboxEffectOutcome>(tx, &intent.effect_id(), QUIESCENT)? {
+        Some(recorded) if recorded == outcome && outcome != SandboxEffectOutcome::Unknown => {}
+        None if outcome == SandboxEffectOutcome::Settled => {
+            record_quiescence_in(tx, intent, actor, outcome)?;
+        }
+        _ => {
+            return Err(Error::Conflict(
+                "Graph recovery lacks matching physical settlement",
+            ))
+        }
+    }
+    append_node_release(tx, actor, intent, terminal, outcome)
 }
 
 impl SessionStore {
@@ -533,59 +627,5 @@ impl SessionStore {
             outcome,
         )?;
         db(tx.commit())
-    }
-
-    /// Recover only a positively recorded source Graph node proof after the
-    /// original outer Run has closed. An absent proof remains held for
-    /// independent driver-specific inspection; never fabricate a node result.
-    pub fn sandbox_recover_recorded_graph_node(
-        &self,
-        manager: &PrincipalId,
-        agent_ref: &str,
-        turn: u64,
-        call: &str,
-        coordinate: usize,
-    ) -> Result<SandboxEffectOutcome> {
-        if self.inner.mode != crate::StoreMode::OwnerLock {
-            return Err(Error::Denied(
-                "Graph source recovery requires exclusive Store",
-            ));
-        }
-        let mut c = self.connection()?;
-        let tx = db(c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
-        let (session, branch) = agent_owner::key_for_ref(&tx, agent_ref)?;
-        let agent_key = AgentKey::new(&session, &branch);
-        agent_owner::authorize_permission(&tx, manager, agent_key, AgentPermission::View)?;
-        let observed = observe(&tx, agent_ref, turn, call)?;
-        let graph = original_graph(&observed)?;
-        let task = original_task(&tx, &observed)?;
-        let claim = node_claim(
-            &tx,
-            &observed,
-            &graph,
-            graph.fingerprint(),
-            &task,
-            coordinate,
-        )?
-        .ok_or(Error::Conflict("original Graph node has no source custody"))?;
-        let project = crate::sandbox_owner::parse_sandbox_ref(&claim.sandbox_ref)?.project;
-        crate::sandbox_owner::authorize_project(&tx, manager, &project, true)?;
-        require_current_sandbox_in(&tx, agent_key, &claim)?;
-        if let Some(outcome) = released(&tx, &observed, &claim)? {
-            return Ok(outcome);
-        }
-        if observed.active {
-            return Err(Error::Denied(
-                "Graph source recovery requires closed original Run",
-            ));
-        }
-        let terminal = terminal_in(&tx, &observed)?.0;
-        let outcome = fact_in::<SandboxEffectOutcome>(&tx, &claim.intent.effect_id(), QUIESCENT)?
-            .ok_or(Error::Conflict(
-            "Graph node requires independent physical recovery",
-        ))?;
-        release_node_in(self, &tx, manager, &observed, &claim, terminal, outcome)?;
-        db(tx.commit())?;
-        Ok(outcome)
     }
 }

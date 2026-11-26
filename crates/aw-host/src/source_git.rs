@@ -588,6 +588,7 @@ impl GitNativeSourceResolver {
             &self.store,
             manager,
             target,
+            None,
             SandboxToolRecoverySelection {
                 driver: &native.descriptor().driver,
                 sandbox_ref: None,
@@ -613,11 +614,37 @@ impl GitNativeSourceResolver {
         sandbox: &str,
         authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
     ) -> Result<SandboxEffectOutcome> {
+        Self::recover_configured_in(store, manager, target, None, sandbox, authorize)
+    }
+
+    /// Exact offline recovery of one originally claimed native Graph node.
+    /// The same independent Git/artifact fence and inspector serve both
+    /// routes. The outer constructor never substitutes for the node.
+    pub fn recover_configured_graph_node<F: crate::source_checkpoint::GitSourceFence>(
+        store: &SessionStore,
+        manager: &PrincipalId,
+        target: NativeSourceRecoveryTarget<'_>,
+        coordinate: usize,
+        sandbox: &str,
+        authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
+    ) -> Result<SandboxEffectOutcome> {
+        Self::recover_configured_in(store, manager, target, Some(coordinate), sandbox, authorize)
+    }
+
+    fn recover_configured_in<F: crate::source_checkpoint::GitSourceFence>(
+        store: &SessionStore,
+        manager: &PrincipalId,
+        target: NativeSourceRecoveryTarget<'_>,
+        coordinate: Option<usize>,
+        sandbox: &str,
+        authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
+    ) -> Result<SandboxEffectOutcome> {
         let key = aw_agent_core::DriverKey::builtin("native-filesystem")?;
         Self::recover_in(
             store,
             manager,
             target,
+            coordinate,
             SandboxToolRecoverySelection {
                 driver: &key,
                 sandbox_ref: Some(sandbox),
@@ -641,6 +668,7 @@ impl GitNativeSourceResolver {
         store: &SessionStore,
         manager: &PrincipalId,
         target: NativeSourceRecoveryTarget<'_>,
+        coordinate: Option<usize>,
         selection: SandboxToolRecoverySelection<'_>,
         git: impl FnOnce() -> Result<SourceDriverHandle<GitSourceDriver>>,
         authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
@@ -648,106 +676,115 @@ impl GitNativeSourceResolver {
         let expected_driver = selection.driver;
         let mut held = None;
         let mut physical = None;
-        let result = store.sandbox_recover_tool_source_effect_exact(
-            manager,
-            target.agent_ref,
-            target.turn_id,
-            target.call_id,
-            selection,
-            |recovery| {
-                let tool = FsTool::from_name(&recovery.original.call.name).ok_or(Error::Denied(
-                    "original effect is not a native filesystem tool",
-                ))?;
-                let effect = if tool.action() == Action::Read {
-                    ToolEffect::Read
-                } else {
-                    ToolEffect::Write
-                };
-                if &recovery.driver != expected_driver
-                    || recovery.original.effect != effect
-                    || !recovery.source.is_trusted_host()
-                    || tool == FsTool::Remove
-                {
+        let inspect = |recovery: &SandboxToolRecovery| {
+            let tool = FsTool::from_name(recovery.tool_name()).ok_or(Error::Denied(
+                "original effect is not a native filesystem tool",
+            ))?;
+            let effect = if tool.action() == Action::Read {
+                ToolEffect::Read
+            } else {
+                ToolEffect::Write
+            };
+            if &recovery.driver != expected_driver
+                || recovery.effect() != effect
+                || recovery.node.as_ref().map(|node| node.binding.coordinate) != coordinate
+                || !recovery.source.is_trusted_host()
+                || tool == FsTool::Remove
+            {
+                return Err(Error::Denied(
+                    "original effect is not owned by this native driver",
+                ));
+            }
+            let git = git()?;
+            let (fence, state_root) = authorize(recovery)?;
+            held = Some(fence);
+            let locations = held
+                .as_ref()
+                .expect("live native recovery fence")
+                .locations();
+            if locations.len() != recovery.sources.len() || locations.is_empty() {
+                return Err(Error::Conflict(
+                    "native recovery requires exact original source set",
+                ));
+            }
+            let sandbox = store.sandbox_get(manager, &recovery.sandbox_ref)?;
+            if locations.len() == 1
+                && locations[0].repository == sandbox.tool_root
+                && sandbox.sources.len() != 1
+            {
+                return Err(Error::Denied(
+                    "native recovery cannot grant a multi-source parent",
+                ));
+            }
+            let driver = store.source_driver(&git)?;
+            let mut repos = Vec::with_capacity(locations.len());
+            for (source, location) in recovery.sources.iter().zip(locations) {
+                if source.binding.binding.name != location.name {
+                    return Err(Error::Conflict("native recovery source selection changed"));
+                }
+                crate::source_filesystem::require_named_root(
+                    &sandbox.tool_root,
+                    &location.name,
+                    &location.repository,
+                    locations.len(),
+                )?;
+                if &source.binding.binding.driver != git.driver() {
                     return Err(Error::Denied(
-                        "original effect is not owned by this native driver",
+                        "Git source identity differs from registered driver",
                     ));
                 }
-                let git = git()?;
-                let (fence, state_root) = authorize(recovery)?;
-                held = Some(fence);
-                let locations = held
-                    .as_ref()
-                    .expect("live native recovery fence")
-                    .locations();
-                if locations.len() != recovery.sources.len() || locations.is_empty() {
-                    return Err(Error::Conflict(
-                        "native recovery requires exact original source set",
-                    ));
-                }
-                let sandbox = store.sandbox_get(manager, &recovery.sandbox_ref)?;
-                if locations.len() == 1
-                    && locations[0].repository == sandbox.tool_root
-                    && sandbox.sources.len() != 1
-                {
-                    return Err(Error::Denied(
-                        "native recovery cannot grant a multi-source parent",
-                    ));
-                }
-                let driver = store.source_driver(&git)?;
-                let mut repos = Vec::with_capacity(locations.len());
-                for (source, location) in recovery.sources.iter().zip(locations) {
-                    if source.binding.binding.name != location.name {
-                        return Err(Error::Conflict("native recovery source selection changed"));
-                    }
-                    crate::source_filesystem::require_named_root(
-                        &sandbox.tool_root,
-                        &location.name,
-                        &location.repository,
-                        locations.len(),
-                    )?;
-                    if &source.binding.binding.driver != git.driver() {
-                        return Err(Error::Denied(
-                            "Git source identity differs from registered driver",
-                        ));
-                    }
-                    repos.push(driver.verify_materialization(
-                        &source.binding.binding,
-                        &location.repository,
-                        location.repository_identity,
-                    )?);
-                }
-                let exclusions = git_layout_exclusions(&repos)?;
-                validate_git_artifact_state(&repos, &state_root)?;
-                let mut roots = Vec::with_capacity(locations.len());
-                for (source, location) in recovery.sources.iter().zip(locations) {
-                    roots.push(NativeSourceRoot {
-                        source: source.clone(),
-                        physical: GrantIdentity {
-                            path: location.repository.clone(),
-                            volume: location.repository_identity.0,
-                            object: location.repository_identity.1,
-                            read: true,
-                            write: source.access == SourceAccess::ReadWrite,
-                        },
-                        private_artifacts: reopen_source_artifacts(
-                            &location.repository,
-                            &state_root,
-                        )?,
-                    });
-                }
-                let layout =
-                    Self::pin_verified_layout(&sandbox.tool_root, roots, exclusions, true)?;
-                // Retain the original driver's checkout and administration
-                // identities alongside the capability through settlement.
-                physical = Some((layout, repos));
-                physical
-                    .as_ref()
-                    .expect("pinned native recovery layout")
-                    .0
-                    .reconcile_private_artifacts()?;
-                Ok(SandboxEffectOutcome::Settled)
-            },
-        );
+                repos.push(driver.verify_materialization(
+                    &source.binding.binding,
+                    &location.repository,
+                    location.repository_identity,
+                )?);
+            }
+            let exclusions = git_layout_exclusions(&repos)?;
+            validate_git_artifact_state(&repos, &state_root)?;
+            let mut roots = Vec::with_capacity(locations.len());
+            for (source, location) in recovery.sources.iter().zip(locations) {
+                roots.push(NativeSourceRoot {
+                    source: source.clone(),
+                    physical: GrantIdentity {
+                        path: location.repository.clone(),
+                        volume: location.repository_identity.0,
+                        object: location.repository_identity.1,
+                        read: true,
+                        write: source.access == SourceAccess::ReadWrite,
+                    },
+                    private_artifacts: reopen_source_artifacts(&location.repository, &state_root)?,
+                });
+            }
+            let layout = Self::pin_verified_layout(&sandbox.tool_root, roots, exclusions, true)?;
+            // Retain the original driver's checkout and administration
+            // identities alongside the capability through settlement.
+            physical = Some((layout, repos));
+            physical
+                .as_ref()
+                .expect("pinned native recovery layout")
+                .0
+                .reconcile_private_artifacts()?;
+            Ok(SandboxEffectOutcome::Settled)
+        };
+        let result = match coordinate {
+            Some(coordinate) => store.sandbox_recover_graph_node_exact(
+                manager,
+                target.agent_ref,
+                target.turn_id,
+                target.call_id,
+                coordinate,
+                selection,
+                inspect,
+            ),
+            None => store.sandbox_recover_tool_source_effect_exact(
+                manager,
+                target.agent_ref,
+                target.turn_id,
+                target.call_id,
+                selection,
+                inspect,
+            ),
+        };
         // Keep the independent authority and physical pins through the
         // original source owner settlement (also on failure).
         drop(physical);

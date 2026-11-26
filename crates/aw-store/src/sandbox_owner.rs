@@ -21,8 +21,8 @@ pub(crate) use effects::journal::EFFECT_PREFIX as JOURNALED_SOURCE_EFFECT_PREFIX
 pub use effects::{
     NativeTurnReconciliation, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch,
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
-    SandboxEffectRequest, SandboxToolRecovery, SandboxToolRecoverySelection,
-    SandboxToolTerminalRef, SourceTurnReconciliation,
+    SandboxEffectRequest, SandboxGraphNodeRecovery, SandboxToolRecovery,
+    SandboxToolRecoverySelection, SandboxToolTerminalRef, SourceTurnReconciliation,
 };
 pub(crate) mod construction;
 pub use construction::{

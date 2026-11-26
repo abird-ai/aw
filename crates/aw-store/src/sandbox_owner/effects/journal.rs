@@ -506,6 +506,7 @@ impl Release {
 pub(super) fn record_quiescence_in(
     tx: &Transaction<'_>,
     intent: &Intent,
+    actor: &PrincipalId,
     outcome: SandboxEffectOutcome,
 ) -> Result<()> {
     require_claim(tx, intent)?;
@@ -517,7 +518,7 @@ pub(super) fn record_quiescence_in(
             "source effect already settled or not proven quiescent",
         ));
     }
-    append_fact(tx, &intent.effect_id(), QUIESCENT, &intent.actor, &outcome)
+    append_fact(tx, &intent.effect_id(), QUIESCENT, actor, &outcome)
 }
 
 pub(super) fn release_in(
@@ -525,13 +526,17 @@ pub(super) fn release_in(
     intent: &Intent,
     actor: &PrincipalId,
     outcome: SandboxEffectOutcome,
+    recovery: bool,
 ) -> Result<()> {
-    require_claim(tx, intent)?;
     if intent.node.is_some() {
+        if recovery {
+            return node::release_recovered_in(tx, intent, actor, outcome);
+        }
         return Err(Error::Denied(
             "Graph source effect requires its original node closure",
         ));
     }
+    require_claim(tx, intent)?;
     let observed = observe(tx, &intent.agent_ref, intent.turn_id, &intent.call_id)?;
     if observed.intent != *intent {
         return Err(Error::Conflict("original source effect intent changed"));
@@ -556,8 +561,29 @@ pub(super) fn release_in(
     )
 }
 
+/// Exact original native Graph coordinate. The outer ToolRecords remain
+/// the constructor's immutable history, never fabricated peer receipts.
+#[derive(Clone, Debug)]
+pub struct SandboxGraphNodeRecovery {
+    pub binding: aw_tools::filesystem::job_manager::NodeExecutionBinding,
+    pub tool: aw_tools::filesystem::schema::Tool,
+    pub arguments: serde_json::Value,
+}
+
+impl SandboxGraphNodeRecovery {
+    pub fn effect(&self) -> ToolEffect {
+        if self.tool.action() == aw_tools::filesystem::access::Action::Read {
+            ToolEffect::Read
+        } else {
+            ToolEffect::Write
+        }
+    }
+}
+
 /// Read-only recovery input. The original journal is authoritative for
 /// intent/terminal; a terminal ToolRecord alone is not physical quiescence.
+/// For Graph recovery, original/terminal are the actual outer constructor
+/// records, and node identifies the original physical effect.
 pub struct SandboxToolRecovery {
     pub effect_id: String,
     pub agent_ref: String,
@@ -570,6 +596,22 @@ pub struct SandboxToolRecovery {
     pub terminal: ToolRecord,
     pub source: ToolSourceEvidence,
     pub sources: Vec<EffectiveSourceBinding>,
+    pub node: Option<SandboxGraphNodeRecovery>,
+}
+
+impl SandboxToolRecovery {
+    pub fn effect(&self) -> ToolEffect {
+        self.node.as_ref().map_or_else(
+            || self.original.effect.clone(),
+            SandboxGraphNodeRecovery::effect,
+        )
+    }
+
+    pub fn tool_name(&self) -> &str {
+        self.node
+            .as_ref()
+            .map_or(self.original.call.name.as_str(), |node| node.tool.name())
+    }
 }
 
 /// Trusted recovery consumer's exact original effect scope. A
@@ -589,21 +631,30 @@ fn authorize_recovery_in(
     agent_ref: &str,
     turn_id: u64,
     call_id: &str,
-) -> Result<(Observation, Claim)> {
+    coordinate: Option<usize>,
+) -> Result<(Observation, Claim, Option<SandboxGraphNodeRecovery>)> {
     let (session, branch) = agent_owner::key_for_ref(tx, agent_ref)?;
     let key = AgentKey::new(&session, &branch);
     agent_owner::authorize_permission(tx, manager, key, AgentPermission::View)?;
     let observed = observe(tx, agent_ref, turn_id, call_id)?;
-    if observed.record.effect == ToolEffect::Control {
-        return Err(Error::Denied(
-            "Graph source recovery requires exact node coordinate",
-        ));
-    }
-    let claim = require_claim(tx, &observed.intent)?;
+    let (claim, node) = match coordinate {
+        Some(coordinate) => {
+            let (claim, node) = node::recovery_claim_in(tx, &observed, coordinate)?;
+            (claim, Some(node))
+        }
+        None => {
+            if observed.record.effect == ToolEffect::Control {
+                return Err(Error::Denied(
+                    "Graph source recovery requires exact node coordinate",
+                ));
+            }
+            (require_claim(tx, &observed.intent)?, None)
+        }
+    };
     let project = super::super::parse_sandbox_ref(&claim.sandbox_ref)?.project;
     super::super::authorize_project(tx, manager, &project, true)?;
     require_current_sandbox_in(tx, key, &claim)?;
-    Ok((observed, claim))
+    Ok((observed, claim, node))
 }
 
 fn require_current_sandbox_in(tx: &Connection, key: AgentKey<'_>, claim: &Claim) -> Result<()> {
@@ -1013,7 +1064,7 @@ impl SessionStore {
         require_current_sandbox_in(&tx, AgentKey::new(&session, &branch), &claim)?;
         let sources = recovery_sources_in(self, &tx, &claim)?;
         let lease = reclaim_in(self, &tx, actor, observed.intent, &claim, &sources)?;
-        lease.settle_in(&tx, outcome)?;
+        lease.settle_in(&tx, outcome, false)?;
         db(tx.commit())?;
         Ok(Some(outcome))
     }
@@ -1034,7 +1085,15 @@ impl SessionStore {
         call_id: &str,
         inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
     ) -> Result<SandboxEffectOutcome> {
-        self.recover_tool_source_effect_in(manager, agent_ref, turn_id, call_id, None, inspect)
+        self.recover_tool_source_effect_in(
+            manager,
+            agent_ref,
+            turn_id,
+            call_id,
+            None,
+            None,
+            Some(inspect),
+        )
     }
 
     pub fn sandbox_recover_tool_source_effect_exact(
@@ -1051,8 +1110,55 @@ impl SessionStore {
             agent_ref,
             turn_id,
             call_id,
+            None,
             Some(selection),
-            inspect,
+            Some(inspect),
+        )
+    }
+
+    /// Recover one exact claimed native Graph node. No outer constructor
+    /// replay, missing-node terminal synthesis or broader Run disposition.
+    /// A fresh inspection can prove settlement, not that a claimed node
+    /// never started. Previously recorded no-start remains replayable.
+    pub fn sandbox_recover_graph_node_exact(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+        coordinate: usize,
+        selection: SandboxToolRecoverySelection<'_>,
+        inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
+    ) -> Result<SandboxEffectOutcome> {
+        self.recover_tool_source_effect_in(
+            manager,
+            agent_ref,
+            turn_id,
+            call_id,
+            Some(coordinate),
+            Some(selection),
+            Some(inspect),
+        )
+    }
+
+    /// Replay release or consume an existing positive Graph node proof;
+    /// missing proof is a refusal, not an invitation to probe or relaunch.
+    pub fn sandbox_recover_recorded_graph_node(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+        coordinate: usize,
+    ) -> Result<SandboxEffectOutcome> {
+        self.recover_tool_source_effect_in(
+            manager,
+            agent_ref,
+            turn_id,
+            call_id,
+            Some(coordinate),
+            None,
+            None::<fn(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>>,
         )
     }
 
@@ -1062,8 +1168,9 @@ impl SessionStore {
         agent_ref: &str,
         turn_id: u64,
         call_id: &str,
+        coordinate: Option<usize>,
         selection: Option<SandboxToolRecoverySelection<'_>>,
-        inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
+        inspect: Option<impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>>,
     ) -> Result<SandboxEffectOutcome> {
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
@@ -1074,14 +1181,18 @@ impl SessionStore {
             let mut connection = self.connection()?;
             let tx =
                 db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
-            let (observed, claim) =
-                authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id)?;
+            let (observed, claim, node) =
+                authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id, coordinate)?;
+            let effect = node.as_ref().map_or_else(
+                || observed.record.effect.clone(),
+                SandboxGraphNodeRecovery::effect,
+            );
             if selection.is_some_and(|selection| {
                 &claim.driver != selection.driver
                     || selection
                         .sandbox_ref
                         .is_some_and(|reference| reference != claim.sandbox_ref)
-                    || !selection.effects.contains(&observed.record.effect)
+                    || !selection.effects.contains(&effect)
                     || !observed.source.matches_source(selection.source)
                     || selection
                         .execution_site
@@ -1091,20 +1202,39 @@ impl SessionStore {
                     "source effect recovery differs from original driver, Sandbox or tool route",
                 ));
             }
+            if node.is_some() {
+                if let Some(outcome) = node::released(&tx, &observed, &claim)? {
+                    return Ok(outcome);
+                }
+                if observed.active {
+                    return Err(Error::Denied(
+                        "Graph source recovery requires closed original Run",
+                    ));
+                }
+                let sandbox = crate::sandbox_owner::snapshot_with_sources(&tx, &claim.sandbox_ref)?;
+                node::verify_complete_claim(&tx, &claim, &sandbox)?;
+            }
             let (terminal_ref, terminal) = terminal_in(&tx, &observed)?;
-            if let Some(outcome) = released_in(&tx, &observed, &terminal_ref)? {
-                return Ok(outcome);
+            if node.is_none() {
+                if let Some(outcome) = released_in(&tx, &observed, &terminal_ref)? {
+                    return Ok(outcome);
+                }
             }
             let recorded =
-                fact_in::<SandboxEffectOutcome>(&tx, &observed.intent.effect_id(), QUIESCENT)?;
-            let intent = observed.intent;
+                fact_in::<SandboxEffectOutcome>(&tx, &claim.intent.effect_id(), QUIESCENT)?;
+            if recorded.is_none() && inspect.is_none() {
+                return Err(Error::Conflict(
+                    "Graph node requires independent physical recovery",
+                ));
+            }
+            let intent = claim.intent.clone();
             let sources = recovery_sources_in(self, &tx, &claim)?;
             let lease = reclaim_in(self, &tx, manager, intent.clone(), &claim, &sources)?;
             if let Some(outcome) = recorded {
                 if outcome == SandboxEffectOutcome::Unknown {
                     return Err(Error::Storage("invalid source quiescence fact"));
                 }
-                lease.settle_in(&tx, outcome)?;
+                lease.settle_in(&tx, outcome, true)?;
                 db(tx.commit())?;
                 return Ok(outcome);
             }
@@ -1120,13 +1250,17 @@ impl SessionStore {
                 terminal,
                 source: observed.source,
                 sources,
+                node,
             };
             db(tx.commit())?;
             (lease, recovery)
         };
+        let inspect = inspect.ok_or(Error::Conflict(
+            "original source effect requires independent physical recovery",
+        ))?;
         match inspect(&recovery) {
             Ok(outcome) => {
-                lease.settle(outcome)?;
+                lease.settle_recovered(outcome)?;
                 Ok(outcome)
             }
             Err(error) => {

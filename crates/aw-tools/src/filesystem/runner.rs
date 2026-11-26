@@ -83,28 +83,41 @@ impl ProcessTerminal {
         }
     }
 
+    /// Compact Graph status detail. Stream lists contain exactly the
+    /// affected streams; an omitted field means neither is affected.
+    /// Full byte counts and booleans remain in the typed terminal and
+    /// dedicated ShellNode result.
     pub fn status_detail(self) -> String {
-        let mut fields = vec![match self.exit {
+        use std::fmt::Write as _;
+        let mut detail = match self.exit {
             ProcessExit::Code(code) => format!("exit={code}"),
             ProcessExit::Signal(signal) => format!("exit=signal:{signal}"),
             ProcessExit::Unknown => "exit=unknown".into(),
-        }];
-        if self.output.stdout_truncated {
-            fields.push("stdout_truncated=true".into());
-        }
-        if self.output.stderr_truncated {
-            fields.push("stderr_truncated=true".into());
-        }
+        };
         if let Some(reason) = self.stop_reason() {
-            fields.push(format!("stop={}", reason.as_str()));
+            write!(detail, " stop={}", reason.as_str()).expect("String write");
         }
-        if !self.output.stdout_complete {
-            fields.push("stdout_complete=false".into());
+        for (field, stdout, stderr) in [
+            (
+                "truncated",
+                self.output.stdout_truncated,
+                self.output.stderr_truncated,
+            ),
+            (
+                "incomplete",
+                !self.output.stdout_complete,
+                !self.output.stderr_complete,
+            ),
+        ] {
+            let streams = match (stdout, stderr) {
+                (true, true) => "stdout,stderr",
+                (true, false) => "stdout",
+                (false, true) => "stderr",
+                (false, false) => continue,
+            };
+            write!(detail, " {field}={streams}").expect("String write");
         }
-        if !self.output.stderr_complete {
-            fields.push("stderr_complete=false".into());
-        }
-        fields.join(" ")
+        detail
     }
 
     /// Compact ShellNode `result` metadata. stdout/stderr bytes themselves
@@ -200,6 +213,21 @@ mod tests {
         let compact = terminal.compact_result();
         assert!(compact.contains("stdout_truncated=true"));
         assert!(!compact.contains("incomplete"));
+        assert_eq!(terminal.status_detail(), "exit=0 truncated=stdout");
+        let terminal = ProcessTerminal {
+            output: ProcessOutputMeta {
+                stdout_truncated: false,
+                stderr_truncated: true,
+                stdout_complete: false,
+                stderr_complete: true,
+                ..terminal.output
+            },
+            ..terminal
+        };
+        assert_eq!(
+            terminal.status_detail(),
+            "exit=0 truncated=stderr incomplete=stdout"
+        );
     }
 
     #[test]

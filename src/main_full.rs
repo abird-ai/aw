@@ -187,7 +187,7 @@ enum TopCommand {
         /// independent exclusion of all other layout and Git backing users.
         approval: PathBuf,
     },
-    /// Offline recovery of one exact native source effect, never replay a tool.
+    /// Offline recovery of one exact native source effect (tool or Graph node), never replay.
     #[cfg(feature = "workspace")]
     NativeSourceRecover {
         /// Private approval in the original artifact state directory. The

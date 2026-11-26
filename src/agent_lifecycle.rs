@@ -1064,14 +1064,34 @@ mod tests {
             CheckpointPolicy, DriverKey, Role, SandboxDriverRegistry, SourceAccess,
             SourceDriverRegistry, SourceName, ToolCall,
         };
-        use aw_git::source_driver::GitSourceDriver;
+        use aw_git::source_driver::{GitSourceDriver, GitSourceLocation};
         use aw_host::{
             source_filesystem::NativeFilesystemDriver,
             source_git::{GitNativeSourceHost, GitNativeSourceResolver},
         };
         use aw_store::{AgentAdmission, AgentHistoryForkAccess, CheckpointRestoreRequest};
+        use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity};
         use serde_json::json;
-        use std::{fs, io::Write, path::Path, process::Command, time::Duration};
+        use std::{
+            fs,
+            io::Write,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+            path::Path,
+            process::Command,
+            time::Duration,
+        };
+
+        // Independent fixture approval of the exact original checkout and
+        // artifact namespace. All fixture writers/old Store are gone.
+        struct RecoveryFence {
+            locations: Vec<GitSourceLocation>,
+            _pins: Vec<aw_platform::DirectoryIdentity>,
+        }
+        impl aw_host::source_checkpoint::GitSourceFence for RecoveryFence {
+            fn locations(&self) -> &[GitSourceLocation] {
+                &self.locations
+            }
+        }
 
         const PROCESS_COMMAND: &str = "printf process-owned > process-created; printf process-stdout; printf process-stderr >&2";
         const RECOVERY_COMMAND: &str = "printf recovered-process > process-recovery; printf process-stdout; printf process-stderr >&2";
@@ -1259,13 +1279,15 @@ mod tests {
                         (
                             "interrupt-graph-before-claim"
                             | "interrupt-graph-after-settlement"
-                            | "interrupt-graph-lost-node",
+                            | "interrupt-graph-lost-node"
+                            | "interrupt-graph-needs-inspection",
                             0,
                         ) => {
                             let path = match prompt {
                                 "interrupt-graph-before-claim" => "graph-not-started",
                                 "interrupt-graph-after-settlement" => "graph-created",
-                                _ => "graph-unreleased",
+                                "interrupt-graph-lost-node" => "graph-unreleased",
+                                _ => "graph-inspected",
                             };
                             Some(ToolCall {
                                 id: "source-graph-fixture".into(),
@@ -2283,9 +2305,58 @@ mod tests {
             (10, "interrupt-graph-before-claim", "graph-not-started"),
             (11, "interrupt-graph-after-settlement", "graph-created"),
             (12, "interrupt-graph-lost-node", "graph-unreleased"),
+            (13, "interrupt-graph-needs-inspection", "graph-inspected"),
         ] {
             let no_start = message_id == 10;
             let lost_node = message_id == 12;
+            let needs_inspection = message_id == 13;
+            let unresolved = lost_node || needs_inspection;
+            let stage_name = ".aw-stage-graph-recovery-fixture.tmp";
+            let stage = repo.join(stage_name);
+            let lookalike = repo.join(".aw-stage-graph-unowned-fixture.tmp");
+            let checkout_identity = aw_platform::DirectoryIdentity::open(&repo)
+                .unwrap()
+                .identity()
+                .unwrap();
+            let artifact_identity = aw_platform::DirectoryIdentity::open(&approvals)
+                .unwrap()
+                .identity()
+                .unwrap();
+            if needs_inspection {
+                // Fault fixture at the real durable Stage boundary, exactly
+                // as in the executable native recovery test. The later
+                // original Graph write cannot assert quiescence while this
+                // original artifact namespace has unresolved custody.
+                let object_identity = |path: &Path| {
+                    let meta = fs::symlink_metadata(path).unwrap();
+                    ObjectIdentity {
+                        volume: meta.dev(),
+                        object: meta.ino(),
+                    }
+                };
+                let artifacts =
+                    aw_tools_adapter::native_filesystem::reopen_source_artifacts(&repo, &approvals)
+                        .unwrap();
+                let mut reservation = artifacts
+                    .reserve_name(
+                        Kind::Stage,
+                        String::new(),
+                        object_identity(&repo),
+                        stage_name.into(),
+                    )
+                    .unwrap();
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&stage)
+                    .unwrap();
+                let lease = reservation.finalize(object_identity(&stage)).unwrap();
+                file.write_all(b"original Graph artifact").unwrap();
+                file.sync_all().unwrap();
+                drop(lease);
+                fs::write(&lookalike, b"unowned").unwrap();
+            }
             let store =
                 SessionStore::open_with_sources(&state, registry.clone(), Default::default())
                     .unwrap();
@@ -2420,13 +2491,13 @@ mod tests {
                             aw_agent_core::AgentEvent::ToolFinished { record, .. } if !no_start => {
                                 assert_eq!(
                                     record.status,
-                                    if lost_node {
+                                    if unresolved {
                                         aw_agent_core::ToolStatus::Interrupted
                                     } else {
                                         aw_agent_core::ToolStatus::Succeeded
                                     }
                                 );
-                                if !lost_node {
+                                if !unresolved {
                                     let output = record.output.as_ref().unwrap();
                                     assert!(output.content.contains("fixture data"), "{output:?}");
                                     assert!(output.content.contains("graph node"), "{output:?}");
@@ -2449,7 +2520,7 @@ mod tests {
                 Some(&"fixture lost original Graph Actor")
             );
             let after = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
-            assert_eq!(after.rev, before.rev + u64::from(!no_start && !lost_node));
+            assert_eq!(after.rev, before.rev + u64::from(!no_start && !unresolved));
             assert_eq!(after.sources, before.sources);
             if no_start {
                 assert!(!repo.join(path).exists());
@@ -2471,7 +2542,7 @@ mod tests {
             drop(drivers);
             drop(approval);
             drop(store);
-            let store = if lost_node {
+            let store = if unresolved {
                 SessionStore::open_with_sources(&state, registry.clone(), Default::default())
                     .unwrap()
             } else {
@@ -2512,7 +2583,7 @@ mod tests {
                 assert!(recover(1).is_err());
             } else {
                 assert_eq!(recover(1).unwrap(), aw_store::SandboxEffectOutcome::Settled);
-                if lost_node {
+                if unresolved {
                     assert!(store
                         .reconcile_source_turn(&manager, &reference, turn_id)
                         .is_err());
@@ -2527,7 +2598,145 @@ mod tests {
                 } else {
                     assert_eq!(recover(3).unwrap(), aw_store::SandboxEffectOutcome::Settled);
                 }
-                assert_eq!(recover(2).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                if needs_inspection {
+                    use aw_host::source_git::NativeSourceRecoveryTarget;
+                    let target = || NativeSourceRecoveryTarget {
+                        agent_ref: &reference,
+                        turn_id,
+                        call_id: "source-graph-fixture",
+                    };
+                    let native_key = DriverKey::builtin("native-filesystem").unwrap();
+                    let source = aw_agent_core::ToolSource::trusted_host();
+                    let selector = |effects| aw_store::SandboxToolRecoverySelection {
+                        driver: &native_key,
+                        sandbox_ref: Some(&sandbox.canonical_ref),
+                        effects,
+                        source: &source,
+                        execution_site: Some("local"),
+                    };
+                    // Reject a mismatched effect even on an already released
+                    // sibling. An exact coordinate is not a capability.
+                    assert!(store
+                        .sandbox_recover_graph_node_exact(
+                            &manager,
+                            &reference,
+                            turn_id,
+                            "source-graph-fixture",
+                            1,
+                            selector(&[aw_agent_core::ToolEffect::Write]),
+                            |_| panic!("wrong effect must refuse before release replay"),
+                        )
+                        .is_err());
+                    assert!(stage.is_file());
+                    assert!(recover(2).is_err(), "absence of proof cannot settle node");
+                    // A claimed effect's fresh physical recovery cannot
+                    // invent a pre-launch outcome.
+                    assert!(store
+                        .sandbox_recover_graph_node_exact(
+                            &manager,
+                            &reference,
+                            turn_id,
+                            "source-graph-fixture",
+                            2,
+                            selector(&[aw_agent_core::ToolEffect::Write]),
+                            |_| Ok(aw_store::SandboxEffectOutcome::NotStarted),
+                        )
+                        .is_err());
+                    let inspect = |identity| {
+                        GitNativeSourceResolver::recover_configured_graph_node(
+                            &store,
+                            &manager,
+                            target(),
+                            2,
+                            &sandbox.canonical_ref,
+                            |recovery| {
+                                let node = recovery.node.as_ref().expect("original Graph node");
+                                assert_eq!(node.binding.coordinate, 2);
+                                assert_eq!(node.tool.name(), "write");
+                                assert_eq!(
+                                    node.arguments,
+                                    json!({"path":path,"content":"graph node"})
+                                );
+                                assert_eq!(recovery.original.call.name, "batch");
+                                assert_eq!(
+                                    recovery.original.effect,
+                                    aw_agent_core::ToolEffect::Control
+                                );
+                                assert_eq!(
+                                    recovery.terminal.status,
+                                    aw_agent_core::ToolStatus::Interrupted
+                                );
+                                assert_eq!(recovery.effect(), aw_agent_core::ToolEffect::Write);
+                                assert_eq!(recovery.sources.len(), 1);
+                                assert_eq!(
+                                    recovery.sources[0].binding.binding_rev,
+                                    before.sources[0].binding_rev
+                                );
+                                assert_eq!(
+                                    recovery.sources[0].binding.binding.name,
+                                    before.sources[0].name
+                                );
+                                assert_eq!(
+                                    recovery.sources[0].binding.binding.driver,
+                                    before.sources[0].driver
+                                );
+                                assert_eq!(recovery.sources[0].access, SourceAccess::ReadWrite);
+                                let root = aw_platform::DirectoryIdentity::open(&repo)?;
+                                let artifacts = aw_platform::DirectoryIdentity::open(&approvals)?;
+                                assert_eq!(artifacts.identity()?, artifact_identity);
+                                assert_eq!(root.identity()?, checkout_identity);
+                                Ok((
+                                    RecoveryFence {
+                                        locations: vec![GitSourceLocation {
+                                            name: name.clone(),
+                                            repository: repo.clone(),
+                                            repository_identity: identity,
+                                        }],
+                                        _pins: vec![root, artifacts],
+                                    },
+                                    approvals.clone(),
+                                ))
+                            },
+                        )
+                    };
+                    // Wrong independently approved checkout identity must
+                    // leave the exact artifact and original source hazard.
+                    assert!(inspect((0, 0)).is_err());
+                    assert!(stage.is_file());
+                    assert_eq!(
+                        store
+                            .sandbox_get(&manager, &sandbox.canonical_ref)
+                            .unwrap()
+                            .rev,
+                        before.rev
+                    );
+                    assert!(store
+                        .reconcile_source_turn(&manager, &reference, turn_id)
+                        .is_err());
+                    assert_eq!(
+                        inspect(checkout_identity).unwrap(),
+                        aw_store::SandboxEffectOutcome::Settled
+                    );
+                    assert!(!stage.exists());
+                    assert_eq!(fs::read(&lookalike).unwrap(), b"unowned");
+                    assert_eq!(fs::read(repo.join(path)).unwrap(), b"graph node");
+                    // Existing release replay must not re-probe the driver
+                    // or repeat physical cleanup.
+                    assert_eq!(
+                        GitNativeSourceResolver::recover_configured_graph_node::<RecoveryFence>(
+                            &store,
+                            &manager,
+                            target(),
+                            2,
+                            &sandbox.canonical_ref,
+                            |_| panic!("released Graph node must not inspect"),
+                        )
+                        .unwrap(),
+                        aw_store::SandboxEffectOutcome::Settled
+                    );
+                } else {
+                    assert_eq!(recover(2).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                }
                 assert_eq!(recover(2).unwrap(), aw_store::SandboxEffectOutcome::Settled);
             }
             let result = store
@@ -2535,7 +2744,7 @@ mod tests {
                 .unwrap();
             let effects = if no_start {
                 0
-            } else if lost_node {
+            } else if unresolved {
                 2
             } else {
                 3
@@ -2571,7 +2780,7 @@ mod tests {
             );
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 17);
+        assert_eq!(calls.load(Ordering::SeqCst), 18);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -2593,8 +2802,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 12
-                            && v.history.turns[11].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 13
+                            && v.history.turns[12].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -2604,7 +2813,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 20);
+        assert_eq!(calls.load(Ordering::SeqCst), 21);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
