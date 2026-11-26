@@ -447,6 +447,10 @@ where
     A: SandboxEffectAuthority + Send + 'static,
     S: aw_store::SecretStore + 'static,
 {
+    let prepared = prepared.with_vault_projection_claim(selection.projection_claim(
+        &handle.descriptor().provider,
+        aw_agent_core::VaultProjection::Env,
+    )?)?;
     run_fenced_source_process(
         prepared,
         deadline,
@@ -594,6 +598,10 @@ where
     A: SandboxEffectAuthority + Send + 'static,
     S: aw_store::SecretStore + 'static,
 {
+    let prepared = prepared.with_vault_projection_claim(selection.projection_claim(
+        &handle.descriptor().provider,
+        aw_agent_core::VaultProjection::Env,
+    )?)?;
     start_fenced_source_process(
         prepared,
         deadline,
@@ -882,6 +890,8 @@ mod tests {
             "host:closed-scope",
             "host:vault-stale",
             "host:vault-collision",
+            "host:vault-mismatched-claim",
+            "host:vault-downgrade",
             "host:vault-valid",
             "host:write",
             "host:unproven",
@@ -1271,6 +1281,77 @@ mod tests {
                 Some(SandboxEffectOutcome::NotStarted)
             );
         }
+        // The final launch must consume the exact immutable projection
+        // selection. A different valid current grant or an ordinary launch
+        // callback cannot reinterpret a previously sealed Process claim.
+        for id in ["host:vault-mismatched-claim", "host:vault-downgrade"] {
+            let selected_rev = if id == "host:vault-mismatched-claim" {
+                stale_rev
+            } else {
+                current_rev
+            };
+            let prepared = prepare(id, capture(), false)
+                .unwrap()
+                .with_vault_projection_claim(
+                    selection(selected_rev)
+                        .projection_claim(
+                            &vault_handle.descriptor().provider,
+                            aw_agent_core::VaultProjection::Env,
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            let completion = if id == "host:vault-downgrade" {
+                run_source_process(
+                    prepared,
+                    deadline(),
+                    CancellationToken::new(),
+                    |_| -> Result<()> { panic!("refused projection downgrade must not spawn") },
+                )
+                .await
+                .unwrap()
+            } else {
+                run_fenced_source_process(
+                    prepared,
+                    deadline(),
+                    CancellationToken::new(),
+                    None,
+                    signing_projection(
+                        vault_registry.reader().unwrap(),
+                        vault_handle.clone(),
+                        selection(current_rev),
+                        aw_agent_core::VaultProjection::Env,
+                    ),
+                    |_| -> Result<()> { panic!("mismatched Vault claim must not spawn") },
+                )
+                .await
+                .unwrap()
+            };
+            assert!(matches!(
+                completion.receipt,
+                Err(PipeLaunchFailure::NotStarted(_))
+            ));
+            assert_eq!(
+                completion.quiescence.unwrap(),
+                SandboxEffectOutcome::NotStarted
+            );
+            assert_eq!(std::fs::read(&code).unwrap(), b"initial");
+            final_records.push(
+                finish_tool(
+                    &journal,
+                    id,
+                    ToolStatus::Failed,
+                    ToolOutput::error("original Vault projection claim refused"),
+                )
+                .await,
+            );
+            assert_eq!(
+                store
+                    .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, id)
+                    .unwrap(),
+                Some(SandboxEffectOutcome::NotStarted)
+            );
+        }
         let valid = prepare("host:vault-valid", capture(), false).unwrap();
         let valid_id = valid.plan().effect_id.clone();
         let SourceProcessStart { launch, source } = start_source_process_with_vault(
@@ -1290,6 +1371,37 @@ mod tests {
         assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
         assert_eq!(receipt.output.stdout.head, b"done");
         assert_eq!(std::fs::read(&code).unwrap(), b"changed");
+        {
+            // Exact actual source and Vault provenance in one original
+            // committed claim, with one shared stable actor ceiling.
+            let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            let payload: String = c.query_row(
+                "SELECT payload_json FROM commit_log WHERE entity_type='source_effect' AND entity_id=?1 AND kind='source.effect.claimed'",
+                [&valid_id], |row| row.get(0),
+            ).unwrap();
+            let fact: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            let manifest = fact["fact"]["disclosure_manifest"].as_str().unwrap();
+            assert_eq!(fact["fact"]["vault_projection"]["projection"], "env");
+            assert_eq!(
+                fact["fact"]["vault_projection"]["selection_digest"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                32
+            );
+            assert!(!payload.contains("fixture challenge"));
+            let entries: (usize, usize, usize) = c
+                .query_row(
+                    "SELECT sum(entry_kind='fact' AND entry_ref GLOB 'source-claim:*'),
+                        sum(entry_kind='fact' AND entry_ref GLOB 'vault-claim:*'),
+                        sum(entry_kind='authority_root')
+                 FROM disclosure_manifest_entries WHERE node_digest=?1",
+                    [manifest],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(entries, (1, 1, 1));
+        }
         final_records.push(
             finish_tool(
                 &journal,

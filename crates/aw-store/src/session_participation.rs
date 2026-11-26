@@ -104,6 +104,7 @@ pub(crate) fn evidence_in(
     session: &str,
     actor: &PrincipalId,
 ) -> Result<SessionParticipationEvidence> {
+    crate::history_owner::source::require_session_reader(connection, session, actor)?;
     let _ = session_in(connection, session)?;
     let (audience_epoch, _management_revision): (u64, u64) = db(connection.query_row(
         "SELECT audience_epoch,management_revision

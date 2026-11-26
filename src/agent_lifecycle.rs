@@ -1773,6 +1773,21 @@ mod tests {
         };
         assert!(build(&store, &host).is_err());
         let grant = host.publish_grant(&manager, 0).unwrap();
+        let outsider = PrincipalId::new("internal:fixture:protected-source-viewer").unwrap();
+        // An independent source grant does not confer disclosure to a
+        // legacy Session viewer. Reject the source-aware host before
+        // activation; retiring the viewer permits the original private route.
+        store
+            .grant(&manager, &session, &outsider, Some(false))
+            .unwrap();
+        assert!(store.read_branch_view(&outsider, &session, &branch).is_ok());
+        assert!(matches!(
+            build(&store, &host),
+            Err(Error::Denied(
+                "source disclosure requires a private Session audience"
+            ))
+        ));
+        store.grant(&manager, &session, &outsider, None).unwrap();
         let (mut agent, source) = build(&store, &host).unwrap();
         let held = store.agent_get(&manager, &reference).unwrap();
         assert_eq!(held.admission, AgentAdmission::Held);
@@ -1821,6 +1836,36 @@ mod tests {
             turn
         );
         assert_eq!(turn.tool_records.len(), 2);
+        // Actual source custody has now committed the independent maximum
+        // disclosure ceiling. Same-user exact history inherits it even
+        // without a source layout, and cannot launder it via legacy export.
+        assert!(store
+            .grant(&manager, &session, &outsider, Some(false))
+            .is_err());
+        assert!(store
+            .read_branch_view(&outsider, &session, &branch)
+            .is_err());
+        assert!(store.export_jsonl(&manager, &session).is_err());
+        let fork_root = temp.0.join("protected-history-fork");
+        fs::create_dir(&fork_root).unwrap();
+        let (fork, fork_branch) = store
+            .create_agent_from_history_ref(
+                &manager,
+                &reference,
+                "protected exact history",
+                layout(&fork_root),
+                AgentHistoryForkAccess::Private,
+            )
+            .unwrap();
+        let inherited = store
+            .read_agent_branch_view(&manager, &fork.id, &fork_branch.id)
+            .unwrap();
+        assert_eq!(inherited.history.turns.len(), 1);
+        assert_eq!(json!(inherited.history.turns[0]), json!(turn));
+        assert!(store
+            .grant(&manager, &fork.id, &outsider, Some(false))
+            .is_err());
+        assert!(store.export_jsonl(&manager, &fork.id).is_err());
         assert!(store
             .reconcile_native_turn(&manager, &reference, turn.id)
             .is_err());

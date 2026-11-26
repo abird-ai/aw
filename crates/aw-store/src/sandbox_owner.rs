@@ -17,6 +17,7 @@ use std::path::PathBuf;
 const MAX_SANDBOX_LIST: usize = 256;
 
 mod effects;
+pub(crate) use effects::journal::history_disclosure_manifests;
 pub(crate) use effects::journal::EFFECT_PREFIX as JOURNALED_SOURCE_EFFECT_PREFIX;
 pub use effects::{
     NativeTurnReconciliation, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch,

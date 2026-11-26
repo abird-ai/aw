@@ -216,6 +216,11 @@ impl SandboxExecutionGuard<'_> {
         {
             return Err(Error::Denied("source execution scope changed"));
         }
+        crate::history_owner::source::require_private_audience(
+            c,
+            session,
+            &crate::session_owner_user(c, session)?,
+        )?;
         let key = AgentKey::new(session, branch);
         if agent_owner::canonical_ref(c, key)? != e.agent.canonical_ref() {
             return Err(Error::Denied("source execution Agent changed"));

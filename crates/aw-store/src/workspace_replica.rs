@@ -1284,7 +1284,8 @@ impl SessionStore {
                 "Workspace handoff requester peer is not trusted",
             ));
         }
-        let c = self.connection()?;
+        let mut connection = self.connection()?;
+        let c = db(connection.transaction_with_behavior(TransactionBehavior::Deferred))?;
         let workspace = workspace_row_raw(&c, workspace_id)?;
         let writer = workspace_writer::writer_row(&c, workspace_id)?;
         require_export_authority(&c, actor, &workspace, &writer, requester_node_id)?;
@@ -1300,6 +1301,27 @@ impl SessionStore {
             [],
             |r| r.get(0),
         ))?;
+        // This legacy snapshot does not carry the exact source disclosure
+        // DAG. Never export its content under a weaker representation.
+        {
+            let mut query =
+                db(c.prepare("SELECT id FROM sessions WHERE workspace_id=?1 LIMIT ?2"))?;
+            let sessions = db(db(query
+                .query_map(params![workspace_id, MAX_REPLICA_SESSIONS + 1], |row| {
+                    row.get::<_, String>(0)
+                }))?
+            .collect::<rusqlite::Result<Vec<_>>>())?;
+            if sessions.len() > MAX_REPLICA_SESSIONS {
+                return Err(Error::Limit("Workspace replica Session bound exceeded"));
+            }
+            for session in sessions {
+                if crate::history_owner::source::session_ceiling(&c, &session)?.is_some() {
+                    return Err(Error::Denied(
+                        "Workspace replica cannot preserve protected source disclosure",
+                    ));
+                }
+            }
+        }
         let (sessions, mut user_ids, artifact_ids) = load_replica_sessions(&c, workspace_id)?;
         if let Some(id) = &workspace.created_by_user_id {
             user_ids.insert(id.clone());

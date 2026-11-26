@@ -252,7 +252,8 @@ pub use teams::*;
 pub use types::*;
 pub use vault_grants::{
     VaultBindingSelection, VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus,
-    VaultGrantSummary, VaultGrantTarget, VaultGrantView, VaultSetOutcome, VaultSetRequest,
+    VaultGrantSummary, VaultGrantTarget, VaultGrantView, VaultProcessProjectionClaim,
+    VaultSetOutcome, VaultSetRequest,
 };
 pub use vault_signing::{
     SigningBroker, SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV,
@@ -772,6 +773,12 @@ pub(crate) fn authorize(
         return Err(Error::Denied("session unavailable or not permitted"));
     };
     let actor_user = user_for_principal(conn, actor)?;
+    history_owner::source::require_session_principal(
+        conn,
+        session,
+        "user",
+        actor_user.as_deref().unwrap_or(""),
+    )?;
     if match owner_user_id.as_deref() {
         Some(owner_user) => actor_user.as_deref() == Some(owner_user),
         None => owner == actor.as_str(),
@@ -2220,7 +2227,8 @@ impl SessionStore {
     }
 
     pub fn tree(&self, actor: &PrincipalId, session: &str) -> Result<Vec<Node>> {
-        let c = self.connection()?;
+        let mut connection = self.connection()?;
+        let c = db(connection.transaction_with_behavior(TransactionBehavior::Deferred))?;
         context::authorize_tree(&c, session, actor)?;
         nodes_in(&c, session)
     }
@@ -2232,7 +2240,8 @@ impl SessionStore {
         session_id: &str,
         branch_id: &str,
     ) -> Result<SessionView> {
-        let c = self.connection()?;
+        let mut connection = self.connection()?;
+        let c = db(connection.transaction_with_behavior(TransactionBehavior::Deferred))?;
         read_branch_view_in(&c, actor, session_id, branch_id, true)
     }
 
@@ -2244,7 +2253,8 @@ impl SessionStore {
         session_id: &str,
         branch_id: &str,
     ) -> Result<SessionView> {
-        let c = self.connection()?;
+        let mut connection = self.connection()?;
+        let c = db(connection.transaction_with_behavior(TransactionBehavior::Deferred))?;
         let branch = branch_in(&c, session_id, branch_id)?;
         if branch.id != branch_id {
             return Err(Error::Denied("Agent view requires an exact branch ID"));

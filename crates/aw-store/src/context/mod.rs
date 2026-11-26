@@ -157,6 +157,16 @@ pub(crate) fn disclosure(
     refs: &[EvidenceRef],
     viewers: &BTreeSet<PrincipalId>,
 ) -> Result<()> {
+    // The legacy context artifact path has no exact protected-source
+    // manifest transfer into its resulting Session. Do not silently
+    // declassify or retain only the old Session membership dependency.
+    for source in refs {
+        if crate::history_owner::source::session_ceiling(c, &source.session_id)?.is_some() {
+            return Err(Error::Denied(
+                "protected source context transfer requires an exact history or Event manifest",
+            ));
+        }
+    }
     for viewer in viewers {
         check_sources(c, viewer, refs)?;
     }
@@ -748,6 +758,7 @@ pub(crate) fn authorize_dependencies_for_grant(
     session: &str,
     member: &PrincipalId,
 ) -> Result<()> {
+    crate::history_owner::source::require_session_reader(c, session, member)?;
     let private: bool = db(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM context_private_sessions WHERE session_id=?1)",
         [session],

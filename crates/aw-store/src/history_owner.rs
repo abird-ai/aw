@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod source;
+
 const MANIFEST_FANOUT: usize = 64;
 const MAX_MANIFEST_INPUTS: usize = 16_384;
 const MAX_MANIFEST_WALK_NODES: usize = 16_384;
@@ -430,7 +432,7 @@ fn dependency_manifest(connection: &Connection, head: &str) -> Result<String> {
     for legacy in legacy {
         manifest = union_manifests(connection, &manifest, &legacy)?;
     }
-    Ok(manifest)
+    source::add_history_claims(connection, head, manifest)
 }
 
 pub(crate) fn legacy_protected_input_manifest(
@@ -1235,7 +1237,13 @@ fn manifest_authority_roots(
     connection: &Connection,
     manifest: &str,
 ) -> Result<Vec<(String, String, String, String)>> {
-    let mut stack = vec![manifest.to_owned()];
+    manifest_authority_roots_from(connection, vec![manifest.to_owned()])
+}
+
+fn manifest_authority_roots_from(
+    connection: &Connection,
+    mut stack: Vec<String>,
+) -> Result<Vec<(String, String, String, String)>> {
     let mut visited = BTreeSet::new();
     let mut roots = BTreeSet::new();
     while let Some(node) = stack.pop() {
@@ -1435,8 +1443,11 @@ fn validate_manifest_expansion(
 ) -> Result<()> {
     let roots = manifest_authority_roots(connection, manifest)?;
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
-    for (_root, kind, stable_key, _evidence) in roots {
+    for (_root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
+            source::KIND => {
+                source::require_principal(connection, &evidence, principal_kind, principal_handle)?
+            }
             "agent_source" => validate_agent_source_expansion(
                 connection,
                 actor,
@@ -1580,8 +1591,15 @@ pub(crate) fn authorize_event_manifest_reader(
     };
     let roots = manifest_authority_roots(connection, manifest)?;
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
-    for (_root, kind, stable_key, _evidence) in roots {
+    for (_root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
+            source::KIND => {
+                if let Some(decision) = classify_disclosure_check(source::require_principal(
+                    connection, &evidence, "user", &user,
+                ))? {
+                    return Ok(decision);
+                }
+            }
             "agent_source" => match agent_owner::key_for_ref_optional(connection, &stable_key)? {
                 Some((session, branch)) => match agent_owner::authorize_permission(
                     connection,
@@ -1686,8 +1704,29 @@ pub(crate) fn authorize_event_delivery(
     if let Some(manifest) = manifest {
         let roots = manifest_authority_roots(connection, manifest)?;
         let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
-        for (_root, kind, stable_key, _evidence) in roots {
+        for (_root, kind, stable_key, evidence) in roots {
             match kind.as_str() {
+                source::KIND => {
+                    for (principal_kind, principal_handle) in &recipient_audience {
+                        if let Some(decision) = classify_disclosure_check(
+                            source::require_principal(
+                                connection,
+                                &evidence,
+                                principal_kind,
+                                principal_handle,
+                            )
+                            .and_then(|()| {
+                                source::require_private_audience(
+                                    connection,
+                                    &recipient_session,
+                                    principal_handle,
+                                )
+                            }),
+                        )? {
+                            return Ok(decision);
+                        }
+                    }
+                }
                 "agent_source" => {
                     for (principal_kind, principal_handle) in &recipient_audience {
                         if let Some(decision) =
@@ -1784,8 +1823,11 @@ fn validate_fork_manifest_for_principal(
 
     let roots = manifest_authority_roots(connection, new_manifest)?;
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
-    for (root, kind, stable_key, _evidence) in roots {
+    for (root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
+            source::KIND => {
+                source::require_principal(connection, &evidence, principal_kind, principal_handle)?
+            }
             "agent_source" => validate_agent_source_expansion(
                 connection,
                 actor,
@@ -1923,6 +1965,9 @@ pub(crate) fn prepare_disclosure_expansion(
     principal_kind: &str,
     principal_handle: &str,
 ) -> Result<Option<String>> {
+    // Prior history grants never authorize newly exposed protected source
+    // custody. Check the independent ceiling before any replay shortcut.
+    source::require_session_principal(connection, agent.session, principal_kind, principal_handle)?;
     let (current_base, current_grant, destination_agent): (Option<String>, Option<String>, String) =
         db(connection.query_row(
             "SELECT history_base_id,history_grant_id,
@@ -2694,6 +2739,130 @@ mod tests {
                 .unwrap(),
             rev4,
             "failed new disclosure cannot advance Agent revision"
+        );
+    }
+
+    #[test]
+    fn protected_source_ceiling_overrides_prior_audience_and_event_share() {
+        let store = SessionStore::in_memory().unwrap();
+        let owner = PrincipalId::new("internal:fixture:source-disclosure-owner").unwrap();
+        let other = PrincipalId::new("internal:fixture:source-disclosure-other").unwrap();
+        let (origin, branch) = store
+            .create(&owner, "source disclosure", binding())
+            .unwrap();
+        let (recipient, recipient_branch) = store.create(&owner, "recipient", binding()).unwrap();
+        let domain = store.default_domain(&owner).unwrap();
+        let (other_user, origin_ref, recipient_ref) = {
+            let c = store.connection().unwrap();
+            (
+                crate::ensure_user_for_principal(&c, &other).unwrap(),
+                agent_owner::canonical_ref(&c, agent_owner::AgentKey::new(&origin.id, &branch.id))
+                    .unwrap(),
+                agent_owner::canonical_ref(
+                    &c,
+                    agent_owner::AgentKey::new(&recipient.id, &recipient_branch.id),
+                )
+                .unwrap(),
+            )
+        };
+        let other_ref = format!("/d:{}/i:{other_user}", domain.id);
+        store
+            .checkpoint(
+                &owner,
+                &origin.id,
+                &branch.id,
+                branch.revision,
+                "prior history",
+            )
+            .unwrap();
+        let rev = store
+            .agent_public_revision(&owner, &origin.id, &branch.id)
+            .unwrap();
+        let rev = store
+            .agent_access_set(
+                &owner,
+                &origin.id,
+                &branch.id,
+                &other_ref,
+                Some(crate::AgentPermissions::VIEW_ONLY),
+                rev,
+            )
+            .unwrap();
+        {
+            let c = store.connection().unwrap();
+            assert!(
+                source::record_claim(&c, &origin.id, &owner, ["fixture:refused".into()]).is_err()
+            );
+            assert!(source::session_ceiling(&c, &origin.id).unwrap().is_none());
+        }
+        let rev = store
+            .agent_access_set(&owner, &origin.id, &branch.id, &other_ref, None, rev)
+            .unwrap();
+        let manifest = {
+            let mut c = store.connection().unwrap();
+            let tx =
+                db(c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)).unwrap();
+            let manifest = source::record_claim(
+                &tx,
+                &origin.id,
+                &owner,
+                [
+                    "source-claim:fixture:1".into(),
+                    "vault-claim:fixture:1".into(),
+                ],
+            )
+            .unwrap();
+            let roots = manifest_authority_roots(&tx, &manifest).unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].1, source::KIND);
+            assert!(matches!(
+                authorize_event_manifest_reader(&tx, &owner, &manifest).unwrap(),
+                DisclosureAuthorization::Allow { .. }
+            ));
+            assert_eq!(
+                authorize_event_manifest_reader(&tx, &other, &manifest).unwrap(),
+                DisclosureAuthorization::Deny
+            );
+            assert!(matches!(
+                authorize_event_delivery(&tx, &owner, &origin_ref, &recipient_ref, Some(&manifest))
+                    .unwrap(),
+                DisclosureAuthorization::Allow { .. }
+            ));
+            tx.commit().unwrap();
+            manifest
+        };
+        // The earlier immutable grant is not authority for newly exposed
+        // source data, even when the original owner requests expansion.
+        assert!(matches!(
+            store.agent_access_set(
+                &owner,
+                &origin.id,
+                &branch.id,
+                &other_ref,
+                Some(crate::AgentPermissions::VIEW_ONLY),
+                rev
+            ),
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            store
+                .agent_public_revision(&owner, &origin.id, &branch.id)
+                .unwrap(),
+            rev
+        );
+        assert!(store
+            .grant(&owner, &origin.id, &other, Some(false))
+            .is_err());
+        store
+            .grant(&owner, &recipient.id, &other, Some(false))
+            .unwrap();
+        let c = store.connection().unwrap();
+        // Agent ACL alone is private; legacy Session viewer is enough to
+        // refuse protected Event delivery into this destination.
+        assert_eq!(
+            authorize_event_delivery(&c, &owner, &origin_ref, &recipient_ref, Some(&manifest))
+                .unwrap(),
+            DisclosureAuthorization::Deny
         );
     }
 

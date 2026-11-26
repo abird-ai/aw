@@ -457,6 +457,11 @@ where
             move |terminal: &ProcessTerminal| implementation.prove_quiescent(witness, terminal);
         match &self.signing {
             Some(signing) => {
+                let prepared =
+                    prepared.with_vault_projection_claim(signing.selection.projection_claim(
+                        &signing.handle.descriptor().provider,
+                        signing.projection,
+                    )?)?;
                 // The reader is live, not an authorization snapshot. Its
                 // typed provider and exact VaultGrant are checked inside the
                 // original source/Actor/Store final spawn fence.

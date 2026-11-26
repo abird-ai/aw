@@ -95,6 +95,7 @@ fn policy_in(c: &Connection, session: &str) -> Result<DraftPolicyInfo> {
 }
 
 fn grant_in(c: &Connection, session: &str, actor: &PrincipalId) -> Result<DraftGrantInfo> {
+    crate::history_owner::source::require_session_reader(c, session, actor)?;
     if principal_is_session_owner(c, session, actor)? {
         let user = actor_user(c, actor)?;
         return Ok(DraftGrantInfo {
@@ -139,6 +140,7 @@ pub(crate) fn draft_read_authorized_in(
     session: &str,
     actor: &PrincipalId,
 ) -> Result<bool> {
+    crate::history_owner::source::require_session_reader(c, session, actor)?;
     if principal_is_session_owner(c, session, actor)? {
         return Ok(true);
     }
@@ -166,6 +168,7 @@ fn current_submit_authorized_in(
     actor: &PrincipalId,
     scope_revision: u64,
 ) -> Result<bool> {
+    crate::history_owner::source::require_session_reader(c, session, actor)?;
     let policy = policy_in(c, session)?;
     if policy.mode == DraftMode::Off || policy.revision != scope_revision {
         return Ok(false);

@@ -287,6 +287,11 @@ struct Claim {
     driver: DriverKey,
     sources: Vec<NamedSourceAccess>,
     bindings_digest: [u8; 32],
+    // Older claims predate the protected-source disclosure contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disclosure_manifest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_projection: Option<crate::VaultProcessProjectionClaim>,
 }
 
 fn bindings_digest(sources: &[EffectiveSourceBinding]) -> Result<[u8; 32]> {
@@ -365,6 +370,7 @@ pub(super) fn claim_effect_in(
     intent: &Intent,
     plan: &SandboxEffectPlan,
     scope: &StoreScope,
+    vault_projection: Option<crate::VaultProcessProjectionClaim>,
 ) -> Result<()> {
     if plan.effect_id != intent.effect_id()
         || plan.grant.agent_ref != intent.agent_ref
@@ -373,7 +379,7 @@ pub(super) fn claim_effect_in(
     {
         return Err(Error::Conflict("original source effect custody changed"));
     }
-    let claim = Claim {
+    let mut claim = Claim {
         intent: intent.clone(),
         sandbox_ref: plan.grant.sandbox_ref.clone(),
         store_generation: scope.restore_generation(),
@@ -388,8 +394,87 @@ pub(super) fn claim_effect_in(
             })
             .collect(),
         bindings_digest: bindings_digest(&plan.grant.sources)?,
+        disclosure_manifest: None,
+        vault_projection,
     };
+    // Before any source/Process effect or its result can be exposed, seal
+    // the actual complete source custody's conservative disclosure ceiling.
+    // A claim is potential exposure, not a claim of successful execution.
+    let (session, _) = agent_owner::key_for_ref(tx, &intent.agent_ref)?;
+    let digest = crate::context::digest(&claim)?;
+    let mut facts = vec![format!(
+        "source-claim:{}:{}:{digest}",
+        intent.run_id, plan.effect_id
+    )];
+    if let Some(projection) = vault_projection {
+        let digest = crate::context::digest(&projection)?;
+        facts.push(format!(
+            "vault-claim:{}:{}:{digest}",
+            intent.run_id, plan.effect_id
+        ));
+    }
+    claim.disclosure_manifest = Some(crate::history_owner::source::record_claim(
+        tx,
+        &session,
+        &intent.actor,
+        facts,
+    )?);
     append_fact(tx, &plan.effect_id, CLAIMED, &intent.actor, &claim)
+}
+
+/// Original claim manifests on this exact history ancestry. The original
+/// Run prompt is the causal boundary even before ToolFinished/Turn exists.
+pub(crate) fn history_disclosure_manifests(c: &Connection, head: &str) -> Result<Vec<String>> {
+    const MAX: usize = 16_384;
+    let mut query = db(c.prepare_cached(
+        "WITH RECURSIVE ancestry(id,parent_id) AS (
+            SELECT id,parent_id FROM nodes WHERE id=?1
+            UNION ALL
+            SELECT n.id,n.parent_id FROM nodes n JOIN ancestry a ON a.parent_id=n.id
+         )
+         SELECT e.run_id,e.seq,c.entity_id,c.payload_json
+         FROM ancestry a JOIN runs r ON r.prompt_node=a.id
+         JOIN run_events e ON e.run_id=r.id AND e.kind='tool_started'
+         JOIN commit_log c ON c.entity_type='source_effect'
+           AND (c.entity_id=('source-tool:'||e.seq)
+                OR (c.entity_id>=('source-tool:'||e.seq||':')
+                    AND c.entity_id<('source-tool:'||e.seq||';')))
+           AND c.kind='source.effect.claimed'
+         ORDER BY e.seq,c.entity_id LIMIT ?2",
+    ))?;
+    let mut rows = db(query.query(params![head, MAX + 1]))?;
+    let mut manifests = Vec::new();
+    let mut count = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    #[derive(Deserialize)]
+    struct Payload {
+        sync_scope: String,
+        fact: Claim,
+    }
+    while let Some(row) = db(rows.next())? {
+        count += 1;
+        if count > MAX {
+            return Err(Error::Limit("source history disclosure bound exceeded"));
+        }
+        let run: String = db(row.get(0))?;
+        let seq: u64 = db(row.get(1))?;
+        let effect: String = db(row.get(2))?;
+        let payload: Payload = crate::decode(&db(row.get::<_, String>(3))?)?;
+        if payload.sync_scope != "local"
+            || payload.fact.intent.run_id != run
+            || payload.fact.intent.started_seq != seq
+            || payload.fact.intent.effect_id() != effect
+            || !seen.insert(effect)
+        {
+            return Err(Error::Conflict(
+                "source disclosure differs from original custody",
+            ));
+        }
+        if let Some(manifest) = payload.fact.disclosure_manifest {
+            manifests.push(manifest);
+        }
+    }
+    Ok(manifests)
 }
 
 fn require_claim(c: &Connection, intent: &Intent) -> Result<Claim> {

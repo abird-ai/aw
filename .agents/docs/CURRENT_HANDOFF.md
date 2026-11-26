@@ -26,7 +26,103 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: anonymous Vault file/socket proof capabilities
+## Latest local implementation delta — 2026-11-27: protected source/Vault disclosure custody and inherited history
+
+Parent `7be6b9ef59d3fe07f9c6b6f427570699ae57610f`; published AW main
+`0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only; scoped clean at entry. Store v60, product 0.15.0,
+Git recovery v4 and frozen release unchanged.
+
+- `history_owner/source.rs` uses the existing immutable content-addressed
+  disclosure DAG and `source_actor_v1` authority root, keyed by the
+  original Session with one stable-user maximum audience. No independent
+  source/provider share policy has been qualified, so the ceiling is
+  deliberately whole-Session and actor-private. Require the sole active
+  stable user across the legacy Session audience, Agent branches/ACLs
+  and shared draft readers before source-aware activation and again in
+  the actual source custody claim transaction. Agent Share, Project
+  rights or an earlier history grant cannot widen this ceiling.
+- Original direct/Graph claims retain the exact original effect/run
+  provenance, complete source binding commitment and immutable manifest
+  in the same transaction as the original lease/claim. Separate source
+  and optional Vault fact edges share the common authorization root.
+  Claims describe potential exposure, including unresolved and factual
+  no-start cases, not evidence of success. Existing claims without the
+  new fields remain decodable; no retroactive provenance is fabricated.
+  History seal and Event publication collect exact claim manifests along
+  original Run ancestry, including the active prompt. History forks and
+  accepted EventInput dependencies carry the existing DAG references;
+  multi-root walks deduplicate shared nodes within existing bounds.
+- Existing Session, Agent, participant and draft authorization owners
+  enforce the ceiling, including before the earlier-audience replay
+  shortcut and at ACL mutation. Whole recipient Session/Agent audience
+  is checked for Event delivery. Tree/branch views read authorization
+  and content under a common SQLite snapshot. Legacy context-artifact
+  transfers, JSONL archive and Workspace replica export cannot yet
+  preserve this manifest: protected data refuses those paths rather
+  than silently declassifying. Same-user exact history fork remains
+  available. No parallel ACL service or schema migration.
+- `VaultProcessProjectionClaim` commits to the exact nonsecret provider
+  entry, name, scope, grant revision and projection kind before Process
+  admission. No challenge, proof, key bytes or descriptor paths enter
+  that commitment. Fenced launch must consume that same selection and
+  revalidate the existing live provider/grant; an ordinary launch or a
+  different otherwise-authorized selection refuses. The registered
+  signing Job route and existing finite/interactive signing APIs seal
+  the claim. Unfenced admission cannot consume it. Actual Process
+  owner, proof transports, terminal/release/reconciliation contracts
+  and physical quiescence requirements remain unchanged.
+- Actual Actor fixture refuses pre-existing extra Session viewer at
+  source activation, permits original private source execution after
+  viewer retirement, denies late regrant/export, and retains the exact
+  original Turn and protected ceiling in a same-user history fork with
+  no source layout. History-manifest owner fixture checks prior history
+  grant refusal, unchanged revision, Event reader allow/deny and refusal
+  of a recipient with an extra legacy viewer. Host Process fixture
+  checks different valid Vault selection and ordinary-launch downgrade
+  both factual no-start, then verifies original successful claim contains
+  one source fact, one Vault fact and one common authority root. Prior
+  native/Process/Graph/Vault recovery and original queued Input cases
+  remain exercised.
+
+Validation: L5 locked/offline history owner 5/5 (2.03s), Actor lifecycle
+3/3 (53.04s), Host source Process 2/2 (6.27s), native executable
+1/1 (35.24s); strict Store/Host/CLI all-feature/all-target Clippy
+with -D warnings, durable/minimal all-target checks, scoped rustfmt
+and diff check passed. Existing profile-specific dead-code warnings
+remain. Full Store all-feature library 272/277 (322.60s), including
+the five focused history tests; exactly the five earlier recorded
+legacy failures reproduced:
+
+- agent_host::tests::host_agent_state_shell_creates_reads_edits_and_fences_future_admission:
+  closed legacy Job Event subscription after DL-200 cutover.
+- principal_groups::tests::v38_to_v39_backfills_domain_user_principals_without_changing_handles:
+  foreign key constraint during legacy downgrade.
+- remote_start::tests::v35_open_migrates_legacy_remote_start_and_agent_exposure_indexes:
+  preexisting agent_state_current table.
+- remote_view::tests::remote_view_grant_is_reconnectable_only_for_exact_read_identity:
+  schema 60 vs obsolete expectation 35.
+- remote_view::tests::remote_view_v34_to_v35_migration_preserves_store_identity:
+  preexisting policy_admission_current table.
+
+278 distinct selected tests passed; no new failing Store test relative
+to the documented prior broad runs. No full-suite-green claim or
+unrelated fixture repair. Parent broad suite not independently rerun.
+
+Scope: reviewed derived Env/File/Socket proof consumers and actual new
+source-effect claims, conservative stable-actor-only disclosure. No raw
+Vault credential projection, generic byte taint, retroactive protection
+claim for old unmarked custody, independent external source/provider
+share policy, arbitrary participant/extension execution or full data
+surface qualification. Exact manifest-preserving legacy transfer and
+export, general protected provider metadata/Views and live revocable
+broker/socket remain to be implemented. No new listener or containment
+backend; one-shot socket remains bounded delivery. Next cut: qualify
+provider-owned live broker/socket with exact revocation and metadata
+ceiling, then remaining disclosure transport/production dispatch,
+reviewed physical containment and Sandbox/Vault host RPC/retention.
+
+## Previous local implementation delta — 2026-11-27: anonymous Vault file/socket proof capabilities
 
 Parent `34ebeb284e7587fd3f190e80b9d388504e135ea7`; published AW main
 `0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen

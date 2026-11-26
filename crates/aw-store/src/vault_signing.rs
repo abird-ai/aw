@@ -326,6 +326,24 @@ pub struct SigningProcessProof {
 }
 
 impl SigningProcessProof {
+    pub fn projection_claim(
+        &self,
+        provider: &DriverKey,
+        projection: VaultProjection,
+    ) -> Result<crate::VaultProcessProjectionClaim> {
+        self.validate()?;
+        crate::VaultProcessProjectionClaim::new(
+            &VaultEntryRef {
+                provider: provider.clone(),
+                entry: self.entry.clone(),
+            },
+            &self.name,
+            &self.scope,
+            self.grant_rev,
+            projection,
+        )
+    }
+
     /// The host owns this fixed selection; validate before installing a route
     /// and again at the actual provider use. This is not grant authority.
     pub fn validate(&self) -> Result<()> {

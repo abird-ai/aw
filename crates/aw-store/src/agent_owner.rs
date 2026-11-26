@@ -591,6 +591,12 @@ pub(crate) fn authorize_permission(
     validate(agent)?;
     let user = user_for_principal(connection, actor)?
         .ok_or(Error::Denied("Agent principal is inactive or unknown"))?;
+    crate::history_owner::source::require_session_principal(
+        connection,
+        agent.session,
+        "user",
+        &user,
+    )?;
     let user_security_epoch: u64 = db(connection.query_row(
         "SELECT security_epoch FROM users WHERE user_id=?1 AND status='active'",
         [&user],
@@ -894,6 +900,14 @@ pub(crate) fn initialize_acl(
     if permissions.is_empty() {
         return Ok(());
     }
+    if permissions.view {
+        crate::history_owner::source::require_session_principal(
+            connection,
+            agent.session,
+            principal_kind,
+            principal_handle,
+        )?;
+    }
     if !matches!(principal_kind, "user" | "group") {
         return Err(Error::Denied("invalid Agent ACL principal kind"));
     }
@@ -943,6 +957,14 @@ pub(crate) fn set_acl(
     expected_rev: u64,
 ) -> Result<(u64, u64, bool)> {
     let permissions = permissions.validate()?;
+    if permissions.view {
+        crate::history_owner::source::require_session_principal(
+            connection,
+            agent.session,
+            principal_kind,
+            principal_handle,
+        )?;
+    }
     if revision(connection, agent)? != expected_rev {
         return Err(Error::Conflict("stale Agent revision"));
     }

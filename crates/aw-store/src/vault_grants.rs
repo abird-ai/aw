@@ -50,6 +50,53 @@ impl VaultGrantTarget {
     }
 }
 
+/// Immutable, nonsecret commitment to one selected Process projection.
+/// This is potential exposure provenance, not a Vault grant or proof
+/// that materialization/spawn actually occurred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultProcessProjectionClaim {
+    projection: VaultProjection,
+    selection_digest: [u8; 32],
+}
+
+impl VaultProcessProjectionClaim {
+    pub fn new(
+        entry: &VaultEntryRef,
+        name: &SourceName,
+        scope: &str,
+        grant_rev: u64,
+        projection: VaultProjection,
+    ) -> Result<Self> {
+        use sha2::{Digest as _, Sha256};
+        entry.validate()?;
+        name.validate()?;
+        opaque(scope)?;
+        if projection == VaultProjection::Broker || grant_rev == 0 || grant_rev > i64::MAX as u64 {
+            return Err(Error::Denied(
+                "invalid original Vault Process projection selection",
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"aw-vault-process-projection-claim-v1\0");
+        hash.update(crate::json(&(entry, name, scope, grant_rev, projection))?.as_bytes());
+        Ok(Self {
+            projection,
+            selection_digest: hash.finalize().into(),
+        })
+    }
+
+    pub(crate) fn for_target(target: &VaultGrantTarget, grant_rev: u64) -> Result<Self> {
+        Self::new(
+            &target.entry,
+            &target.name,
+            &target.scope,
+            grant_rev,
+            target.projection,
+        )
+    }
+}
+
 /// Evidence supplied by a trusted provider's live authority owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultGrantPolicy {

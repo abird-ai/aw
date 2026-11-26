@@ -254,6 +254,7 @@ pub struct PreparedSandboxEffect<'a, P, A> {
     store: &'a SessionStore,
     request: SandboxEffectRequest,
     boundary: Boundary,
+    vault_projection: Option<crate::VaultProcessProjectionClaim>,
     // Drop inert capability pins before the guard authorizing them.
     prepared: P,
     authority: A,
@@ -266,6 +267,28 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
 
     pub fn authority(&self) -> &A {
         &self.authority
+    }
+
+    /// Seal the trusted host-selected potential Vault exposure before the
+    /// original claim. Only the original Process launch token can consume
+    /// it, and current provider/grant authority is still required there.
+    pub fn with_vault_projection_claim(
+        mut self,
+        claim: crate::VaultProcessProjectionClaim,
+    ) -> Result<Self> {
+        if self.vault_projection.is_some()
+            || self.boundary.intent.is_none()
+            || self
+                .authority
+                .tool_binding()
+                .is_none_or(|binding| binding.effect != aw_agent_core::ToolEffect::Process)
+        {
+            return Err(Error::Denied(
+                "Vault projection requires exact original Process intent",
+            ));
+        }
+        self.vault_projection = Some(claim);
+        Ok(self)
     }
 }
 
@@ -306,6 +329,11 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
     /// together through factual settlement, including when its awaiter is
     /// dropped. No second claim or new execution admission is introduced.
     pub fn admit_with_authority(self) -> Result<(P, A, SandboxEffectLease)> {
+        if self.vault_projection.is_some() {
+            return Err(Error::Denied(
+                "Vault projection requires original fenced launch",
+            ));
+        }
         let (prepared, authority, lease, _, _) = self.admit()?;
         Ok((prepared, authority, lease))
     }
@@ -337,11 +365,13 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
                 "fenced launch requires original Process tool intent",
             ));
         }
+        let vault_projection = self.vault_projection;
         let (prepared, authority, lease, request, boundary) = self.admit()?;
         let launch = SandboxEffectLaunch {
             store: lease.barrier.store().clone(),
             request,
             boundary,
+            vault_projection,
             pin: lease.barrier.launch_pin(),
         };
         Ok((prepared, authority, launch, lease))
@@ -354,6 +384,7 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
             boundary,
             authority,
             prepared,
+            vault_projection,
         } = self;
         let barrier = authority.with_admission(|| {
             let mut connection = store.connection()?;
@@ -375,7 +406,13 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
             let barrier =
                 store.acquire_source_mutation_barrier_in(&tx, &set, &current.plan.effect_id)?;
             if let Some(intent) = &current.intent {
-                journal::claim_effect_in(&tx, intent, &current.plan, &current.store_scope)?;
+                journal::claim_effect_in(
+                    &tx,
+                    intent,
+                    &current.plan,
+                    &current.store_scope,
+                    vault_projection,
+                )?;
             }
             db(tx.commit())?;
             Ok(barrier)
@@ -405,6 +442,7 @@ pub struct SandboxEffectLaunch {
     store: SessionStore,
     request: SandboxEffectRequest,
     boundary: Boundary,
+    vault_projection: Option<crate::VaultProcessProjectionClaim>,
     pin: crate::source_barrier::SourceMutationPin,
 }
 
@@ -417,6 +455,11 @@ impl SandboxEffectLaunch {
         source: &impl SandboxEffectAuthority,
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
+        if self.vault_projection.is_some() {
+            return Err(Error::Denied(
+                "original Vault Process may not launch without its selected projection",
+            ));
+        }
         self.with_launch_in(source, |_| operation())
     }
 
@@ -452,7 +495,12 @@ impl SandboxEffectLaunch {
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
         let target = &vault.policy().target;
-        if projection == aw_agent_core::VaultProjection::Broker
+        if projection != target.projection
+            || self.vault_projection
+                != Some(crate::VaultProcessProjectionClaim::for_target(
+                    target,
+                    expected_grant_rev,
+                )?)
             || target.agent_ref != self.request.agent_ref
             || target.actor != self.request.actor
             || !source
@@ -700,6 +748,7 @@ impl SessionStore {
             store: self,
             request,
             boundary,
+            vault_projection: None,
             authority,
             prepared,
         })

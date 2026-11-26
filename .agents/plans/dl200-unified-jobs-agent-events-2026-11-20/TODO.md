@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: anonymous Vault file/socket proof capabilities (this checkpoint; local parent `34ebeb284e7587fd3f190e80b9d388504e135ea7`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: protected source/Vault disclosure custody and inherited history (this checkpoint; local parent `7be6b9ef59d3fe07f9c6b6f427570699ae57610f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1844,11 +1844,30 @@ Current implementation: anonymous Vault file/socket proof capabilities (this che
       durable/minimal and fmt/diff passed. 294 selected tests green.
       Obsolete Socket advertisement assertion updated for Linux only;
       actual cross-kind grant refusal separately qualified.
-      **Next:** protected raw Vault/Source disclosure propagation and
-      authorized Views, live broker/socket revocation and remaining
-      production dispatch, reviewed containment/extension and host
-      RPC/retention. Bounded one-shot proof socket is not live broker;
-      raw file/env and arbitrary secret exposure remain held. No arbitrary shell CLI
+      **Protected source/Vault disclosure custody:** original source
+      claims atomically seal exact immutable source and optional Vault
+      fact edges into the existing disclosure DAG, with the independent
+      whole-Session stable-actor ceiling before activation and claim.
+      Existing Session/Agent/participant/draft owners and prior history
+      grant shortcuts enforce it. Exact history forks and Event manifests
+      inherit it; broader recipient audiences and legacy transfers/exports
+      without manifest support refuse. Actual Vault projection selection
+      committed before admission; mismatched or downgraded launch refuses.
+      Old unmarked custody remains decodable, not retroactively qualified.
+      Actual source Actor/fork and Host no-start tests plus manifest/Event
+      authority-owner tests passed. History owner 5/5,
+      Actor 3/3, Host Process 2/2, native executable 1/1, strict affected
+      Clippy, durable/minimal and scoped fmt/diff passed. Full Store
+      272/277: the same five documented legacy failures (closed Agent
+      shell subscription, principal/remote-start downgrade, remote-view
+      reconnect and downgrade); no new failure identified. 278 distinct
+      selected tests green; full Store suite remains not green.
+      **Next:** live provider-owned broker/socket revocation and protected
+      metadata/Views, manifest-preserving legacy transfer/export, general
+      independent source/provider share policy and remaining production
+      dispatch, reviewed containment/extension and host RPC/retention.
+      Bounded one-shot proof socket is not live broker; raw file/env and
+      arbitrary secret exposure remain held. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant
@@ -1869,7 +1888,7 @@ Current implementation: anonymous Vault file/socket proof capabilities (this che
       attachment/recovery/abandonment, replacement/recovery/continuation
       and exact named/final-source release, plus authenticated unused-Sandbox
       Git source setter are landed; do not repeat.
-      Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
+      Remaining Vault production Process dispatch, raw credential projection and live socket/broker, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.

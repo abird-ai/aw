@@ -50,8 +50,14 @@ impl SessionStore {
     /// Complete idle tree and branch refs. Does not export login tokens, configured
     /// provider secrets/grants, private runtime continuations or active requests.
     pub fn export_jsonl(&self, actor: &PrincipalId, session: &str) -> Result<Vec<u8>> {
-        let c = self.connection()?;
+        let mut connection = self.connection()?;
+        let c = db(connection.transaction_with_behavior(TransactionBehavior::Deferred))?;
         super::context::authorize_tree(&c, session, actor)?;
+        if crate::history_owner::source::session_ceiling(&c, session)?.is_some() {
+            return Err(Error::Denied(
+                "legacy archive cannot preserve protected source disclosure",
+            ));
+        }
         if session_in(&c, session)?.owner != *actor {
             return Err(Error::Denied(
                 "read-only session access does not grant a portable export release",
