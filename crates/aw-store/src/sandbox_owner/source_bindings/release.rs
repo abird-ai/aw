@@ -231,6 +231,65 @@ fn observe_in(
 }
 
 impl SessionStore {
+    /// Replay the exact prior physical removal (Sandbox, name, original
+    /// CAS revision) using the existing immutable source-change fact.
+    /// A metadata-only change, replacement, another name or later
+    /// revision cannot serve as its receipt. A later attachment is never
+    /// touched. Only the current authorized redacted snapshot is returned.
+    pub fn sandbox_replay_source_release(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        name: &SourceName,
+        expected_rev: u64,
+    ) -> Result<Option<SandboxSnapshot>> {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "source release replay requires the exclusive Store owner",
+            ));
+        }
+        name.validate()?;
+        if expected_rev == 0 {
+            return Err(Error::Denied("source release requires an exact revision"));
+        }
+        let settled_rev = next_source_rev(expected_rev)?;
+        let key = sandbox_owner::parse_sandbox_ref(sandbox)?;
+        if key.canonical() != sandbox {
+            return Err(Error::Denied("source release requires canonical Sandbox"));
+        }
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        sandbox_owner::authorize_project(&tx, actor, &key.project, false)?;
+        let current = sandbox_owner::snapshot_row(&tx, sandbox)?;
+        // Normal admission need not inspect history at all. The original
+        // release owner still revalidates the complete live observation.
+        let result = if current.rev == expected_rev {
+            None
+        } else {
+            // Use the existing entity-indexed history only for stale CAS
+            // replay. The Sandbox revision uniquely identifies a mutation;
+            // require its original release fact, not just a missing name.
+            let settled: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commit_log
+                 WHERE entity_type='sandbox' AND entity_id=?1
+                   AND kind='sandbox.sources.changed' AND event_id GLOB 'sbx-release:*'
+                   AND json_extract(payload_json,'$.source_name')=?2
+                   AND json_extract(payload_json,'$.rev')=?3
+                   AND json_type(payload_json,'$.released')='true')",
+                params![sandbox, name.as_str(), settled_rev],
+                |row| row.get(0),
+            ))?;
+            if !settled || current.rev < settled_rev {
+                return Err(Error::Conflict(
+                    "no exact settled source release at the original revision",
+                ));
+            }
+            Some(sandbox_owner::snapshot_with_sources(&tx, sandbox)?)
+        };
+        db(tx.commit())?;
+        Ok(result)
+    }
+
     /// Trusted effectful realization of sources.set(name, null) for an
     /// original managed materialization. Independent authorization and
     /// read-only preflight precede the durable exact-revision release

@@ -168,6 +168,12 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_source_attach::ReplaceArgs,
     },
+    /// Release one exact managed Git source from an unused Sandbox.
+    #[cfg(feature = "workspace")]
+    SandboxSourceRelease {
+        #[command(flatten)]
+        args: sandbox_retention::ReleaseArgs,
+    },
     /// Offline reconciliation of exact managed Git sources in a closed Sandbox.
     #[cfg(feature = "workspace")]
     SandboxRetention {
@@ -1749,6 +1755,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::SandboxSourceAttach { args } => sandbox_source_attach::run(args),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxSourceReplace { args } => sandbox_source_attach::run_replace(args),
+        #[cfg(feature = "workspace")]
+        TopCommand::SandboxSourceRelease { args } => sandbox_retention::run_release(args),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         #[cfg(feature = "workspace")]

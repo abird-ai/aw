@@ -2051,7 +2051,8 @@ mod tests {
             .is_err());
         fs::write(&gap_path, serde_json::to_vec(&continuation).unwrap()).unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let gap_replaced = replace(
             &store,
             &gap_path,
@@ -2105,12 +2106,166 @@ mod tests {
             ),
             replacement_version.captured_commit
         );
+        // Exact named release of the original Applied replacement. No
+        // metadata-only removal can turn retained custody into an ambient root.
+        let release_path = approvals.join("source-release.json");
+        let release_config = json!({
+            "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":actor,"sandbox":replaced.canonical_ref,"sandbox_rev":replaced.rev,
+            "source":location.name,"destination_root":attach_root,
+            "destination_identity":DirectoryIdentity::open(&attach_root).unwrap().identity().unwrap(),
+            "repositories":[replacement_location]
+        });
+        let mut file = aw_platform::open_private_new(&release_path).unwrap();
+        file.write_all(&serde_json::to_vec(&release_config).unwrap())
+            .unwrap();
+        drop(file);
+        let release = |store: &SessionStore| {
+            crate::sandbox_retention::release(
+                store,
+                &actor,
+                &release_path,
+                &replaced.canonical_ref,
+                &location.name,
+            )
+        };
+        assert!(crate::sandbox_retention::Approval::open(&release_path, &actor).is_err());
+        assert!(crate::sandbox_retention::release(
+            &store,
+            &actor,
+            &sandbox_path,
+            &replaced.canonical_ref,
+            &location.name
+        )
+        .is_err());
+        // A replacement's old release provenance is not a removal receipt.
+        assert!(store
+            .sandbox_replay_source_release(
+                &actor,
+                &replaced.canonical_ref,
+                &location.name,
+                attached.rev
+            )
+            .is_err());
+        assert!(store
+            .sandbox_replay_source_release(
+                &actor,
+                &replaced.canonical_ref,
+                &location.name,
+                replaced.rev
+            )
+            .unwrap()
+            .is_none());
+        let mut wrong = release_config.clone();
+        wrong["repositories"][0] = json!(location);
+        fs::write(&release_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(release(&store).is_err());
+        fs::write(&release_path, serde_json::to_vec(&release_config).unwrap()).unwrap();
+        let foreign = attach_root.join("foreign");
+        fs::write(&foreign, b"keep").unwrap();
+        assert!(release(&store).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        fs::remove_file(foreign).unwrap();
+        let old_file = attach_root.join("code/tracked");
+        fs::write(&old_file, b"independent edit").unwrap();
+        assert!(release(&store).is_err());
+        assert_eq!(fs::read(&old_file).unwrap(), b"independent edit");
+        assert_eq!(
+            store.sandbox_get(&actor, &replaced.canonical_ref).unwrap(),
+            replaced
+        );
+        assert!(store
+            .create(&actor, "unresolved release", layout(&attach_root))
+            .is_err());
+        assert!(store
+            .sandbox_close(&actor, &replaced.canonical_ref, Some(replaced.rev))
+            .is_err());
+        fs::write(&old_file, b"replacement version").unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let source_free = release(&store).unwrap();
+        assert_eq!(source_free.rev, replaced.rev + 1);
+        assert!(source_free.sources.is_empty());
+        assert_eq!(source_free.layout_digest, replaced.layout_digest);
+        assert!(attach_root.is_dir());
+        assert!(fs::read_dir(&attach_root).unwrap().next().is_none());
+        assert_eq!(release(&store).unwrap(), source_free);
+        assert!(store
+            .sandbox_replay_source_release(
+                &actor,
+                &replaced.canonical_ref,
+                &SourceName::new("other").unwrap(),
+                replaced.rev
+            )
+            .is_err());
+        assert!(store
+            .sandbox_replay_source_release(
+                &actor,
+                &replaced.canonical_ref,
+                &location.name,
+                replaced.rev - 1
+            )
+            .is_err());
+        // Reattachment at the same name and pathname has distinct original
+        // custody. Replaying the earlier release must not inspect or remove it.
+        let reattach_path = approvals.join("reattach.json");
+        let reattach_config = json!({
+            "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":actor,"sandbox":source_free.canonical_ref,"sandbox_rev":source_free.rev,
+            "anchor":anchor,"destination_root":attach_root,
+            "destination_identity":DirectoryIdentity::open(&attach_root).unwrap().identity().unwrap(),
+            "repositories":[location]
+        });
+        let mut file = aw_platform::open_private_new(&reattach_path).unwrap();
+        file.write_all(&serde_json::to_vec(&reattach_config).unwrap())
+            .unwrap();
+        drop(file);
+        let reattached = attach(
+            &store,
+            &reattach_path,
+            &source_free.canonical_ref,
+            "fixture:reattach-after-release",
+            false,
+        )
+        .unwrap();
+        assert_eq!(reattached.rev, source_free.rev + 1);
+        assert_eq!(reattached.sources[0].binding_rev, reattached.rev);
+        assert_eq!(release(&store).unwrap(), reattached);
+        assert_eq!(
+            fs::read(attach_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            fs::read(attach_pending_root.join("code/tracked")).unwrap(),
+            b"replacement version"
+        );
+        assert_eq!(
+            git(
+                &executable,
+                &replacement_repo,
+                &["rev-parse", &replacement_version.retention_ref()]
+            ),
+            replacement_version.captured_commit
+        );
+        assert_eq!(
+            store.agent_list(&actor, project, None, 64).unwrap(),
+            agents_before
+        );
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+                .unwrap(),
+            checkpoints_before
+        );
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&replacement_repo, root.join("moved-replacement-origin")).unwrap();
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(release(&store).unwrap().rev, reattached.rev);
         assert_eq!(
             replace(
                 &store,
@@ -2121,7 +2276,7 @@ mod tests {
             )
             .unwrap()
             .rev,
-            replaced.rev
+            reattached.rev
         );
         assert_eq!(
             replace(
@@ -2152,7 +2307,7 @@ mod tests {
             )
             .unwrap()
             .rev,
-            replaced.rev
+            reattached.rev
         );
         assert_eq!(
             attach(

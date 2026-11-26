@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact offline Git source replacement (this checkpoint; parent `6974a4b35ad5281326eb1237bb846c0c7ce74029`, source attachment). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact offline Git source release (this checkpoint; parent `0110a2c09d5a4fcaaa1c8c2bc8ded4acd8baf0be`, source replacement). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1545,6 +1545,16 @@ Current implementation: exact offline Git source replacement (this checkpoint; p
       Grouped offline lifecycle 1/1, Store Sandbox 4/4, Host lifecycle 1/1;
       strict affected Clippy, durable library/minimal checks, full CLI
       and required/mode-conflict smoke, scoped fmt/diff passed.
+      **Unused-Sandbox exact Git source release consumer landed:** existing
+      original Applied descriptor and full retained layout under separate
+      named-removal approval, original CAS and release claim/reconciliation,
+      final empty named parent preserved. Exact immutable release fact
+      acknowledges original name/revision, not metadata deletion or
+      replacement; replay needs no driver/layout, never touches later
+      attachment. Original strict-CAS SDK retained, no new schema/ledger.
+      Grouped offline lifecycle 1/1, Store Sandbox 4/4, Host lifecycle 1/1;
+      strict affected Clippy, durable library/minimal checks, full CLI
+      and required/unsupported-mode smoke, scoped fmt/diff passed.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1561,8 +1571,8 @@ Current implementation: exact offline Git source replacement (this checkpoint; p
       recovery/abandonment and narrow offline checkpoint/closed Sandbox
       retention reconciliation, standalone Git derivation and retained-version
       baseline construction/recovery/abandonment and unused-Sandbox
-      attachment/recovery/abandonment and replacement/recovery/continuation
-      are landed; do not repeat.
+      attachment/recovery/abandonment, replacement/recovery/continuation
+      and exact named/final-source release are landed; do not repeat.
       Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.

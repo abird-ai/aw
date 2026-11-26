@@ -19,7 +19,96 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: exact offline Git source replacement
+## Latest local implementation delta — 2026-11-26: exact offline Git source release
+
+Parent: `0110a2c09d5a4fcaaa1c8c2bc8ded4acd8baf0be` (source
+replacement), signature verified. Original Agent/Turn journal and resource
+CLI owners remain occupied. Independent unused-Sandbox named release,
+including final-source removal, L5 only; no runtime activation.
+
+- Production workspace-feature `aw sandbox-source-release --state-dir
+  <existing private Store> <approval.json> <canonical-Sandbox> <source-name>`
+  consumes the existing structural release owner. Same original
+  Sandbox/name/CAS revision identifies the operation; no invented
+  invocation ID, extra receipt or ledger. Current Project writer and
+  exclusive Store owner must observe an exact open unused isolated
+  Sandbox; original Applied construction/attachment/replacement descriptor
+  and complete retained set must remain available. Existing source
+  mutation barrier claims the full old set before the driver effect;
+  exact layout/source and writer observations revalidated through commit.
+  Same original release claim may reconcile after interruption; no
+  general retry or source adoption. Failed effects or failed final
+  publication retain the old binding set/revision and Unknown hazard.
+  No separate recover flag: re-submit the exact original approved
+  removal; original coordinator/driver distinguishes first claim and
+  exact reconciliation. Changed, ambiguous or shared materialization
+  stays held; no force delete, prune, broad backing GC or arbitrary
+  physical locator. Final release proves named parent empty, retains
+  it and exact layout identity, and removes just the binding at one
+  Sandbox revision advance. No Agent creation/activation.
+- Share existing offline closed-Sandbox maintenance private approval:
+  v1 `{version,store_directory,store_id,store_generation,manager,sandbox,
+  sandbox_rev,destination_root,destination_identity,repositories,source}`.
+  Named removal requires `source` exactly equal to the command source
+  name; closed retention requires absent/null source, never consumes
+  named-removal approval. Exact canonical target and OS manager,
+  current Store scope, full original named source locations and actual
+  registered Git driver. Reuse the existing lease-backed pinned named
+  layout and independent host exclusion of all users/writers, backing/
+  retention users, aliases, mounts, other Stores through operation and
+  interruption. Only ordinary private origin checkouts and existing
+  private named-child layouts with cwd=tool_root; all siblings' exact
+  identity verified without discarding their edits. No implicit
+  disclosure, capture/restore, retention or execution grant.
+- `SessionStore::sandbox_replay_source_release` returns None for the
+  original current CAS (normal admission avoids history lookup).
+  For a later revision, current Project View and exact canonical
+  Sandbox required; the existing entity-indexed commit history must
+  contain the exact original local `sandbox.sources.changed` release
+  fact (`sbx-release:` identity, selected source_name, expected_rev+1,
+  released=true). Metadata-only changes, replacement provenance,
+  later names/revisions, or missing source alone cannot acknowledge
+  release. Successful replay returns current redacted snapshot, before
+  selecting the Git driver or probing the physical layout. It still
+  requires the independent original semantic approval and current Store
+  scope. A subsequent attachment at the same name is never touched.
+  Original strict-CAS SDK release remains compatible; no schema,
+  provenance index, operation ledger, recovery format or new resource
+  owner. New command only invokes original Host and Store owners.
+
+Validation (L5, Rust 1.95.0): production all-feature binary type-check;
+grouped real offline Git/SQLite lifecycle 1/1 (81.56s), Store Sandbox
+owner 4/4, Host source-checkpoint lifecycle 1/1 (167.01s). Existing
+grouped fixture proves separate named/closed cleanup approvals, wrong
+original origin and foreign layout refusal, modified worktree preserved
+under unresolved release, exact repair/restart reconciliation, final
+empty parent preserved, one revision advance, wrong name/revision and
+replacement-fact replay refusal, exact replay after same-name
+reattachment without touching the new materialization, and terminal
+replay without installed Git or physical origins. Original retention
+refs, other Sandbox content, Agent and public checkpoint lists preserved.
+Existing Host multi-source interrupted physical removal, sibling
+preservation and exact release-fact replay passed. Strict affected
+all-feature/all-target Clippy, durable library/minimal all-target checks,
+full binary build, actual source-release/retention help and required
+args/unsupported continuation smoke passed. Scoped fmt/diff and signed
+exact commit checked. Prior durable-only non-workspace binary blocker,
+feature-specific warnings and broad CLI inventory discrepancy remain;
+unchanged Process suites and pinned Nix/native-platform qualification
+not rerun. Only isolated fixture effects; no real user source mutation.
+
+Next: exact source-aware Actor/Turn admission through original journal
+owners when available. All narrow offline standalone Git creation/
+derive, unused-Sandbox attach/replace/continue/release and closed
+retention consumers are now landed. Do not proliferate alternative offline
+commands. If original journal ownership remains blocked, prioritize
+remaining genuine production authority/containment or other sealed
+Phase 3 owner boundaries. Broader mixed/unversioned assets, linked
+checkout policy, task-bearing/cross-Project effects, protected host
+RPCs, bound-Agent structural mutation and source-bearing Actor/Process
+admission remain held.
+
+## Previous local implementation delta — 2026-11-26: exact offline Git source replacement
 
 Parent: `6974a4b35ad5281326eb1237bb846c0c7ce74029` (source
 attachment), signature verified. Original Agent/Turn journal and

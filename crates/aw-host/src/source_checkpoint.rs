@@ -2938,6 +2938,25 @@ mod tests {
         assert_eq!(reduced.sources, child.sources[1..]);
         assert_eq!(reduced.layout_digest, child.layout_digest);
         assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        assert_eq!(
+            store
+                .sandbox_replay_source_release(
+                    &actor,
+                    &child.canonical_ref,
+                    &removed_name,
+                    child.rev
+                )
+                .unwrap(),
+            Some(reduced.clone())
+        );
+        assert!(store
+            .sandbox_replay_source_release(
+                &actor,
+                &child.canonical_ref,
+                &child.sources[1].name,
+                child.rev
+            )
+            .is_err());
         assert!(host
             .release_sandbox_source::<Fence<'_>>(
                 &actor,
