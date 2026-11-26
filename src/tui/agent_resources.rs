@@ -137,7 +137,11 @@ impl LoadedResourceSummary {
     }
 
     pub fn add_skill(&mut self, name: impl Into<String>, source: impl Into<String>, bytes: usize) {
-        self.skills.push(LoadedSkillResource { name: name.into(), source: source.into(), bytes });
+        self.skills.push(LoadedSkillResource {
+            name: name.into(),
+            source: source.into(),
+            bytes,
+        });
     }
 
     pub fn with_context_blocks(&self, blocks: &[ContextBlock]) -> Self {
@@ -209,12 +213,16 @@ mod tests {
 
     #[test]
     fn selected_skill_is_typed_local_provenance_and_changes_fingerprint() {
-        let mut resources = LoadedResourceSummary::with_system_prompt(SystemPromptOrigin::BuiltIn, 10);
+        let mut resources =
+            LoadedResourceSummary::with_system_prompt(SystemPromptOrigin::BuiltIn, 10);
         let before = resources.fingerprint();
         resources.add_skill("review", "./skills/review.md", 42);
         assert_ne!(resources.fingerprint(), before);
         assert_eq!(resources.skills().len(), 1);
-        assert_eq!(resources.skills()[0].label(), "review · ./skills/review.md · 42 B");
+        assert_eq!(
+            resources.skills()[0].label(),
+            "review · ./skills/review.md · 42 B"
+        );
     }
 
     #[test]

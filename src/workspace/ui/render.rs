@@ -519,10 +519,11 @@ impl Ui {
         let palette = crate::tui::theme::palette_for(&self.ui_config);
         match target {
             Target::Conversation => palette.success,
-            Target::AgentView { .. } | Target::File { .. }
-            | Target::Activity | Target::Settings => palette.accent,
-            Target::Diff { .. } | Target::Terminal { .. }
-            | Target::ContextFlow => palette.warning,
+            Target::AgentView { .. }
+            | Target::File { .. }
+            | Target::Activity
+            | Target::Settings => palette.accent,
+            Target::Diff { .. } | Target::Terminal { .. } | Target::ContextFlow => palette.warning,
             Target::SessionTree | Target::Help => palette.muted,
         }
     }
@@ -1913,12 +1914,18 @@ impl Ui {
                             area,
                             &t,
                             *self.terminal_scroll.get(&tab.id).unwrap_or(&0),
-                            focused && self.palette.is_none()
-                                && matches!(self.terminal_pool.as_ref()
-                                    .and_then(|pool| pool.dock_mode(&t.id)),
+                            focused
+                                && self.palette.is_none()
+                                && matches!(
+                                    self.terminal_pool
+                                        .as_ref()
+                                        .and_then(|pool| pool.dock_mode(&t.id)),
                                     Some(super::super::terminal_control::Mode::Local)
-                                        | Some(super::super::terminal_control::Mode::Offered)),
-                            self.terminal_pool.as_ref().and_then(|pool| pool.dock_mode(&t.id)),
+                                        | Some(super::super::terminal_control::Mode::Offered)
+                                ),
+                            self.terminal_pool
+                                .as_ref()
+                                .and_then(|pool| pool.dock_mode(&t.id)),
                         );
                     } else {
                         frame.render_widget(Paragraph::new("Terminal not live in this owner. Restoring a layout never launches a shell. Use terminal-start explicitly."),area);

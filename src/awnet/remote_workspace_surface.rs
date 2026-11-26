@@ -146,17 +146,31 @@ mod tests {
 
     struct FixtureRoot(PathBuf);
     impl FixtureRoot {
-        fn path(&self) -> &Path { &self.0 }
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
     impl Drop for FixtureRoot {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     fn fixture() -> (FixtureRoot, SurfaceRemoteWorkspaceProjection) {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = FixtureRoot(std::env::temp_dir().join(format!("aw-remote-workspace-{}-{unique}", std::process::id())));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = FixtureRoot(std::env::temp_dir().join(format!(
+            "aw-remote-workspace-{}-{unique}",
+            std::process::id()
+        )));
         fs::create_dir_all(root.path().join("src")).unwrap();
-        fs::write(root.path().join("src/lib.rs"), "pub fn remote_fixture() {}\n").unwrap();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn remote_fixture() {}\n",
+        )
+        .unwrap();
         let git = std::env::var_os("AW_GIT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
@@ -183,7 +197,9 @@ mod tests {
     #[test]
     fn remote_capabilities_are_permission_scoped_and_never_expose_terminal_or_write() {
         let (_root, projection) = fixture();
-        let files = projection.capabilities(RemoteViewPermission::Files).unwrap();
+        let files = projection
+            .capabilities(RemoteViewPermission::Files)
+            .unwrap();
         assert_eq!(files["files"], true);
         assert_eq!(files["git_read"], false);
         assert_eq!(files["git_write"], false);
@@ -212,7 +228,9 @@ mod tests {
     #[test]
     fn remote_file_view_reuses_exact_surface_source_and_scope() {
         let (_root, projection) = fixture();
-        let caps = projection.capabilities(RemoteViewPermission::Files).unwrap();
+        let caps = projection
+            .capabilities(RemoteViewPermission::Files)
+            .unwrap();
         let source = caps["source_id"].as_str().unwrap();
         let scope = caps["view_root"]["id"].as_str().unwrap();
         let envelope = projection
@@ -248,7 +266,10 @@ mod tests {
     fn remote_git_projection_retains_inventory_and_immutable_review_identity() {
         let (root, projection) = fixture();
         git(root.path(), &["init", "-q"]);
-        git(root.path(), &["config", "user.email", "fixture@example.invalid"]);
+        git(
+            root.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
         git(root.path(), &["config", "user.name", "Fixture"]);
         git(root.path(), &["add", "src/lib.rs"]);
         git(root.path(), &["commit", "-qm", "base"]);

@@ -84,11 +84,7 @@ impl Interaction {
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('n'))
         {
-            self.history(
-                editor,
-                history,
-                key.code == KeyCode::Char('p'),
-            )?;
+            self.history(editor, history, key.code == KeyCode::Char('p'))?;
             self.selected = 0;
             return Ok(Action::Handled);
         }
@@ -185,12 +181,7 @@ impl Interaction {
         Ok(Action::Handled)
     }
 
-    fn history(
-        &mut self,
-        editor: &mut Editor,
-        history: &[String],
-        previous: bool,
-    ) -> Result<bool> {
+    fn history(&mut self, editor: &mut Editor, history: &[String], previous: bool) -> Result<bool> {
         if previous {
             if history.is_empty() {
                 return Ok(false);
@@ -238,9 +229,13 @@ mod tests {
         let mut state = Interaction::default();
         let mut editor = Editor::default();
         editor.set("/").unwrap();
-        state.handle(&mut editor, key(KeyCode::Up), &[], false).unwrap();
+        state
+            .handle(&mut editor, key(KeyCode::Up), &[], false)
+            .unwrap();
         assert!(state.selected > 0);
-        state.handle(&mut editor, key(KeyCode::Down), &[], false).unwrap();
+        state
+            .handle(&mut editor, key(KeyCode::Down), &[], false)
+            .unwrap();
 
         editor.set("draft").unwrap();
         let history = vec!["first".into(), "second".into()];
@@ -270,14 +265,18 @@ mod tests {
         let mut editor = Editor::default();
         editor.set("/settings").unwrap();
         assert_eq!(
-            state.handle(&mut editor, key(KeyCode::Enter), &[], false).unwrap(),
+            state
+                .handle(&mut editor, key(KeyCode::Enter), &[], false)
+                .unwrap(),
             Action::OpenSettings
         );
         assert!(editor.is_empty());
 
         editor.set("hello").unwrap();
         assert_eq!(
-            state.handle(&mut editor, key(KeyCode::Enter), &[], false).unwrap(),
+            state
+                .handle(&mut editor, key(KeyCode::Enter), &[], false)
+                .unwrap(),
             Action::Submit("hello".into())
         );
     }

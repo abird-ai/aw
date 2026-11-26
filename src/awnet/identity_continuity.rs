@@ -864,10 +864,7 @@ mod tests {
     fn remote_view_request_requires_exact_machine_link_read_capabilities() {
         let request = RemoteViewGrantRequest {
             workspace_id: "ws_fixture".into(),
-            permissions: BTreeSet::from([
-                RemoteViewPermission::Files,
-                RemoteViewPermission::Git,
-            ]),
+            permissions: BTreeSet::from([RemoteViewPermission::Files, RemoteViewPermission::Git]),
             ttl_secs: 60,
         };
         assert!(validate_remote_view_request(

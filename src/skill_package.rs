@@ -49,7 +49,9 @@ impl SkillBundle {
 
     pub fn validate(&self) -> Result<()> {
         if self.format_version != FORMAT_VERSION {
-            return Err(Error::Config("unsupported skill bundle format_version".into()));
+            return Err(Error::Config(
+                "unsupported skill bundle format_version".into(),
+            ));
         }
         config::validate_skill_name(&self.name)?;
         validate_description(self.description.as_deref())?;
@@ -74,7 +76,9 @@ impl SkillBundle {
     pub fn read(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         if !file.metadata()?.is_file() {
-            return Err(Error::Config("skill bundle source must be a regular file".into()));
+            return Err(Error::Config(
+                "skill bundle source must be a regular file".into(),
+            ));
         }
         let mut bytes = Vec::new();
         file.take((MAX_BUNDLE_BYTES + 1) as u64)
@@ -96,10 +100,10 @@ impl SkillBundle {
         let parent = config_path
             .parent()
             .ok_or_else(|| Error::Config("configuration path has no parent directory".into()))?;
-        Ok(parent.join("skills").join(format!("{}.md", self.content_sha256)))
+        Ok(parent
+            .join("skills")
+            .join(format!("{}.md", self.content_sha256)))
     }
-
-
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -228,12 +232,9 @@ mod tests {
         let output = root.join("review.awskill.json");
         let first_path = output.clone();
         let second_path = output.clone();
-        let first = std::thread::spawn(move || {
-            write_new_or_replace(&first_path, b"first", false)
-        });
-        let second = std::thread::spawn(move || {
-            write_new_or_replace(&second_path, b"second", false)
-        });
+        let first = std::thread::spawn(move || write_new_or_replace(&first_path, b"first", false));
+        let second =
+            std::thread::spawn(move || write_new_or_replace(&second_path, b"second", false));
         let results = [first.join().unwrap(), second.join().unwrap()];
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);

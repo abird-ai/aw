@@ -28,12 +28,26 @@ pub enum RemoteWorkspaceGitMode {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteWorkspaceViewRequest {
-    Files { path: String },
-    FileSearch { query: String, limit: usize },
-    File { path: String },
-    GitList { mode: RemoteWorkspaceGitMode },
-    GitOpen { inventory_id: String, item_id: String },
-    Review { review_id: String },
+    Files {
+        path: String,
+    },
+    FileSearch {
+        query: String,
+        limit: usize,
+    },
+    File {
+        path: String,
+    },
+    GitList {
+        mode: RemoteWorkspaceGitMode,
+    },
+    GitOpen {
+        inventory_id: String,
+        item_id: String,
+    },
+    Review {
+        review_id: String,
+    },
 }
 
 impl RemoteWorkspaceViewRequest {
@@ -52,7 +66,9 @@ impl RemoteWorkspaceViewRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteWorkspaceRequest {
-    Capabilities { permission: RemoteViewPermission },
+    Capabilities {
+        permission: RemoteViewPermission,
+    },
     View {
         source_id: String,
         scope_id: String,
@@ -103,8 +119,12 @@ pub trait RemoteWorkspaceProjection: Send + Sync + std::fmt::Debug {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteWorkspaceResponse {
-    Capabilities { capabilities: serde_json::Value },
-    View { envelope: serde_json::Value },
+    Capabilities {
+        capabilities: serde_json::Value,
+    },
+    View {
+        envelope: serde_json::Value,
+    },
     Error {
         source_id: Option<String>,
         scope_id: Option<String>,
@@ -365,10 +385,7 @@ fn request_sha256(request: &MachineReadRequest) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
-fn remote_view_read_transcript(
-    challenge: &RemoteViewReadChallenge,
-    public_key: &str,
-) -> Vec<u8> {
+fn remote_view_read_transcript(challenge: &RemoteViewReadChallenge, public_key: &str) -> Vec<u8> {
     let fields: [&[u8]; 12] = [
         challenge.lease_id.as_bytes(),
         challenge.request_id.as_bytes(),
@@ -410,9 +427,7 @@ fn authenticate_remote_view_read(
         || proof.grant_id != challenge.grant_id
         || proof.public_key != challenge.public_key
     {
-        return Err(Error::Protocol(
-            "remote-view read proof correlation failed",
-        ));
+        return Err(Error::Protocol("remote-view read proof correlation failed"));
     }
     let authenticated = store.authenticate_portable_device_signature(
         &challenge.domain_id,
@@ -632,9 +647,12 @@ pub fn serve_machine_service(
             let hello = envelope.remote_view.as_ref().ok_or(Error::Denied(
                 "remote-view read requires an exact grant and device proof",
             ))?;
-            let workspace_id = opts.remote_view_workspace_id.as_deref().ok_or(Error::Denied(
-                "Machine service did not bind this exported root to a remote-view Workspace",
-            ))?;
+            let workspace_id = opts
+                .remote_view_workspace_id
+                .as_deref()
+                .ok_or(Error::Denied(
+                    "Machine service did not bind this exported root to a remote-view Workspace",
+                ))?;
             let challenge = RemoteViewReadChallenge {
                 version: protocol_version,
                 lease_id: lease.lease_id.clone(),
@@ -683,12 +701,8 @@ pub fn serve_machine_service(
             opts.remote_workspace.as_deref(),
         )?;
         if let Some((authenticated, permission, grant_id, workspace_id)) = &remote_authorization {
-            let grant = store.authorize_remote_view(
-                grant_id,
-                authenticated,
-                &peer.node_id,
-                *permission,
-            )?;
+            let grant =
+                store.authorize_remote_view(grant_id, authenticated, &peer.node_id, *permission)?;
             if grant.workspace_id != *workspace_id {
                 return Err(Error::Denied(
                     "remote-view grant changed before response publication",
@@ -1103,7 +1117,10 @@ mod tests {
                 },
             },
         };
-        assert_eq!(machine_service_version(&a), REMOTE_WORKSPACE_SERVICE_VERSION);
+        assert_eq!(
+            machine_service_version(&a),
+            REMOTE_WORKSPACE_SERVICE_VERSION
+        );
         assert_ne!(request_sha256(&a).unwrap(), request_sha256(&b).unwrap());
     }
 

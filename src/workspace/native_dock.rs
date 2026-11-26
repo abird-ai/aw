@@ -3,17 +3,17 @@
 //! lease. Linux migration admits inert original-master/pidfd escrow and
 //! activates only after authenticated original-worker release. No Agent,
 //! provider, Store, shell replay or saved-layout authority is created.
-mod persistent;
 #[cfg(target_os = "linux")]
 mod migration;
-#[cfg(target_os = "linux")]
-pub use migration::{promote, serve_adoption, inspect_migration};
-pub use persistent::{serve_persistent, start_persistent, stop_persistent};
+mod persistent;
 use super::{terminal_control::INVITE_TTL, terminals};
 use aw::{Error, Result};
 use aw_terminal::Snapshot;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
+#[cfg(target_os = "linux")]
+pub use migration::{inspect_migration, promote, serve_adoption};
+pub use persistent::{serve_persistent, start_persistent, stop_persistent};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -47,39 +47,72 @@ struct Invite {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Hello { version: u8, ticket: String },
+    Hello {
+        version: u8,
+        ticket: String,
+    },
     Heartbeat,
-    Input { bytes: Vec<u8> },
-    Resize { rows: u16, cols: u16 },
+    Input {
+        bytes: Vec<u8>,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     Detach,
     /// Explicit stop only for a separately launched broker-owned PTY.
-    Stop { ticket: String },
+    Stop {
+        ticket: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
-    Ready { version: u8, terminal: String },
-    Frame { snapshot: Snapshot },
+    Ready {
+        version: u8,
+        terminal: String,
+    },
+    Frame {
+        snapshot: Snapshot,
+    },
     /// Origin has fenced the recipient epoch and regained exclusive control.
-    Detached { terminal: String },
-    Stopped { terminal: String },
-    Error { message: String },
+    Detached {
+        terminal: String,
+    },
+    Stopped {
+        terminal: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// A directory created with unpredictable CSPRNG bytes, mode 0700, containing
 /// only a 0600 invitation file and the owner-bound AF_UNIX socket.
 struct Cleanup(PathBuf);
 impl Cleanup {
-    fn transfer(mut self) { self.0 = PathBuf::new(); }
+    fn transfer(mut self) {
+        self.0 = PathBuf::new();
+    }
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if self.0.as_os_str().is_empty() { return; }
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
         let _ = fs::remove_file(self.0.join("invite"));
         let _ = fs::remove_file(self.0.join("invite-next"));
         let _ = fs::remove_file(self.0.join("socket"));
         // Only fixed broker transaction artifacts within this owned endpoint.
-        for name in ["control", "transaction", "prepared", "released", "released-next", "active", "failed"] {
+        for name in [
+            "control",
+            "transaction",
+            "prepared",
+            "released",
+            "released-next",
+            "active",
+            "failed",
+        ] {
             let _ = fs::remove_file(self.0.join(name));
         }
         let _ = fs::remove_dir(&self.0);
@@ -97,7 +130,10 @@ fn fail(message: impl Into<String>) -> Error {
 fn send(stream: &mut UnixStream, value: &Reply) -> io::Result<()> {
     let mut encoded = serde_json::to_vec(value)?;
     if encoded.len() > MAX_WIRE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded terminal frame overflow"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded terminal frame overflow",
+        ));
     }
     encoded.push(b'\n');
     stream.write_all(&encoded)
@@ -107,14 +143,22 @@ fn request(reader: &mut BufReader<UnixStream>, max: usize) -> io::Result<Option<
     let started = Instant::now();
     loop {
         match reader.fill_buf() {
-            Ok([]) => return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof, "native owner connection closed"
-            )),
+            Ok([]) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "native owner connection closed",
+                ))
+            }
             Ok(available) => {
-                let count = available.iter().position(|byte| *byte == b'\n')
+                let count = available
+                    .iter()
+                    .position(|byte| *byte == b'\n')
                     .map_or(available.len(), |index| index + 1);
                 if line.len() + count > max {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "native input frame exceeds limit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native input frame exceeds limit",
+                    ));
                 }
                 line.extend_from_slice(&available[..count]);
                 reader.consume(count);
@@ -123,11 +167,20 @@ fn request(reader: &mut BufReader<UnixStream>, max: usize) -> io::Result<Option<
                     return Ok(Some(line));
                 }
             }
-            Err(error) if matches!(error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if line.is_empty() { return Ok(None); }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if line.is_empty() {
+                    return Ok(None);
+                }
                 if started.elapsed() >= HEARTBEAT_TTL {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "incomplete native input frame"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "incomplete native input frame",
+                    ));
                 }
             }
             Err(error) => return Err(error),
@@ -135,7 +188,9 @@ fn request(reader: &mut BufReader<UnixStream>, max: usize) -> io::Result<Option<
     }
 }
 fn serve(
-    mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite,
+    mut stream: UnixStream,
+    pool: &terminals::Pool,
+    invite: &Invite,
     persistent: bool,
 ) -> io::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_millis(130)))?;
@@ -144,39 +199,78 @@ fn serve(
     let until = Instant::now() + Duration::from_secs(4);
     let hello = loop {
         match request(&mut reader, 256)? {
-            Some(value) => break serde_json::from_slice::<Request>(&value)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            Some(value) => {
+                break serde_json::from_slice::<Request>(&value)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            }
             None if Instant::now() < until => {}
-            None => return Err(io::Error::new(io::ErrorKind::TimedOut, "no explicit terminal hello")),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no explicit terminal hello",
+                ))
+            }
         }
     };
     if let Request::Stop { ticket } = &hello {
         if !persistent || ticket.len() != 64 || !pool.has_invitation(&invite.terminal, ticket) {
-            send(&mut stream, &Reply::Error { message: "native stop not authorized".into() })?;
+            send(
+                &mut stream,
+                &Reply::Error {
+                    message: "native stop not authorized".into(),
+                },
+            )?;
             return Ok(false);
         }
         pool.cancel_dock(&invite.terminal)
             .map_err(|error| io::Error::other(error.to_string()))?;
         pool.shutdown();
-        if pool.all().iter().any(|terminal| !terminal.status().exited()) {
-            send(&mut stream, &Reply::Error {
-                message: "PTY termination uncertain; inspect launched processes".into(),
-            })?;
+        if pool
+            .all()
+            .iter()
+            .any(|terminal| !terminal.status().exited())
+        {
+            send(
+                &mut stream,
+                &Reply::Error {
+                    message: "PTY termination uncertain; inspect launched processes".into(),
+                },
+            )?;
         } else {
-            send(&mut stream, &Reply::Stopped { terminal: invite.terminal.clone() })?;
+            send(
+                &mut stream,
+                &Reply::Stopped {
+                    terminal: invite.terminal.clone(),
+                },
+            )?;
         }
         return Ok(true);
     }
     let Request::Hello { version, ticket } = hello else {
-        send(&mut stream, &Reply::Error { message: "explicit terminal hello required".into() })?;
+        send(
+            &mut stream,
+            &Reply::Error {
+                message: "explicit terminal hello required".into(),
+            },
+        )?;
         return Ok(false);
     };
     if version != PROTOCOL {
-        send(&mut stream, &Reply::Error { message: "unsupported native dock protocol".into() })?;
+        send(
+            &mut stream,
+            &Reply::Error {
+                message: "unsupported native dock protocol".into(),
+            },
+        )?;
         return Ok(false);
     }
     if ticket.len() != 64 {
-        send(&mut stream, &Reply::Error { message: "invalid or expired terminal invite".into() })?;
+        send(
+            &mut stream,
+            &Reply::Error {
+                message: "invalid or expired terminal invite".into(),
+            },
+        )?;
         return Ok(false);
     }
     // This is the *only* control transfer. The original renderer is read-only
@@ -186,24 +280,43 @@ fn serve(
     let lease = match pool.accept_dock(&invite.terminal, &ticket) {
         Ok(lease) => lease,
         Err(error) => {
-            send(&mut stream, &Reply::Error { message: error.to_string() })?;
+            send(
+                &mut stream,
+                &Reply::Error {
+                    message: error.to_string(),
+                },
+            )?;
             return Ok(false);
         }
     };
-    send(&mut stream, &Reply::Ready { version: PROTOCOL, terminal: invite.terminal.clone() })?;
+    send(
+        &mut stream,
+        &Reply::Ready {
+            version: PROTOCOL,
+            terminal: invite.terminal.clone(),
+        },
+    )?;
     let mut last_seen = Instant::now();
     let mut detached_by_request = false;
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut last_version = None;
     loop {
-        if pool.is_shutting_down() || last_seen.elapsed() > HEARTBEAT_TTL { break; }
+        if pool.is_shutting_down() || last_seen.elapsed() > HEARTBEAT_TTL {
+            break;
+        }
         // A separately broker-owned PTY ends with its original child.
         // Never silently launch a replacement shell when the child exits.
-        if persistent && pool.get(&invite.terminal).is_some_and(|terminal|
-            terminal.status() != aw_terminal::Status::Running) {
-            let _ = send(&mut stream, &Reply::Error {
-                message: "persistent PTY exited; no process replay".into(),
-            });
+        if persistent
+            && pool
+                .get(&invite.terminal)
+                .is_some_and(|terminal| terminal.status() != aw_terminal::Status::Running)
+        {
+            let _ = send(
+                &mut stream,
+                &Reply::Error {
+                    message: "persistent PTY exited; no process replay".into(),
+                },
+            );
             break;
         }
         if last_frame.elapsed() >= FRAME_INTERVAL {
@@ -211,8 +324,15 @@ fn serve(
                 Ok(snapshot) => snapshot,
                 Err(_) => break,
             };
-            if last_version != Some(snapshot.version) || last_frame.elapsed() >= Duration::from_secs(1) {
-                send(&mut stream, &Reply::Frame { snapshot: snapshot.clone() })?;
+            if last_version != Some(snapshot.version)
+                || last_frame.elapsed() >= Duration::from_secs(1)
+            {
+                send(
+                    &mut stream,
+                    &Reply::Frame {
+                        snapshot: snapshot.clone(),
+                    },
+                )?;
                 last_version = Some(snapshot.version);
             }
             last_frame = Instant::now();
@@ -226,9 +346,14 @@ fn serve(
                     Request::Heartbeat => {}
                     Request::Resize { rows, cols } => {
                         if let Err(error) = pool.resize_docked(&lease, rows, cols) {
-                            let _ = send(&mut stream, &Reply::Error {
-                                message: format!("PTY resize denied: {error}; control returning to origin"),
-                            });
+                            let _ = send(
+                                &mut stream,
+                                &Reply::Error {
+                                    message: format!(
+                                        "PTY resize denied: {error}; control returning to origin"
+                                    ),
+                                },
+                            );
                             break;
                         }
                     }
@@ -242,7 +367,10 @@ fn serve(
                             break;
                         }
                     }
-                    Request::Detach => { detached_by_request = true; break; }
+                    Request::Detach => {
+                        detached_by_request = true;
+                        break;
+                    }
                     Request::Hello { .. } | Request::Stop { .. } => break, // replay cannot change authority
                 }
             }
@@ -255,18 +383,27 @@ fn serve(
     if detached_by_request {
         let until = Instant::now() + Duration::from_secs(3);
         while pool.dock_mode(&invite.terminal) != Some(super::terminal_control::Mode::Local)
-            && Instant::now() < until {
+            && Instant::now() < until
+        {
             std::thread::sleep(Duration::from_millis(12));
         }
         if pool.dock_mode(&invite.terminal) != Some(super::terminal_control::Mode::Local) {
-            send(&mut stream, &Reply::Error {
-                message: "terminal input still settling; detach outcome unknown".into(),
-            })?;
+            send(
+                &mut stream,
+                &Reply::Error {
+                    message: "terminal input still settling; detach outcome unknown".into(),
+                },
+            )?;
             return Ok(true);
         }
         // Only a receipt *after* the owner regained control makes a recipient
         // F12 detach successful. Lost receipt remains UNKNOWN, never replayed.
-        send(&mut stream, &Reply::Detached { terminal: invite.terminal.clone() })?;
+        send(
+            &mut stream,
+            &Reply::Detached {
+                terminal: invite.terminal.clone(),
+            },
+        )?;
     }
     Ok(true)
 }
@@ -276,7 +413,10 @@ fn private_directory() -> Result<(PathBuf, Cleanup)> {
         let mut bytes = [0_u8; 8];
         getrandom::fill(&mut bytes)
             .map_err(|_| fail("cannot create secure local docking directory"))?;
-        let suffix = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let suffix = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let dir = std::env::temp_dir().join(format!("aw-pty-{suffix}"));
         match DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok((dir.clone(), Cleanup(dir))),
@@ -293,19 +433,28 @@ pub fn invite(pool: terminals::Pool, terminal_id: &str) -> Result<PathBuf> {
     let (directory, cleanup) = private_directory()?;
     let listener = UnixListener::bind(directory.join("socket"))
         .map_err(|error| fail(format!("native docking socket: {error}")))?;
-    listener.set_nonblocking(true).map_err(|error| fail(error.to_string()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| fail(error.to_string()))?;
     let dock = pool.prepare_dock(terminal_id)?;
     let invitation = Invite {
-        version: PROTOCOL, socket: directory.join("socket"),
-        terminal: dock.terminal_id, ticket: dock.ticket,
+        version: PROTOCOL,
+        socket: directory.join("socket"),
+        terminal: dock.terminal_id,
+        ticket: dock.ticket,
     };
     let invite_path = directory.join("invite");
     let id = invitation.terminal.clone();
     let write_invite = (|| -> Result<()> {
         let bytes = serde_json::to_vec(&invitation).map_err(|error| fail(error.to_string()))?;
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .open(&invite_path).map_err(|error| fail(error.to_string()))?;
-        file.write_all(&bytes).map_err(|error| fail(error.to_string()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&invite_path)
+            .map_err(|error| fail(error.to_string()))?;
+        file.write_all(&bytes)
+            .map_err(|error| fail(error.to_string()))?;
         file.sync_all().map_err(|error| fail(error.to_string()))
     })();
     if let Err(error) = write_invite {
@@ -314,56 +463,81 @@ pub fn invite(pool: terminals::Pool, terminal_id: &str) -> Result<PathBuf> {
     }
     let retained_pool = pool.clone();
     let server_id = id.clone();
-    let task = std::thread::Builder::new().name("aw-native-dock".into()).spawn(move || {
-        let pool = retained_pool;
-        let id = server_id;
-        let _cleanup = cleanup;
-        let deadline = Instant::now() + INVITE_TTL;
-        loop {
-            if Instant::now() >= deadline || pool.is_shutting_down()
-                || !pool.has_invitation(&id, &invitation.ticket) {
-                break;
+    let task = std::thread::Builder::new()
+        .name("aw-native-dock".into())
+        .spawn(move || {
+            let pool = retained_pool;
+            let id = server_id;
+            let _cleanup = cleanup;
+            let deadline = Instant::now() + INVITE_TTL;
+            loop {
+                if Instant::now() >= deadline
+                    || pool.is_shutting_down()
+                    || !pool.has_invitation(&id, &invitation.ticket)
+                {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((client, _)) => match serve(client, &pool, &invitation, false) {
+                        Ok(true) => break, // used once; never automatically replay
+                        Ok(false) => {}
+                        Err(_) => {} // malformed/untrusted clients cannot transfer
+                    },
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(30))
+                    }
+                    Err(_) => break,
+                }
             }
-            match listener.accept() {
-                Ok((client, _)) => match serve(client, &pool, &invitation, false) {
-                    Ok(true) => break, // used once; never automatically replay
-                    Ok(false) => {}
-                    Err(_) => {} // malformed/untrusted clients cannot transfer
-                },
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock =>
-                    std::thread::sleep(Duration::from_millis(30)),
-                Err(_) => break,
-            }
-        }
-        let _ = pool.cancel_dock(&id);
-    });
+            let _ = pool.cancel_dock(&id);
+        });
     if let Err(error) = task {
         // A failure starting the listener cannot retain an unseen,
         // unconsumable invitation against the original PTY.
         let _ = pool.cancel_dock(&id);
-        return Err(fail(format!("native docking listener unavailable: {error}")));
+        return Err(fail(format!(
+            "native docking listener unavailable: {error}"
+        )));
     }
     Ok(invite_path)
 }
 
 fn read_invite(path: &Path) -> Result<Invite> {
     if !path.is_absolute() || path.file_name().is_none_or(|file| file != "invite") {
-        return Err(Error::Denied("use an absolute owner-generated native invitation file"));
+        return Err(Error::Denied(
+            "use an absolute owner-generated native invitation file",
+        ));
     }
     let meta = fs::symlink_metadata(path).map_err(|error| fail(error.to_string()))?;
-    let parent = path.parent().ok_or(Error::Denied("invalid invitation directory"))?;
+    let parent = path
+        .parent()
+        .ok_or(Error::Denied("invalid invitation directory"))?;
     let folder = fs::symlink_metadata(parent).map_err(|error| fail(error.to_string()))?;
-    if !meta.file_type().is_file() || !folder.file_type().is_dir()
-        || meta.mode() & 0o077 != 0 || folder.mode() & 0o077 != 0
-        || meta.uid() != folder.uid() || meta.len() > 4096 || meta.len() == 0 {
-        return Err(Error::Denied("native invitation must be private and bounded"));
+    if !meta.file_type().is_file()
+        || !folder.file_type().is_dir()
+        || meta.mode() & 0o077 != 0
+        || folder.mode() & 0o077 != 0
+        || meta.uid() != folder.uid()
+        || meta.len() > 4096
+        || meta.len() == 0
+    {
+        return Err(Error::Denied(
+            "native invitation must be private and bounded",
+        ));
     }
     // Refuse a pathname swapped between metadata checks and opening the
     // invitation. Read from the *opened inode* with a hard 4096-byte cap.
-    let file = OpenOptions::new().read(true).open(path).map_err(Error::Io)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(Error::Io)?;
     let opened = file.metadata().map_err(Error::Io)?;
-    if !opened.is_file() || opened.dev() != meta.dev() || opened.ino() != meta.ino()
-        || opened.uid() != folder.uid() || opened.mode() & 0o077 != 0 {
+    if !opened.is_file()
+        || opened.dev() != meta.dev()
+        || opened.ino() != meta.ino()
+        || opened.uid() != folder.uid()
+        || opened.mode() & 0o077 != 0
+    {
         return Err(Error::Denied("native invitation identity replaced"));
     }
     let mut bytes = Vec::with_capacity(opened.len() as usize);
@@ -371,20 +545,30 @@ fn read_invite(path: &Path) -> Result<Invite> {
     if bytes.len() > 4096 {
         return Err(Error::Denied("native invitation exceeds maximum size"));
     }
-    let invitation: Invite = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::Denied("malformed native invitation"))?;
-    if invitation.version != PROTOCOL || invitation.socket != parent.join("socket")
+    let invitation: Invite =
+        serde_json::from_slice(&bytes).map_err(|_| Error::Denied("malformed native invitation"))?;
+    if invitation.version != PROTOCOL
+        || invitation.socket != parent.join("socket")
         || invitation.ticket.len() != 64
-        || !invitation.ticket.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || invitation.terminal.len() > 128 {
+        || !invitation
+            .ticket
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || invitation.terminal.len() > 128
+    {
         return Err(Error::Denied("invalid native invitation binding"));
     }
     Ok(invitation)
 }
 
-async fn send_async(writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>, request: Request) -> Result<()> {
+async fn send_async(
+    writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+    request: Request,
+) -> Result<()> {
     let mut data = serde_json::to_vec(&request).map_err(|error| fail(error.to_string()))?;
-    if data.len() > MAX_CLIENT { return Err(Error::Denied("native control request too large")); }
+    if data.len() > MAX_CLIENT {
+        return Err(Error::Denied("native control request too large"));
+    }
     data.push(b'\n');
     writer.write_all(&data).await.map_err(Error::Io)
 }
@@ -399,10 +583,15 @@ async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
     loop {
         let available = reader.fill_buf().await.map_err(Error::Io)?;
         if available.is_empty() {
-            return if line.is_empty() { Ok(None) }
-                else { Err(Error::Denied("incomplete native owner frame")) };
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(Error::Denied("incomplete native owner frame"))
+            };
         }
-        let count = available.iter().position(|byte| *byte == b'\n')
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
         if line.len().saturating_add(count) > max.saturating_add(1) {
             return Err(Error::Denied("native owner frame exceeds limit"));
@@ -423,7 +612,13 @@ async fn flush_input(
     if !pending.is_empty() {
         // Never retry a potentially accepted PTY write after an ambiguous
         // transport failure. Control effects are not replayable UI state.
-        send_async(writer, Request::Input { bytes: std::mem::take(pending) }).await?;
+        send_async(
+            writer,
+            Request::Input {
+                bytes: std::mem::take(pending),
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -433,14 +628,20 @@ async fn flush_input(
 pub fn attach(invitation_path: &Path) -> Result<u8> {
     use crate::tui::terminal_session::{Surface, TerminalSession};
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(Error::Denied("native docking requires an interactive second terminal"));
+        return Err(Error::Denied(
+            "native docking requires an interactive second terminal",
+        ));
     }
     let invitation = read_invite(invitation_path)?;
     let mut stream = UnixStream::connect(&invitation.socket).map_err(Error::Io)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(Error::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(Error::Io)?;
     let hello = serde_json::to_vec(&Request::Hello {
-        version: PROTOCOL, ticket: invitation.ticket,
-    }).map_err(|error| fail(error.to_string()))?;
+        version: PROTOCOL,
+        ticket: invitation.ticket,
+    })
+    .map_err(|error| fail(error.to_string()))?;
     stream.write_all(&hello).map_err(Error::Io)?;
     stream.write_all(b"\n").map_err(Error::Io)?;
     // Consume exactly one reply line. Avoid a BufReader that might prefetch
@@ -449,7 +650,9 @@ pub fn attach(invitation_path: &Path) -> Result<u8> {
     loop {
         let mut byte = [0_u8; 1];
         stream.read_exact(&mut byte).map_err(Error::Io)?;
-        if byte[0] == b'\n' { break; }
+        if byte[0] == b'\n' {
+            break;
+        }
         if first.len() == 4096 {
             return Err(Error::Denied("native docking admission exceeds bound"));
         }
@@ -458,9 +661,14 @@ pub fn attach(invitation_path: &Path) -> Result<u8> {
     let reply: Reply = serde_json::from_slice(&first)
         .map_err(|_| Error::Denied("invalid native docking owner reply"))?;
     match reply {
-        Reply::Ready { version, terminal } if version == PROTOCOL && terminal == invitation.terminal => {}
+        Reply::Ready { version, terminal }
+            if version == PROTOCOL && terminal == invitation.terminal => {}
         Reply::Error { message } => return Err(fail(message)),
-        _ => return Err(Error::Denied("native docking owner did not confirm terminal identity")),
+        _ => {
+            return Err(Error::Denied(
+                "native docking owner did not confirm terminal identity",
+            ))
+        }
     }
     // The invitation's one-use proof is now consumed by the *original*
     // retained Pool, not by another shell or a parallel Agent owner.
@@ -597,17 +805,25 @@ mod tests {
         let other = root.join("other");
         fs::write(&other, b"private fixture").unwrap();
         symlink(&other, &path).unwrap();
-        assert!(read_invite(&path).is_err(), "symlinked invitation is never followed");
+        assert!(
+            read_invite(&path).is_err(),
+            "symlinked invitation is never followed"
+        );
         fs::remove_file(&path).unwrap();
         fs::remove_file(&other).unwrap();
 
         fs::write(&path, vec![b'x'; 4097]).unwrap();
-        assert!(read_invite(&path).is_err(), "oversized descriptor is rejected");
+        assert!(
+            read_invite(&path).is_err(),
+            "oversized descriptor is rejected"
+        );
         fs::remove_file(&path).unwrap();
 
         let invitation = Invite {
-            version: PROTOCOL, socket: root.join("wrong-socket"),
-            terminal: "synthetic_pty".into(), ticket: "a".repeat(64),
+            version: PROTOCOL,
+            socket: root.join("wrong-socket"),
+            terminal: "synthetic_pty".into(),
+            ticket: "a".repeat(64),
         };
         fs::write(&path, serde_json::to_vec(&invitation).unwrap()).unwrap();
         let permission = fs::metadata(&path).unwrap().permissions();
@@ -615,11 +831,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         private.set_mode(0o600);
         fs::set_permissions(&path, private).unwrap();
-        assert!(read_invite(&path).is_err(), "socket cannot retarget another owner");
+        assert!(
+            read_invite(&path).is_err(),
+            "socket cannot retarget another owner"
+        );
         let mut public = permission;
         public.set_mode(0o644);
         fs::set_permissions(&path, public).unwrap();
-        assert!(read_invite(&path).is_err(), "public-readable descriptor is denied");
+        assert!(
+            read_invite(&path).is_err(),
+            "public-readable descriptor is denied"
+        );
         fs::remove_file(&path).unwrap();
     }
 
@@ -629,40 +851,71 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(read);
         let mut partial = Vec::new();
         writer.write_all(b"{\"op\":").await.unwrap();
-        let interrupted = tokio::time::timeout(Duration::from_millis(35),
-            read_bounded_frame(&mut reader, &mut partial, 90)).await;
-        assert!(interrupted.is_err(), "waiting for the rest of a split frame must suspend");
-        assert_eq!(partial, b"{\"op\":", "cancelled read may not drop consumed bytes");
-        writer.write_all(b"\"frame\",\"contents\":\"hello\"}\n").await.unwrap();
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(35),
+            read_bounded_frame(&mut reader, &mut partial, 90),
+        )
+        .await;
+        assert!(
+            interrupted.is_err(),
+            "waiting for the rest of a split frame must suspend"
+        );
+        assert_eq!(
+            partial, b"{\"op\":",
+            "cancelled read may not drop consumed bytes"
+        );
+        writer
+            .write_all(b"\"frame\",\"contents\":\"hello\"}\n")
+            .await
+            .unwrap();
         let complete = read_bounded_frame(&mut reader, &mut partial, 90)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(complete, b"{\"op\":\"frame\",\"contents\":\"hello\"}");
         assert!(partial.is_empty());
         writer.write_all(b"1234567890\n").await.unwrap();
-        assert!(read_bounded_frame(&mut reader, &mut partial, 4).await.is_err(),
-            "too-large native owner frame must be rejected before allocation");
+        assert!(
+            read_bounded_frame(&mut reader, &mut partial, 4)
+                .await
+                .is_err(),
+            "too-large native owner frame must be rejected before allocation"
+        );
     }
 
     #[test]
     fn stop_request_never_terminates_original_workspace_owned_pty() {
         let (root, root_cleanup) = private_directory().unwrap();
-        let shell = std::env::var_os("AW_BASH").map(PathBuf::from)
+        let shell = std::env::var_os("AW_BASH")
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/bash"));
         let pool = terminals::Pool::new();
-        let terminal_id = pool.launch(root.clone(), shell, "synthetic_actor".into()).unwrap();
+        let terminal_id = pool
+            .launch(root.clone(), shell, "synthetic_actor".into())
+            .unwrap();
         let invitation = invite(pool.clone(), &terminal_id).unwrap();
         let descriptor = read_invite(&invitation).unwrap();
         let mut socket = UnixStream::connect(&descriptor.socket).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let request = serde_json::to_vec(&Request::Stop {
             ticket: descriptor.ticket.clone(),
-        }).unwrap();
+        })
+        .unwrap();
         socket.write_all(&request).unwrap();
         socket.write_all(b"\n").unwrap();
-        let response = super::request(&mut BufReader::new(socket), 4096).unwrap().unwrap();
-        assert!(matches!(serde_json::from_slice::<Reply>(&response).unwrap(),
-            Reply::Error { .. }));
-        assert_eq!(pool.get(&terminal_id).unwrap().status(), aw_terminal::Status::Running);
+        let response = super::request(&mut BufReader::new(socket), 4096)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&response).unwrap(),
+            Reply::Error { .. }
+        ));
+        assert_eq!(
+            pool.get(&terminal_id).unwrap().status(),
+            aw_terminal::Status::Running
+        );
         assert!(pool.has_invitation(&terminal_id, &descriptor.ticket));
         pool.cancel_dock(&terminal_id).unwrap();
         pool.shutdown();
@@ -674,13 +927,21 @@ mod tests {
     fn private_socket_transfers_exact_live_pty_and_disconnect_restores_source() {
         let mut random = [0_u8; 12];
         getrandom::fill(&mut random).unwrap();
-        let root = std::env::temp_dir().join(format!("aw-native-dock-wire-test-{}",
-            random.iter().map(|byte| format!("{byte:02x}")).collect::<String>()));
+        let root = std::env::temp_dir().join(format!(
+            "aw-native-dock-wire-test-{}",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
         fs::create_dir(&root).unwrap();
-        let shell = std::env::var_os("AW_BASH").map(PathBuf::from)
+        let shell = std::env::var_os("AW_BASH")
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/bash"));
         let pool = terminals::Pool::new();
-        let id = pool.launch(root.clone(), shell, "synthetic_actor".into()).unwrap();
+        let id = pool
+            .launch(root.clone(), shell, "synthetic_actor".into())
+            .unwrap();
         let original = pool.get(&id).unwrap();
         let old_snapshot = original.snapshot(0);
 
@@ -689,42 +950,75 @@ mod tests {
         assert_eq!(token.terminal, id);
         assert_eq!(token.version, PROTOCOL);
         assert_eq!(fs::metadata(&invite_path).unwrap().mode() & 0o077, 0);
-        assert_eq!(fs::metadata(invite_path.parent().unwrap()).unwrap().mode() & 0o077, 0);
-        assert_eq!(pool.dock_mode(&id), Some(super::super::terminal_control::Mode::Offered));
-        assert!(invite(pool.clone(), &id).is_err(),
-            "only one pending socket invitation belongs to this PTY");
+        assert_eq!(
+            fs::metadata(invite_path.parent().unwrap()).unwrap().mode() & 0o077,
+            0
+        );
+        assert_eq!(
+            pool.dock_mode(&id),
+            Some(super::super::terminal_control::Mode::Offered)
+        );
+        assert!(
+            invite(pool.clone(), &id).is_err(),
+            "only one pending socket invitation belongs to this PTY"
+        );
 
         // A wrong proof must be denied by owner without consuming the token.
         let mut invalid = UnixStream::connect(&token.socket).unwrap();
-        invalid.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        invalid.write_all(b"{\"op\":\"hello\",\"version\":1,\"ticket\":\"f\"}\n").unwrap();
+        invalid
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        invalid
+            .write_all(b"{\"op\":\"hello\",\"version\":1,\"ticket\":\"f\"}\n")
+            .unwrap();
         let mut reader = BufReader::new(invalid);
         let line = request(&mut reader, 8192).unwrap().unwrap();
-        assert!(matches!(serde_json::from_slice::<Reply>(&line).unwrap(), Reply::Error { .. }));
-        assert_eq!(pool.dock_mode(&id), Some(super::super::terminal_control::Mode::Offered));
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&line).unwrap(),
+            Reply::Error { .. }
+        ));
+        assert_eq!(
+            pool.dock_mode(&id),
+            Some(super::super::terminal_control::Mode::Offered)
+        );
 
         let mut socket = UnixStream::connect(&token.socket).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let hello = serde_json::to_vec(&Request::Hello {
-            version: PROTOCOL, ticket: token.ticket,
-        }).unwrap();
+            version: PROTOCOL,
+            ticket: token.ticket,
+        })
+        .unwrap();
         socket.write_all(&hello).unwrap();
         socket.write_all(b"\n").unwrap();
         let mut reader = BufReader::new(socket.try_clone().unwrap());
         let admission = request(&mut reader, 8192).unwrap().unwrap();
-        assert!(matches!(serde_json::from_slice::<Reply>(&admission).unwrap(),
-            Reply::Ready { version: 1, .. }));
-        assert_eq!(pool.dock_mode(&id), Some(super::super::terminal_control::Mode::Docked));
-        assert!(pool.input_local(&id, b"echo SOURCE_MUST_BE_BLOCKED\n".to_vec()).is_err());
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&admission).unwrap(),
+            Reply::Ready { version: 1, .. }
+        ));
+        assert_eq!(
+            pool.dock_mode(&id),
+            Some(super::super::terminal_control::Mode::Docked)
+        );
+        assert!(pool
+            .input_local(&id, b"echo SOURCE_MUST_BE_BLOCKED\n".to_vec())
+            .is_err());
         let request_bytes = serde_json::to_vec(&Request::Input {
             bytes: b"echo SAME_RETained_PTY\n".to_vec(),
-        }).unwrap();
+        })
+        .unwrap();
         socket.write_all(&request_bytes).unwrap();
         socket.write_all(b"\n").unwrap();
         let received = request(&mut reader, MAX_WIRE).unwrap().unwrap();
-        let Reply::Frame { snapshot } = serde_json::from_slice::<Reply>(&received).unwrap()
-            else { panic!("receiver must read a real original PTY snapshot") };
+        let Reply::Frame { snapshot } = serde_json::from_slice::<Reply>(&received).unwrap() else {
+            panic!("receiver must read a real original PTY snapshot")
+        };
         assert_eq!(snapshot.id, old_snapshot.id);
         assert_eq!(snapshot.root, root);
         assert_eq!(snapshot.owner, old_snapshot.owner);
@@ -735,12 +1029,23 @@ mod tests {
         drop(socket);
         for _ in 0..120 {
             if pool.dock_mode(&id) == Some(super::super::terminal_control::Mode::Local)
-                && !invite_path.exists() { break; }
+                && !invite_path.exists()
+            {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
-        assert_eq!(pool.dock_mode(&id), Some(super::super::terminal_control::Mode::Local));
-        assert!(!invite_path.exists(), "one-use invitation cleaned after disconnect");
-        assert!(pool.input_local(&id, b"echo RETURNED_TO_ORIGIN\n".to_vec()).is_ok());
+        assert_eq!(
+            pool.dock_mode(&id),
+            Some(super::super::terminal_control::Mode::Local)
+        );
+        assert!(
+            !invite_path.exists(),
+            "one-use invitation cleaned after disconnect"
+        );
+        assert!(pool
+            .input_local(&id, b"echo RETURNED_TO_ORIGIN\n".to_vec())
+            .is_ok());
         assert_eq!(pool.get(&id).unwrap().id, old_snapshot.id);
         pool.shutdown();
         drop(pool);

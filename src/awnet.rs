@@ -31,10 +31,10 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
 
-mod authority;
-mod authority_replica;
 #[cfg(target_os = "linux")]
 mod actor_remote;
+mod authority;
+mod authority_replica;
 mod federation;
 mod fleet_dispatch;
 mod identity_continuity;
@@ -52,10 +52,10 @@ pub(crate) mod remote_workspace_target;
 mod routes;
 mod services;
 mod workspace_replica;
-pub use authority::*;
-pub use authority_replica::*;
 #[cfg(target_os = "linux")]
 pub use actor_remote::*;
+pub use authority::*;
+pub use authority_replica::*;
 pub use federation::*;
 pub use fleet_dispatch::*;
 pub use identity_continuity::*;
@@ -276,7 +276,9 @@ fn open_private_existing(path: &Path) -> Result<File> {
 
 fn create_private_new(path: &Path) -> Result<File> {
     aw_platform::open_private_new(path).map_err(|_| {
-        Error::Denied("AwNode identity creation requires platform-verified owner-only private custody")
+        Error::Denied(
+            "AwNode identity creation requires platform-verified owner-only private custody",
+        )
     })
 }
 

@@ -345,7 +345,11 @@ fn heading(line: &str) -> Option<&str> {
 }
 
 fn list_indent(line: &str) -> usize {
-    line.chars().take_while(|ch| ch.is_whitespace()).count().div_euclid(2).min(4)
+    line.chars()
+        .take_while(|ch| ch.is_whitespace())
+        .count()
+        .div_euclid(2)
+        .min(4)
 }
 
 fn unordered(line: &str) -> Option<(String, &str)> {
@@ -355,7 +359,10 @@ fn unordered(line: &str) -> Option<(String, &str)> {
         if let Some(content) = trimmed.strip_prefix(marker) {
             let (glyph, content) = if let Some(rest) = content.strip_prefix("[ ] ") {
                 ("☐", rest)
-            } else if let Some(rest) = content.strip_prefix("[x] ").or_else(|| content.strip_prefix("[X] ")) {
+            } else if let Some(rest) = content
+                .strip_prefix("[x] ")
+                .or_else(|| content.strip_prefix("[X] "))
+            {
                 ("☑", rest)
             } else {
                 ("•", content)
@@ -374,26 +381,42 @@ fn ordered(line: &str) -> Option<(String, &str)> {
         return None;
     }
     let content = trimmed[digits..].strip_prefix(". ")?;
-    Some((format!("{}{}. ", "  ".repeat(depth), &trimmed[..digits]), content))
+    Some((
+        format!("{}{}. ", "  ".repeat(depth), &trimmed[..digits]),
+        content,
+    ))
 }
 
 fn table_cells(line: &str) -> Option<Vec<&str>> {
-    if !line.contains('|') { return None; }
+    if !line.contains('|') {
+        return None;
+    }
     let trimmed = line.trim().trim_matches('|');
     let cells = trimmed.split('|').map(str::trim).collect::<Vec<_>>();
     (cells.len() >= 2).then_some(cells)
 }
 
 fn table_separator(line: &str) -> bool {
-    let Some(cells) = table_cells(line) else { return false; };
+    let Some(cells) = table_cells(line) else {
+        return false;
+    };
     cells.iter().all(|cell| {
         let core = cell.trim_matches(':');
         core.len() >= 3 && core.chars().all(|ch| ch == '-')
     })
 }
 
-fn render_table_row(cells: &[&str], palette: Palette, width: usize, header: bool) -> Vec<Line<'static>> {
-    let style = if header { palette.markdown_heading_style() } else { palette.text_style() };
+fn render_table_row(
+    cells: &[&str],
+    palette: Palette,
+    width: usize,
+    header: bool,
+) -> Vec<Line<'static>> {
+    let style = if header {
+        palette.markdown_heading_style()
+    } else {
+        palette.text_style()
+    };
     let joined = cells.join(" │ ");
     wrap_with_prefix(
         vec![Span::styled("│ ", palette.user_marker_style())],
@@ -404,7 +427,10 @@ fn render_table_row(cells: &[&str], palette: Palette, width: usize, header: bool
 }
 
 fn horizontal_rule(line: &str) -> bool {
-    let compact = line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let compact = line
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
     compact.len() >= 3
         && (compact.chars().all(|ch| ch == '-')
             || compact.chars().all(|ch| ch == '*')
@@ -440,9 +466,8 @@ fn code_source_spans(
 ) -> Option<Vec<Line<'static>>> {
     #[cfg(feature = "workspace")]
     {
-        language.and_then(|language| {
-            crate::tui::syntax::highlight_language(language, code, theme_mode)
-        })
+        language
+            .and_then(|language| crate::tui::syntax::highlight_language(language, code, theme_mode))
     }
     #[cfg(not(feature = "workspace"))]
     {
@@ -497,12 +522,7 @@ fn render_code_block(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![Span::styled((*raw).to_owned(), code_style)]);
-        for line in wrap_with_prefix(
-            vec![Span::styled("  ", code_style)],
-            spans,
-            width,
-            true,
-        ) {
+        for line in wrap_with_prefix(vec![Span::styled("  ", code_style)], spans, width, true) {
             out.push(fill_line(line, code_style, width));
         }
     }
@@ -553,13 +573,21 @@ fn render_impl(
             continue;
         }
 
-        if index + 1 < source.len() && table_cells(line).is_some() && table_separator(source[index + 1]) {
+        if index + 1 < source.len()
+            && table_cells(line).is_some()
+            && table_separator(source[index + 1])
+        {
             let header = table_cells(line).expect("checked table header");
             out.extend(render_table_row(&header, palette, width, true));
-            out.push(Line::styled("─".repeat(width.min(72)), palette.markdown_rule_style()));
+            out.push(Line::styled(
+                "─".repeat(width.min(72)),
+                palette.markdown_rule_style(),
+            ));
             index += 2;
             while index < source.len() {
-                let Some(row) = table_cells(source[index]) else { break; };
+                let Some(row) = table_cells(source[index]) else {
+                    break;
+                };
                 out.extend(render_table_row(&row, palette, width, false));
                 index += 1;
             }
@@ -779,8 +807,10 @@ mod tests {
         let plain = render_plain(source, palette, mode, 48);
         let rich = render(source, palette, mode, 48);
         assert_eq!(plain_lines(&plain), plain_lines(&rich));
-        assert!(rich.iter().map(|line| line.spans.len()).sum::<usize>()
-            > plain.iter().map(|line| line.spans.len()).sum::<usize>());
+        assert!(
+            rich.iter().map(|line| line.spans.len()).sum::<usize>()
+                > plain.iter().map(|line| line.spans.len()).sum::<usize>()
+        );
     }
 
     #[cfg(feature = "workspace")]
@@ -796,9 +826,7 @@ mod tests {
         );
         let code = lines
             .iter()
-            .find(|line| {
-                plain_lines(std::slice::from_ref(line))[0].contains("pub fn bird")
-            })
+            .find(|line| plain_lines(std::slice::from_ref(line))[0].contains("pub fn bird"))
             .expect("highlighted Rust code row");
         assert!(code.spans.len() > 2);
         assert!(code
@@ -842,8 +870,16 @@ mod tests {
             .iter()
             .find(|line| plain_lines(std::slice::from_ref(line))[0].contains("bird"))
             .unwrap();
-        let dark_fg = dark_row.spans.iter().filter_map(|span| span.style.fg).collect::<Vec<_>>();
-        let light_fg = light_row.spans.iter().filter_map(|span| span.style.fg).collect::<Vec<_>>();
+        let dark_fg = dark_row
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+        let light_fg = light_row
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg)
+            .collect::<Vec<_>>();
         assert_ne!(dark_fg, light_fg);
     }
 
@@ -869,9 +905,7 @@ mod tests {
         let lines = render("```rust\npub fn bird() {}\n```", palette, mode, 40);
         let code = lines
             .iter()
-            .find(|line| {
-                plain_lines(std::slice::from_ref(line))[0].contains("pub fn bird")
-            })
+            .find(|line| plain_lines(std::slice::from_ref(line))[0].contains("pub fn bird"))
             .unwrap();
         assert!(code
             .spans
@@ -888,9 +922,7 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= 12));
         let code = lines
             .iter()
-            .find(|line| {
-                plain_lines(std::slice::from_ref(line))[0].contains("0123456789")
-            })
+            .find(|line| plain_lines(std::slice::from_ref(line))[0].contains("0123456789"))
             .expect("code line");
         assert_eq!(code.width(), 12);
         assert!(code

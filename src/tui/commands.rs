@@ -35,27 +35,54 @@ pub struct SlashCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TuiTarget { Scrollback, Inline, Fullscreen, Workspace }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TuiRequest { Show, Switch(TuiTarget) }
-impl TuiTarget {
-    pub fn parse(value:&str)->Option<Self>{match value.trim().to_ascii_lowercase().as_str(){
-        "scrollback"=>Some(Self::Scrollback),"inline"=>Some(Self::Inline),"fullscreen"=>Some(Self::Fullscreen),"workspace"=>Some(Self::Workspace),_=>None
-    }}
-    pub fn agent_mode(self)->Option<aw::config::TuiMode>{match self{
-        Self::Scrollback=>Some(aw::config::TuiMode::Scrollback),Self::Inline=>Some(aw::config::TuiMode::Inline),Self::Fullscreen=>Some(aw::config::TuiMode::Fullscreen),Self::Workspace=>None
-    }}
+pub enum TuiTarget {
+    Scrollback,
+    Inline,
+    Fullscreen,
+    Workspace,
 }
-pub const TUI_USAGE:&str="/tui scrollback|inline|fullscreen|workspace";
-pub fn tui_request(line:&str)->Option<Result<TuiRequest,&'static str>>{
-    let trimmed=line.trim();
-    if trimmed=="/workspace" { return Some(Ok(TuiRequest::Switch(TuiTarget::Workspace))); }
-    let mut parts=trimmed.split_whitespace();
-    if parts.next()!=Some("/tui") { return None; }
-    match (parts.next(),parts.next()) {
-        (None,None)=>Some(Ok(TuiRequest::Show)),
-        (Some(value),None)=>Some(TuiTarget::parse(value).map(TuiRequest::Switch).ok_or(TUI_USAGE)),
-        _=>Some(Err(TUI_USAGE)),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiRequest {
+    Show,
+    Switch(TuiTarget),
+}
+impl TuiTarget {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scrollback" => Some(Self::Scrollback),
+            "inline" => Some(Self::Inline),
+            "fullscreen" => Some(Self::Fullscreen),
+            "workspace" => Some(Self::Workspace),
+            _ => None,
+        }
+    }
+    pub fn agent_mode(self) -> Option<aw::config::TuiMode> {
+        match self {
+            Self::Scrollback => Some(aw::config::TuiMode::Scrollback),
+            Self::Inline => Some(aw::config::TuiMode::Inline),
+            Self::Fullscreen => Some(aw::config::TuiMode::Fullscreen),
+            Self::Workspace => None,
+        }
+    }
+}
+pub const TUI_USAGE: &str = "/tui scrollback|inline|fullscreen|workspace";
+pub fn tui_request(line: &str) -> Option<Result<TuiRequest, &'static str>> {
+    let trimmed = line.trim();
+    if trimmed == "/workspace" {
+        return Some(Ok(TuiRequest::Switch(TuiTarget::Workspace)));
+    }
+    let mut parts = trimmed.split_whitespace();
+    if parts.next() != Some("/tui") {
+        return None;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => Some(Ok(TuiRequest::Show)),
+        (Some(value), None) => Some(
+            TuiTarget::parse(value)
+                .map(TuiRequest::Switch)
+                .ok_or(TUI_USAGE),
+        ),
+        _ => Some(Err(TUI_USAGE)),
     }
 }
 
@@ -314,9 +341,7 @@ pub fn slash_aliases(name: &str) -> &'static [&'static str] {
 pub fn canonical_slash_name(name: &str) -> Option<&'static str> {
     SLASH_COMMANDS
         .iter()
-        .find(|spec| {
-            spec.name == name || slash_aliases(spec.name).contains(&name)
-        })
+        .find(|spec| spec.name == name || slash_aliases(spec.name).contains(&name))
         .map(|spec| spec.name)
 }
 
@@ -386,7 +411,10 @@ impl WorkspaceCommand {
             | "terminal-live"
             | "terminal-scroll 20"
             | "terminal-scroll -20"
-            | "terminal-forget" | "terminal-promote" | "terminal-dock" | "terminal-dock-cancel" => context.terminal_focused,
+            | "terminal-forget"
+            | "terminal-promote"
+            | "terminal-dock"
+            | "terminal-dock-cancel" => context.terminal_focused,
             "stage" | "unstage" | "hunk-next" | "hunk-prev" | "reviewed" | "comment"
             | "send-review" => context.diff_focused,
             "filter" => context.navigator_focused,
@@ -859,8 +887,7 @@ pub fn slash_query(text: &str) -> Option<&str> {
 pub fn exact_slash_command(text: &str, workspace: bool) -> Option<&'static SlashCommand> {
     let name = slash_query(text)?;
     SLASH_COMMANDS.iter().find(|spec| {
-        spec.available(workspace)
-            && (spec.name == name || slash_aliases(spec.name).contains(&name))
+        spec.available(workspace) && (spec.name == name || slash_aliases(spec.name).contains(&name))
     })
 }
 
@@ -890,11 +917,7 @@ pub fn slash_matches(text: &str, workspace: bool) -> Vec<&'static SlashCommand> 
 
 #[cfg(feature = "workspace")]
 fn workspace_action_has_slash_equivalent(action: &WorkspaceCommand) -> bool {
-    let verb = action
-        .command
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
+    let verb = action.command.split_whitespace().next().unwrap_or("");
     canonical_slash_name(verb).is_some_and(|canonical| {
         SLASH_COMMANDS
             .iter()
@@ -995,9 +1018,7 @@ pub fn slash_help(workspace: bool) -> String {
         let _ = writeln!(
             out,
             "  {:<30} {}{}",
-            spec.usage,
-            spec.description,
-            alias_text
+            spec.usage, spec.description, alias_text
         );
     }
     out.push_str("\nType / in the composer to search and complete commands.\n");
@@ -1117,8 +1138,16 @@ mod tests {
     fn slash_registry_is_presentation_ordered_and_matches() {
         let matches = slash_matches("/mo", false);
         assert_eq!(matches.first().map(|m| m.name), Some("model"));
-        assert_eq!(slash_matches("/tu",false).first().map(|m|m.name),Some("tui"));
-        assert_eq!(slash_matches("/work",false).iter().any(|m|m.name=="workspace"),cfg!(feature="workspace"));
+        assert_eq!(
+            slash_matches("/tu", false).first().map(|m| m.name),
+            Some("tui")
+        );
+        assert_eq!(
+            slash_matches("/work", false)
+                .iter()
+                .any(|m| m.name == "workspace"),
+            cfg!(feature = "workspace")
+        );
     }
 
     #[cfg(feature = "workspace")]
@@ -1133,11 +1162,7 @@ mod tests {
 
     #[test]
     fn aliases_resolve_to_one_canonical_slash_command() {
-        for (alias, canonical) in [
-            ("clone", "fork"),
-            ("open", "resume"),
-            ("side", "btw"),
-        ] {
+        for (alias, canonical) in [("clone", "fork"), ("open", "resume"), ("side", "btw")] {
             assert_eq!(canonical_slash_name(alias), Some(canonical));
             assert_eq!(
                 exact_slash_command(&format!("/{alias}"), cfg!(feature = "workspace"))
@@ -1145,27 +1170,44 @@ mod tests {
                 Some(canonical)
             );
         }
-        for name in ["think", "theme", "settings", "title-generate", "btw", "resume", "tui"] {
+        for name in [
+            "think",
+            "theme",
+            "settings",
+            "title-generate",
+            "btw",
+            "resume",
+            "tui",
+        ] {
             assert_eq!(canonical_slash_name(name), Some(name));
         }
     }
 
     #[test]
     fn tui_modes_are_values_not_parallel_slash_commands() {
-        assert_eq!(TuiTarget::parse("scrollback"),Some(TuiTarget::Scrollback));
-        assert_eq!(TuiTarget::parse("inline"),Some(TuiTarget::Inline));
-        assert_eq!(TuiTarget::parse("fullscreen"),Some(TuiTarget::Fullscreen));
-        assert_eq!(TuiTarget::parse("workspace"),Some(TuiTarget::Workspace));
-        for old in ["scrollback","inline","fullscreen","agent"] { assert!(SLASH_COMMANDS.iter().all(|spec|spec.name!=old)); }
-        assert!(exact_slash_command("/tui inline",false).is_some());
-        assert_eq!(tui_request("/tui"),Some(Ok(TuiRequest::Show)));
-        assert_eq!(tui_request("/tui workspace"),Some(Ok(TuiRequest::Switch(TuiTarget::Workspace))));
-        assert_eq!(tui_request("/workspace"),Some(Ok(TuiRequest::Switch(TuiTarget::Workspace))));
-        assert_eq!(tui_request("/tui nope"),Some(Err(TUI_USAGE)));
-        assert!(exact_slash_command("/minimal",false).is_none());
-        #[cfg(feature="workspace")] {
-            assert!(exact_slash_command("/minimal",true).is_some());
-            assert!(exact_slash_command("/tui inline",true).is_none());
+        assert_eq!(TuiTarget::parse("scrollback"), Some(TuiTarget::Scrollback));
+        assert_eq!(TuiTarget::parse("inline"), Some(TuiTarget::Inline));
+        assert_eq!(TuiTarget::parse("fullscreen"), Some(TuiTarget::Fullscreen));
+        assert_eq!(TuiTarget::parse("workspace"), Some(TuiTarget::Workspace));
+        for old in ["scrollback", "inline", "fullscreen", "agent"] {
+            assert!(SLASH_COMMANDS.iter().all(|spec| spec.name != old));
+        }
+        assert!(exact_slash_command("/tui inline", false).is_some());
+        assert_eq!(tui_request("/tui"), Some(Ok(TuiRequest::Show)));
+        assert_eq!(
+            tui_request("/tui workspace"),
+            Some(Ok(TuiRequest::Switch(TuiTarget::Workspace)))
+        );
+        assert_eq!(
+            tui_request("/workspace"),
+            Some(Ok(TuiRequest::Switch(TuiTarget::Workspace)))
+        );
+        assert_eq!(tui_request("/tui nope"), Some(Err(TUI_USAGE)));
+        assert!(exact_slash_command("/minimal", false).is_none());
+        #[cfg(feature = "workspace")]
+        {
+            assert!(exact_slash_command("/minimal", true).is_some());
+            assert!(exact_slash_command("/tui inline", true).is_none());
         }
     }
 
@@ -1310,7 +1352,9 @@ mod tests {
             );
         }
         assert!(
-            actions.iter().any(|action| action.command == "conversation"),
+            actions
+                .iter()
+                .any(|action| action.command == "conversation"),
             "direct Workspace actions remain discoverable"
         );
     }

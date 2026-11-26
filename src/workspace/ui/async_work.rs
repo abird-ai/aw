@@ -641,7 +641,10 @@ impl Ui {
             UiBackgroundResult::TerminalMigration(result) => {
                 self.terminal_pending = false;
                 self.notice = match result {
-                    Ok(invite) => format!("Original PTY now independent. Attach: {}", super::super::native_dock::attach_hint(&invite)),
+                    Ok(invite) => format!(
+                        "Original PTY now independent. Attach: {}",
+                        super::super::native_dock::attach_hint(&invite)
+                    ),
                     Err(error) => error,
                 };
             }

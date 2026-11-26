@@ -1,12 +1,12 @@
 //! Optional native workspace frontend. One owner thread uses the existing SDK;
 //! neither a layout operation nor a read-only file view invokes a model.
 mod agent_view;
-#[cfg(unix)]
-pub(super) mod native_dock;
 mod background;
 mod branch_view;
 pub(super) mod files;
 pub(super) mod git;
+#[cfg(unix)]
+pub(super) mod native_dock;
 mod owner;
 mod palette;
 mod persistence;
@@ -37,7 +37,8 @@ pub(super) struct Returned {
 pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Result<Returned> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(Error::Config(
-            "aw workspace open requires a real terminal; use --output-print for redirected output".into(),
+            "aw workspace open requires a real terminal; use --output-print for redirected output"
+                .into(),
         ));
     }
     // Human Files roots remain the capabilities originally opened for this

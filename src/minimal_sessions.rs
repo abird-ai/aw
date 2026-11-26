@@ -50,7 +50,9 @@ pub fn default_directory() -> Result<PathBuf> {
         PathBuf::from(value)
     } else {
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
-            Error::Config("HOME/XDG_STATE_HOME missing; set --state-dir or --state-memory-only".into())
+            Error::Config(
+                "HOME/XDG_STATE_HOME missing; set --state-dir or --state-memory-only".into(),
+            )
         })?)
         .join(".local/state")
     };
@@ -179,7 +181,9 @@ impl Sessions {
         Self::validate_binding(&view.session.binding, &current)?;
         self.ensure_no_other_unresolved_effects(&current.tool_root, Some(cursor.session_id()))?;
         let id = cursor.session_id().to_owned();
-        let execution = self.store.agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
+        let execution = self
+            .store
+            .agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
         agent.load_history(view.history, Some(cursor.journal()))?;
         bind_execution_owner(agent, execution)?;
         self.current = Some(cursor);
@@ -199,7 +203,9 @@ impl Sessions {
                 &view.session.binding,
                 &Self::binding(settings, context, tools)?,
             )?;
-            let execution = self.store.agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
+            let execution =
+                self.store
+                    .agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
             agent.load_history(view.history, Some(cursor.journal()))?;
             bind_execution_owner(agent, execution)?;
         }
@@ -222,7 +228,8 @@ impl Sessions {
         ))?;
         let view = cursor.view()?;
         Self::validate_binding(
-            &view.session.binding, &Self::binding(settings, context, tools)?,
+            &view.session.binding,
+            &Self::binding(settings, context, tools)?,
         )?;
         let through = aw::jsonl_compaction::compact(agent, cursor, policy).await?;
         Ok(through as usize)
@@ -341,14 +348,15 @@ mod tests {
             .unwrap();
         // Mirror the actual Agent: first persist the original provider
         // Assistant proposal, then the irreversible Write intent.
-        let mut assistant=aw_agent_core::Message::text(
-            2,aw_agent_core::Role::Assistant,"");
-        assistant.tool_calls=vec![ToolCall {
-            id:"effect".into(),name:"write".into(),
-            arguments:serde_json::json!({"path":"file.txt","content":"changed"}),
+        let mut assistant = aw_agent_core::Message::text(2, aw_agent_core::Role::Assistant, "");
+        assistant.tool_calls = vec![ToolCall {
+            id: "effect".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path":"file.txt","content":"changed"}),
         }];
-        runtime.block_on(journal.append(1,
-            JournalEntry::Assistant{message:assistant})).unwrap();
+        runtime
+            .block_on(journal.append(1, JournalEntry::Assistant { message: assistant }))
+            .unwrap();
         runtime
             .block_on(journal.append(
                 1,

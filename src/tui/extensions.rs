@@ -1,3 +1,4 @@
+use super::theme::{palette_for, Palette};
 use super::{performance::PerformanceStats, status::StatusContext};
 use aw::config::{StatusItem, StatusLineConfig, StatusRegion, UiConfig};
 use aw_ui_extension::{
@@ -9,12 +10,11 @@ use ratatui::{
     text::{Line, Span as TuiSpan},
 };
 use std::sync::Arc;
-use super::theme::{palette_for, Palette};
 use unicode_width::UnicodeWidthStr;
 
 const STATUS_ID: &str = "builtin.status-line";
 const PERFORMANCE_ID: &str = "builtin.performance";
-const FACTUAL_NOTICES_ID:&str="builtin.factual-notices";
+const FACTUAL_NOTICES_ID: &str = "builtin.factual-notices";
 
 #[derive(Clone)]
 struct StatusLineExtension {
@@ -139,27 +139,37 @@ impl UiExtension for PerformanceExtension {
 /// the already existing Activity tab when user config explicitly enables it.
 struct FactualNoticeExtension;
 impl UiExtension for FactualNoticeExtension {
-    fn manifest(&self)->Manifest {
-        Manifest {id:FACTUAL_NOTICES_ID.into(),protocol_version:2,
-            slots:vec![Slot::AfterStep,Slot::AfterTurn,Slot::AfterFinalOutput],settings:Vec::new()}
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            id: FACTUAL_NOTICES_ID.into(),
+            protocol_version: 2,
+            slots: vec![Slot::AfterStep, Slot::AfterTurn, Slot::AfterFinalOutput],
+            settings: Vec::new(),
+        }
     }
-    fn project(&self,_:Slot,_:&Context)->Vec<Contribution>{Vec::new()}
-    fn event(&self,event:&aw_ui_extension::status_events::EventContext)->Vec<Contribution> {
+    fn project(&self, _: Slot, _: &Context) -> Vec<Contribution> {
+        Vec::new()
+    }
+    fn event(&self, event: &aw_ui_extension::status_events::EventContext) -> Vec<Contribution> {
         use aw_ui_extension::status_events::EventKind;
-        let label=match event.kind {
-            EventKind::StepEnd=>"Model step settled",
-            EventKind::TurnEnd=>"Turn settled",
-            EventKind::FinalOutput=>"Final answer available",
+        let label = match event.kind {
+            EventKind::StepEnd => "Model step settled",
+            EventKind::TurnEnd => "Turn settled",
+            EventKind::FinalOutput => "Final answer available",
         };
-        vec![Contribution {extension:FACTUAL_NOTICES_ID.into(),slot:event.kind.slot(),order:50,
-            lines:vec![ExtensionLine::plain(format!("{label} · turn {}",event.turn_id),Tone::Muted)]}]
+        vec![Contribution {
+            extension: FACTUAL_NOTICES_ID.into(),
+            slot: event.kind.slot(),
+            order: 50,
+            lines: vec![ExtensionLine::plain(
+                format!("{label} · turn {}", event.turn_id),
+                Tone::Muted,
+            )],
+        }]
     }
 }
 
-pub fn context(
-    status: &StatusContext,
-    performance: Option<&PerformanceStats>,
-) -> Context {
+pub fn context(status: &StatusContext, performance: Option<&PerformanceStats>) -> Context {
     Context {
         model: status.model.clone(),
         profile: status.profile.clone(),
@@ -260,11 +270,14 @@ fn balanced_line(
 }
 
 fn registry(ui: &UiConfig) -> Registry {
-    let mut extensions=vec![
-        Arc::new(StatusLineExtension{lines:ui.status_lines.clone()}) as Arc<dyn UiExtension>,
-        Arc::new(PerformanceExtension{
-            show:ui.show_performance,show_ttft:ui.show_ttft,
-            show_waterfall:ui.show_waterfall,
+    let mut extensions = vec![
+        Arc::new(StatusLineExtension {
+            lines: ui.status_lines.clone(),
+        }) as Arc<dyn UiExtension>,
+        Arc::new(PerformanceExtension {
+            show: ui.show_performance,
+            show_ttft: ui.show_ttft,
+            show_waterfall: ui.show_waterfall,
         }) as Arc<dyn UiExtension>,
     ];
     if ui.show_event_notices {
@@ -275,7 +288,9 @@ fn registry(ui: &UiConfig) -> Registry {
 /// Explicitly opt-in v2 event subscriber of the original, existing UI
 /// registry. The host never installs it for the default configuration.
 #[cfg(any(feature = "workspace", test))]
-pub fn event_registry(ui:&UiConfig)->Registry { registry(ui) }
+pub fn event_registry(ui: &UiConfig) -> Registry {
+    registry(ui)
+}
 
 fn status_spans(items: &[StatusItem], context: &Context) -> Vec<Span> {
     let mut spans = Vec::new();
@@ -294,7 +309,11 @@ fn status_spans(items: &[StatusItem], context: &Context) -> Vec<Span> {
     spans
 }
 
-fn status_tui_spans(items: &[StatusItem], context: &Context, palette: Palette) -> Vec<TuiSpan<'static>> {
+fn status_tui_spans(
+    items: &[StatusItem],
+    context: &Context,
+    palette: Palette,
+) -> Vec<TuiSpan<'static>> {
     status_spans(items, context)
         .into_iter()
         .map(|span| to_tui_span(span, palette))
@@ -309,9 +328,10 @@ fn status_span(item: StatusItem, context: &Context) -> Option<Span> {
         StatusItem::Profile if !context.profile.is_empty() => {
             Some(Span::text(context.profile.clone(), Tone::Profile))
         }
-        StatusItem::Provider if !context.provider.is_empty() => {
-            Some(Span::text(format!("[{}]", context.provider), Tone::Provider))
-        }
+        StatusItem::Provider if !context.provider.is_empty() => Some(Span::text(
+            format!("[{}]", context.provider),
+            Tone::Provider,
+        )),
         StatusItem::Effort if !context.effort.is_empty() => {
             Some(Span::text(context.effort.clone(), Tone::Effort))
         }
@@ -322,10 +342,9 @@ fn status_span(item: StatusItem, context: &Context) -> Option<Span> {
             compact_path(&context.directory),
             Tone::Directory,
         )),
-        StatusItem::Agent if !context.agent.is_empty() => Some(Span::text(
-            format!("agent {}", context.agent),
-            Tone::Agent,
-        )),
+        StatusItem::Agent if !context.agent.is_empty() => {
+            Some(Span::text(format!("agent {}", context.agent), Tone::Agent))
+        }
         StatusItem::Branch if !context.branch.is_empty() => {
             Some(Span::text(context.branch.clone(), Tone::Branch))
         }
@@ -379,7 +398,11 @@ fn waterfall(stats: &Performance, width: usize) -> Option<String> {
     }
     let ratio = (first / stats.elapsed_secs).clamp(0.0, 1.0);
     let wait = (ratio * width as f64).round() as usize;
-    Some(format!("{}{}", "·".repeat(wait), "━".repeat(width.saturating_sub(wait))))
+    Some(format!(
+        "{}{}",
+        "·".repeat(wait),
+        "━".repeat(width.saturating_sub(wait))
+    ))
 }
 
 fn to_tui_span(span: Span, palette: Palette) -> TuiSpan<'static> {
@@ -393,13 +416,17 @@ fn to_tui_span(span: Span, palette: Palette) -> TuiSpan<'static> {
     // Status metadata may contain user-selected Session titles or paths.
     // They are never terminal control sequences, multiline redraw commands,
     // or bidi control even if a third-party extension passed them as data.
-    let safe=aw::presentation::safe_text(&span.text)
-        .replace(['\n', '\t'], " ");
+    let safe = aw::presentation::safe_text(&span.text).replace(['\n', '\t'], " ");
     TuiSpan::styled(safe.chars().take(512).collect::<String>(), style)
 }
 
 fn to_tui_line(line: ExtensionLine, palette: Palette) -> Line<'static> {
-    Line::from(line.spans.into_iter().map(|span| to_tui_span(span, palette)).collect::<Vec<_>>())
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| to_tui_span(span, palette))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Extension status roles use the same semantic colors as the native
@@ -407,18 +434,24 @@ fn to_tui_line(line: ExtensionLine, palette: Palette) -> Line<'static> {
 fn tone_style(tone: Tone, palette: Palette) -> Style {
     let foreground = match tone {
         Tone::Normal | Tone::State => palette.foreground,
-        Tone::Muted | Tone::Profile | Tone::Provider | Tone::Tools | Tone::Performance =>
-            palette.muted,
-        Tone::Accent | Tone::Model | Tone::Effort | Tone::Agent | Tone::Branch
-        | Tone::Session => palette.accent,
+        Tone::Muted | Tone::Profile | Tone::Provider | Tone::Tools | Tone::Performance => {
+            palette.muted
+        }
+        Tone::Accent | Tone::Model | Tone::Effort | Tone::Agent | Tone::Branch | Tone::Session => {
+            palette.accent
+        }
         Tone::Directory => palette.foreground,
         Tone::Good => palette.tool_foreground,
         Tone::Error => palette.tool_error_foreground,
         Tone::Warning => {
             #[cfg(feature = "workspace")]
-            { palette.warning }
+            {
+                palette.warning
+            }
             #[cfg(not(feature = "workspace"))]
-            { palette.accent }
+            {
+                palette.accent
+            }
         }
     };
     Style::default().fg(foreground)
@@ -439,16 +472,27 @@ mod tests {
                 theme: mode,
                 ..UiConfig::default()
             });
-            assert_eq!(tone_style(Tone::Normal, palette).fg, Some(palette.foreground));
+            assert_eq!(
+                tone_style(Tone::Normal, palette).fg,
+                Some(palette.foreground)
+            );
             assert_eq!(tone_style(Tone::Muted, palette).fg, Some(palette.muted));
             assert_eq!(tone_style(Tone::Model, palette).fg, Some(palette.accent));
-            assert_eq!(tone_style(Tone::Good, palette).fg, Some(palette.tool_foreground));
-            assert_eq!(tone_style(Tone::Error, palette).fg, Some(palette.tool_error_foreground));
+            assert_eq!(
+                tone_style(Tone::Good, palette).fg,
+                Some(palette.tool_foreground)
+            );
+            assert_eq!(
+                tone_style(Tone::Error, palette).fg,
+                Some(palette.tool_error_foreground)
+            );
             #[cfg(feature = "workspace")]
             assert_eq!(tone_style(Tone::Warning, palette).fg, Some(palette.warning));
             if mode == aw::config::ThemeMode::System {
-                assert_eq!(tone_style(Tone::Normal, palette).fg,
-                    Some(ratatui::style::Color::Reset));
+                assert_eq!(
+                    tone_style(Tone::Normal, palette).fg,
+                    Some(ratatui::style::Color::Reset)
+                );
             }
         }
     }
@@ -529,11 +573,7 @@ mod tests {
             status_lines: vec![StatusLineConfig {
                 region: StatusRegion::BelowComposer,
                 items: vec![StatusItem::Branch, StatusItem::SessionTps],
-                right_items: vec![
-                    StatusItem::Model,
-                    StatusItem::Provider,
-                    StatusItem::Effort,
-                ],
+                right_items: vec![StatusItem::Model, StatusItem::Provider, StatusItem::Effort],
             }],
             ..UiConfig::default()
         };
@@ -582,28 +622,43 @@ mod tests {
 #[cfg(test)]
 mod aw_p6_8c_opt_in_factual_notice_tests {
     use super::*;
-    use aw_ui_extension::status_events::{EventContext,EventKind,EventRail,STATUS_PROTOCOL};
+    use aw_ui_extension::status_events::{EventContext, EventKind, EventRail, STATUS_PROTOCOL};
     #[test]
     fn aw_p6_8c_no_automatic_events_unless_explicitly_enabled_in_current_ui_config() {
-        let status=StatusContext{session:"s_approved".into(),state:"ready".into(),..StatusContext::default()};
-        let event=EventContext {protocol_version:STATUS_PROTOCOL,kind:EventKind::TurnEnd,
-            session:status.session.clone(),turn_id:2,sequence:1,
-            context:context(&status,None)};
-        let default=UiConfig::default();
+        let status = StatusContext {
+            session: "s_approved".into(),
+            state: "ready".into(),
+            ..StatusContext::default()
+        };
+        let event = EventContext {
+            protocol_version: STATUS_PROTOCOL,
+            kind: EventKind::TurnEnd,
+            session: status.session.clone(),
+            turn_id: 2,
+            sequence: 1,
+            context: context(&status, None),
+        };
+        let default = UiConfig::default();
         assert!(!default.show_event_notices);
-        assert!(event_registry(&default).event_lines(&event).unwrap().is_empty());
-        let mut enabled=default.clone();
-        enabled.show_event_notices=true;
-        let reg=event_registry(&enabled);
-        let mut rail=EventRail::new("s_approved").unwrap();
-        let notice=rail.publish(&reg,&event).unwrap().unwrap();
-        assert_eq!(notice.kind,EventKind::TurnEnd);
-        assert_eq!(notice.lines[0].spans[0].text,"Turn settled · turn 2");
-        assert!(rail.publish(&reg,&event).is_err(),"duplicate UI event sequence is never accepted");
-        assert_eq!(rail.notices().len(),1);
+        assert!(event_registry(&default)
+            .event_lines(&event)
+            .unwrap()
+            .is_empty());
+        let mut enabled = default.clone();
+        enabled.show_event_notices = true;
+        let reg = event_registry(&enabled);
+        let mut rail = EventRail::new("s_approved").unwrap();
+        let notice = rail.publish(&reg, &event).unwrap().unwrap();
+        assert_eq!(notice.kind, EventKind::TurnEnd);
+        assert_eq!(notice.lines[0].spans[0].text, "Turn settled · turn 2");
+        assert!(
+            rail.publish(&reg, &event).is_err(),
+            "duplicate UI event sequence is never accepted"
+        );
+        assert_eq!(rail.notices().len(), 1);
         // This never activates a Tool/agent; StatusLineExtension remains
         // presentation-only and the old AfterTurn performance slot remains.
-        assert_eq!(enabled.status_lines,default.status_lines);
+        assert_eq!(enabled.status_lines, default.status_lines);
     }
 }
 
@@ -614,21 +669,21 @@ mod aw_p6_8b_status_region_tests {
     fn aw_p6_8b_native_regions_use_same_bounded_semantic_status_rows_without_new_defaults() {
         let ui = UiConfig {
             status_lines: vec![
-            StatusLineConfig {
-                region: StatusRegion::LeftStatus,
-                items: vec![StatusItem::Agent],
-                right_items: vec![],
-            },
-            StatusLineConfig {
-                region: StatusRegion::RightStatus,
-                items: vec![StatusItem::Branch],
-                right_items: vec![],
-            },
-            StatusLineConfig {
-                region: StatusRegion::BelowStatus,
-                items: vec![StatusItem::State],
-                right_items: vec![],
-            },
+                StatusLineConfig {
+                    region: StatusRegion::LeftStatus,
+                    items: vec![StatusItem::Agent],
+                    right_items: vec![],
+                },
+                StatusLineConfig {
+                    region: StatusRegion::RightStatus,
+                    items: vec![StatusItem::Branch],
+                    right_items: vec![],
+                },
+                StatusLineConfig {
+                    region: StatusRegion::BelowStatus,
+                    items: vec![StatusItem::State],
+                    right_items: vec![],
+                },
             ],
             ..UiConfig::default()
         };
@@ -667,14 +722,28 @@ mod aw_p6_8b_status_region_tests {
     }
     #[test]
     fn aw_p6_8b_status_sanitizes_terminal_controls_and_multiline_user_titles() {
-        let ui=UiConfig{status_lines:vec![StatusLineConfig{
-            region:StatusRegion::LeftStatus,items:vec![StatusItem::Agent],right_items:vec![],
-        }],..UiConfig::default()};
-        let ctx=StatusContext{agent:"\x1b[31mOwner\nnext\u{202e}".into(),..StatusContext::default()};
-        let projected=project_status(Slot::LeftStatus,&ui,&ctx,None,32);
-        let text=projected[0].spans.iter().map(|s|s.content.as_ref()).collect::<String>();
+        let ui = UiConfig {
+            status_lines: vec![StatusLineConfig {
+                region: StatusRegion::LeftStatus,
+                items: vec![StatusItem::Agent],
+                right_items: vec![],
+            }],
+            ..UiConfig::default()
+        };
+        let ctx = StatusContext {
+            agent: "\x1b[31mOwner\nnext\u{202e}".into(),
+            ..StatusContext::default()
+        };
+        let projected = project_status(Slot::LeftStatus, &ui, &ctx, None, 32);
+        let text = projected[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
         assert!(!text.contains('\x1b') && !text.contains('\n') && !text.contains('\u{202e}'));
-        assert!(text.contains("\\u{1b}"),"terminal control must be rendered as literal text");
+        assert!(
+            text.contains("\\u{1b}"),
+            "terminal control must be rendered as literal text"
+        );
     }
-
 }

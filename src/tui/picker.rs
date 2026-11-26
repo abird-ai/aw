@@ -28,7 +28,11 @@ pub struct Choice {
     pub detail: String,
 }
 
-pub fn choose(title: &str, choices: &[Choice], theme: aw::config::ThemeMode) -> Result<Option<String>> {
+pub fn choose(
+    title: &str,
+    choices: &[Choice],
+    theme: aw::config::ThemeMode,
+) -> Result<Option<String>> {
     if choices.is_empty() {
         return Ok(None);
     }
@@ -77,14 +81,10 @@ pub fn choose(title: &str, choices: &[Choice], theme: aw::config::ThemeMode) -> 
                         KeyCode::Down => {
                             selected = cycle_selection(selected, filtered.len(), true);
                         }
-                        KeyCode::Char('k')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             selected = cycle_selection(selected, filtered.len(), false);
                         }
-                        KeyCode::Char('j')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             selected = cycle_selection(selected, filtered.len(), true);
                         }
                         _ => {

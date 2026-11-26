@@ -36,7 +36,6 @@ fn store_and_actor(opts: &StoreArgs) -> Result<(SessionStore, aw::PrincipalId)> 
     Ok((SessionStore::open(&dir)?, sessions::actor(&ctx, false)?))
 }
 
-
 #[derive(Clone, Debug, ClapArgs)]
 pub(crate) struct ConfigArgs {
     /// Explicit aw configuration file; defaults to the normal user config.
@@ -130,12 +129,19 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
                 .ok_or_else(|| Error::Config(format!("unknown registered skill {name}")))?;
             print(skill, opts.json)?;
         }
-        SkillCommand::Add { name, path, description, replace, opts } => {
+        SkillCommand::Add {
+            name,
+            path,
+            description,
+            replace,
+            opts,
+        } => {
             config::validate_skill_name(&name)?;
             if let Some(description) = &description {
                 if description.len() > 512 || description.chars().any(char::is_control) {
                     return Err(Error::Config(
-                        "skill description must be at most 512 bytes without control characters".into(),
+                        "skill description must be at most 512 bytes without control characters"
+                            .into(),
                     ));
                 }
             }
@@ -143,7 +149,10 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
             let spec: crate::skills::SkillSpec = format!("{name}={}", path.display())
                 .parse()
                 .map_err(Error::Config)?;
-            crate::skills::load(std::slice::from_ref(&spec), &std::collections::BTreeMap::new())?;
+            crate::skills::load(
+                std::slice::from_ref(&spec),
+                &std::collections::BTreeMap::new(),
+            )?;
             let (cfg, ()) = config::mutate(opts.config.as_deref(), |cfg| {
                 if cfg.skills.contains_key(&name) && !replace {
                     return Err(Error::Conflict(
@@ -152,7 +161,10 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
                 }
                 cfg.skills.insert(
                     name.clone(),
-                    config::SkillConfig { path: path.clone(), description: description.clone() },
+                    config::SkillConfig {
+                        path: path.clone(),
+                        description: description.clone(),
+                    },
                 );
                 Ok(())
             })?;
@@ -167,7 +179,12 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
             })?;
             print(&removed, opts.json)?;
         }
-        SkillCommand::Export { name, output, replace, opts } => {
+        SkillCommand::Export {
+            name,
+            output,
+            replace,
+            opts,
+        } => {
             config::validate_skill_name(&name)?;
             let cfg = load_config(&opts)?;
             let registered = cfg
@@ -192,7 +209,11 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
             let bundle = crate::skill_package::SkillBundle::read(&bundle)?;
             print(&bundle, true)?;
         }
-        SkillCommand::Install { bundle, replace, opts } => {
+        SkillCommand::Install {
+            bundle,
+            replace,
+            opts,
+        } => {
             let bundle = crate::skill_package::SkillBundle::read(&bundle)?;
             let config_path = mutation_config_path(&opts)?;
             let (cfg, ()) = config::mutate(Some(&config_path), |cfg| {
@@ -204,7 +225,10 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
                 let managed = crate::skill_package::publish_managed_content(&bundle, &config_path)?;
                 cfg.skills.insert(
                     bundle.name.clone(),
-                    config::SkillConfig { path: managed, description: bundle.description.clone() },
+                    config::SkillConfig {
+                        path: managed,
+                        description: bundle.description.clone(),
+                    },
                 );
                 Ok(())
             })?;
@@ -215,12 +239,18 @@ pub(crate) fn skill(command: SkillCommand) -> Result<u8> {
             let config_path = mutation_config_path(&opts)?;
             let (cfg, ()) = config::mutate(Some(&config_path), |cfg| {
                 if !cfg.skills.contains_key(&bundle.name) {
-                    return Err(Error::Config(format!("unknown registered skill {}", bundle.name)));
+                    return Err(Error::Config(format!(
+                        "unknown registered skill {}",
+                        bundle.name
+                    )));
                 }
                 let managed = crate::skill_package::publish_managed_content(&bundle, &config_path)?;
                 cfg.skills.insert(
                     bundle.name.clone(),
-                    config::SkillConfig { path: managed, description: bundle.description.clone() },
+                    config::SkillConfig {
+                        path: managed,
+                        description: bundle.description.clone(),
+                    },
                 );
                 Ok(())
             })?;
@@ -340,9 +370,7 @@ fn print<T: serde::Serialize>(value: &T, _json: bool) -> Result<()> {
 
 fn read_private_bytes(path: &std::path::Path, max: usize, what: &'static str) -> Result<Vec<u8>> {
     let mut file = aw_platform::open_private_existing(path, false).map_err(|_| {
-        Error::Denied(
-            "private credential/token files require platform-verified owner-only custody",
-        )
+        Error::Denied("private credential/token files require platform-verified owner-only custody")
     })?;
     let mut bytes = Vec::new();
     std::io::Read::by_ref(&mut file)
@@ -412,11 +440,17 @@ impl From<PipelineModeArg> for aw_store::PipelineBindingMode {
 
 #[cfg(feature = "pipelines")]
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum ScheduleOverlapArg { Skip, Serial }
+pub(crate) enum ScheduleOverlapArg {
+    Skip,
+    Serial,
+}
 #[cfg(feature = "pipelines")]
 impl From<ScheduleOverlapArg> for aw_store::ScheduleOverlapPolicy {
     fn from(value: ScheduleOverlapArg) -> Self {
-        match value { ScheduleOverlapArg::Skip => Self::Skip, ScheduleOverlapArg::Serial => Self::Serial }
+        match value {
+            ScheduleOverlapArg::Skip => Self::Skip,
+            ScheduleOverlapArg::Serial => Self::Serial,
+        }
     }
 }
 
@@ -425,37 +459,122 @@ impl From<ScheduleOverlapArg> for aw_store::ScheduleOverlapPolicy {
 pub(crate) enum ScheduleCommand {
     Define {
         name: String,
-        #[arg(long)] binding: String,
+        #[arg(long)]
+        binding: String,
         #[arg(long = "every-seconds", value_parser=clap::value_parser!(u64).range(60..=2592000))]
         every_seconds: u64,
         #[arg(long = "delay-seconds", default_value_t = 0, value_parser=clap::value_parser!(u64).range(0..=2592000))]
         delay_seconds: u64,
-        #[arg(long, value_enum, default_value = "serial")] overlap: ScheduleOverlapArg,
-        #[arg(value_name="INPUT",num_args=0..)] input: Vec<String>,
-        #[command(flatten)] store: StoreArgs,
+        #[arg(long, value_enum, default_value = "serial")]
+        overlap: ScheduleOverlapArg,
+        #[arg(value_name="INPUT",num_args=0..)]
+        input: Vec<String>,
+        #[command(flatten)]
+        store: StoreArgs,
     },
-    List { #[command(flatten)] store: StoreArgs },
-    Show { schedule: String, #[command(flatten)] store: StoreArgs },
-    Pause { schedule: String, #[arg(long)] expected_generation: u64, #[command(flatten)] store: StoreArgs },
-    Resume { schedule: String, #[arg(long)] expected_generation: u64, #[command(flatten)] store: StoreArgs },
-    Occurrences { schedule: String, #[command(flatten)] store: StoreArgs },
-    RunDue { #[command(flatten)] args: Box<crate::ScheduleRunDueCliArgs> },
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    Show {
+        schedule: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    Pause {
+        schedule: String,
+        #[arg(long)]
+        expected_generation: u64,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    Resume {
+        schedule: String,
+        #[arg(long)]
+        expected_generation: u64,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    Occurrences {
+        schedule: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    RunDue {
+        #[command(flatten)]
+        args: Box<crate::ScheduleRunDueCliArgs>,
+    },
 }
 
 #[cfg(feature = "pipelines")]
 pub(crate) fn schedule(command: ScheduleCommand) -> Result<u8> {
     match command {
-        ScheduleCommand::RunDue { .. } => Err(Error::Config("schedule run-due must be dispatched by the root CLI".into())),
-        ScheduleCommand::Define { name, binding, every_seconds, delay_seconds, overlap, input, store: o } => {
+        ScheduleCommand::RunDue { .. } => Err(Error::Config(
+            "schedule run-due must be dispatched by the root CLI".into(),
+        )),
+        ScheduleCommand::Define {
+            name,
+            binding,
+            every_seconds,
+            delay_seconds,
+            overlap,
+            input,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
-            print(&store.schedule_define(&actor, &name, &binding, &input.join(" "), every_seconds, overlap.into(), delay_seconds)?, o.json)?;
+            print(
+                &store.schedule_define(
+                    &actor,
+                    &name,
+                    &binding,
+                    &input.join(" "),
+                    every_seconds,
+                    overlap.into(),
+                    delay_seconds,
+                )?,
+                o.json,
+            )?;
             Ok(0)
         }
-        ScheduleCommand::List { store: o } => { let (store, actor)=store_and_actor(&o)?; print(&store.schedules(&actor)?,o.json)?; Ok(0) }
-        ScheduleCommand::Show { schedule, store: o } => { let (store, actor)=store_and_actor(&o)?; print(&store.schedule(&actor,&schedule)?,o.json)?; Ok(0) }
-        ScheduleCommand::Pause { schedule, expected_generation, store: o } => { let (store, actor)=store_and_actor(&o)?; print(&store.schedule_set_paused(&actor,&schedule,expected_generation,true)?,o.json)?; Ok(0) }
-        ScheduleCommand::Resume { schedule, expected_generation, store: o } => { let (store, actor)=store_and_actor(&o)?; print(&store.schedule_set_paused(&actor,&schedule,expected_generation,false)?,o.json)?; Ok(0) }
-        ScheduleCommand::Occurrences { schedule, store: o } => { let (store, actor)=store_and_actor(&o)?; print(&store.schedule_occurrences(&actor,&schedule)?,o.json)?; Ok(0) }
+        ScheduleCommand::List { store: o } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(&store.schedules(&actor)?, o.json)?;
+            Ok(0)
+        }
+        ScheduleCommand::Show { schedule, store: o } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(&store.schedule(&actor, &schedule)?, o.json)?;
+            Ok(0)
+        }
+        ScheduleCommand::Pause {
+            schedule,
+            expected_generation,
+            store: o,
+        } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(
+                &store.schedule_set_paused(&actor, &schedule, expected_generation, true)?,
+                o.json,
+            )?;
+            Ok(0)
+        }
+        ScheduleCommand::Resume {
+            schedule,
+            expected_generation,
+            store: o,
+        } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(
+                &store.schedule_set_paused(&actor, &schedule, expected_generation, false)?,
+                o.json,
+            )?;
+            Ok(0)
+        }
+        ScheduleCommand::Occurrences { schedule, store: o } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(&store.schedule_occurrences(&actor, &schedule)?, o.json)?;
+            Ok(0)
+        }
     }
 }
 
@@ -561,14 +680,25 @@ pub(crate) fn pipeline(command: PipelineCommand) -> Result<u8> {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.pipelines(&actor)?, o.json)?;
         }
-        PipelineCommand::Show { pipeline, revision, store: o } => {
+        PipelineCommand::Show {
+            pipeline,
+            revision,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &store.pipeline_revision(&actor, &pipeline, revision.as_deref())?,
                 o.json,
             )?;
         }
-        PipelineCommand::Bind { pipeline, revision, scope, scope_id, mode, store: o } => {
+        PipelineCommand::Bind {
+            pipeline,
+            revision,
+            scope,
+            scope_id,
+            mode,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &store.pipeline_bind(
@@ -586,9 +716,18 @@ pub(crate) fn pipeline(command: PipelineCommand) -> Result<u8> {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.pipeline_bindings(&actor)?, o.json)?;
         }
-        PipelineCommand::BindingSet { binding, expected_revision, enable, disable, revision, store: o } => {
+        PipelineCommand::BindingSet {
+            binding,
+            expected_revision,
+            enable,
+            disable,
+            revision,
+            store: o,
+        } => {
             if !enable && !disable {
-                return Err(Error::Config("binding-set requires --enable or --disable".into()));
+                return Err(Error::Config(
+                    "binding-set requires --enable or --disable".into(),
+                ));
             }
             let (store, actor) = store_and_actor(&o)?;
             print(
@@ -612,12 +751,18 @@ pub(crate) fn pipeline(command: PipelineCommand) -> Result<u8> {
                 o.json,
             )?;
         }
-        PipelineCommand::Approve { approval, deny, store: o } => {
+        PipelineCommand::Approve {
+            approval,
+            deny,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.pipeline_approve(&actor, &approval, !deny)?, o.json)?;
         }
         PipelineCommand::Run { .. } | PipelineCommand::Resume { .. } => {
-            return Err(Error::Config("pipeline execution must be dispatched by the root CLI".into()))
+            return Err(Error::Config(
+                "pipeline execution must be dispatched by the root CLI".into(),
+            ))
         }
     }
     Ok(0)
@@ -695,10 +840,10 @@ pub(crate) enum ReviewCommand {
     /// Redacted pending human approvals for one exact owned Session/branch;
     /// decision still uses the original explicit `aw review approve/deny`.
     Pending {
-        session_id:String,
-        branch_id:String,
+        session_id: String,
+        branch_id: String,
         #[command(flatten)]
-        store:StoreArgs,
+        store: StoreArgs,
     },
     /// Show one durable guardian review operation.
     Show {
@@ -727,9 +872,16 @@ pub(crate) fn review(command: ReviewCommand) -> Result<u8> {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.reviews(&actor)?, o.json)?;
         }
-        ReviewCommand::Pending{session_id,branch_id,store:o}=>{
-            let (store,actor)=store_and_actor(&o)?;
-            print(&aw::approval_ui::pending_for_user(&store,&actor,&session_id,&branch_id)?,o.json)?;
+        ReviewCommand::Pending {
+            session_id,
+            branch_id,
+            store: o,
+        } => {
+            let (store, actor) = store_and_actor(&o)?;
+            print(
+                &aw::approval_ui::pending_for_user(&store, &actor, &session_id, &branch_id)?,
+                o.json,
+            )?;
         }
         ReviewCommand::Show { review, store: o } => {
             let (store, actor) = store_and_actor(&o)?;
@@ -862,7 +1014,11 @@ pub(crate) enum RouteCommand {
 #[cfg(feature = "routing")]
 pub(crate) fn route(command: RouteCommand) -> Result<u8> {
     match command {
-        RouteCommand::Define { file, config, store: o } => {
+        RouteCommand::Define {
+            file,
+            config,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             let mut bytes = Vec::new();
             std::fs::File::open(file)?
@@ -871,8 +1027,9 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
             if bytes.len() > 256 * 1024 {
                 return Err(Error::Limit("routing strategy definition exceeds 256 KiB"));
             }
-            let mut definition: aw_routing::RoutingStrategyDefinition = serde_json::from_slice(&bytes)
-                .map_err(|_| Error::Config("invalid typed routing strategy JSON".into()))?;
+            let mut definition: aw_routing::RoutingStrategyDefinition =
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::Config("invalid typed routing strategy JSON".into()))?;
             let cfg = aw::config::load(config.as_deref())?;
             let mut profiles = aw::config::builtins();
             profiles.extend(cfg.profiles);
@@ -887,7 +1044,11 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
                         target.id, target.account_id
                     ))
                 })?;
-                if !profile.effective_models().iter().any(|model| model == &target.model) {
+                if !profile
+                    .effective_models()
+                    .iter()
+                    .any(|model| model == &target.model)
+                {
                     return Err(Error::Denied(
                         "routing target model is not explicitly allowed by its configured profile",
                     ));
@@ -900,14 +1061,25 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.routing_strategies(&actor)?, o.json)?;
         }
-        RouteCommand::Show { route, revision, store: o } => {
+        RouteCommand::Show {
+            route,
+            revision,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &store.routing_strategy(&actor, &route, revision.as_deref())?,
                 o.json,
             )?;
         }
-        RouteCommand::Bind { route, revision, scope, scope_id, role, store: o } => {
+        RouteCommand::Bind {
+            route,
+            revision,
+            scope,
+            scope_id,
+            role,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &store.routing_bind(
@@ -925,9 +1097,18 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
             let (store, actor) = store_and_actor(&o)?;
             print(&store.routing_bindings(&actor)?, o.json)?;
         }
-        RouteCommand::BindingSet { binding, expected_revision, enable, disable, revision, store: o } => {
+        RouteCommand::BindingSet {
+            binding,
+            expected_revision,
+            enable,
+            disable,
+            revision,
+            store: o,
+        } => {
             if !enable && !disable {
-                return Err(Error::Config("binding-set requires --enable or --disable".into()));
+                return Err(Error::Config(
+                    "binding-set requires --enable or --disable".into(),
+                ));
             }
             let (store, actor) = store_and_actor(&o)?;
             print(
@@ -941,14 +1122,27 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
                 o.json,
             )?;
         }
-        RouteCommand::Affinity { session, branch, role, lineage, store: o } => {
+        RouteCommand::Affinity {
+            session,
+            branch,
+            role,
+            lineage,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &store.routing_affinity(&actor, &session, &branch, &role, &lineage)?,
                 o.json,
             )?;
         }
-        RouteCommand::AffinityClear { session, branch, role, lineage, expected_revision, store: o } => {
+        RouteCommand::AffinityClear {
+            session,
+            branch,
+            role,
+            lineage,
+            expected_revision,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             store.routing_affinity_clear(
                 &actor,
@@ -960,7 +1154,10 @@ pub(crate) fn route(command: RouteCommand) -> Result<u8> {
             )?;
             print(&serde_json::json!({"cleared":true}), o.json)?;
         }
-        RouteCommand::Status { operation, store: o } => {
+        RouteCommand::Status {
+            operation,
+            store: o,
+        } => {
             let (store, actor) = store_and_actor(&o)?;
             print(
                 &serde_json::json!({
@@ -1046,10 +1243,7 @@ pub(crate) enum WorkspaceCommand {
 #[derive(Subcommand, Debug)]
 pub(crate) enum PersistentTerminalCommand {
     /// Spawn one unsandboxed Bash in its own local PTY broker (24h idle limit).
-    Start {
-        root: PathBuf,
-        shell: PathBuf,
-    },
+    Start { root: PathBuf, shell: PathBuf },
     /// Terminate the explicitly owned persistent PTY, after admission.
     Stop { invite: PathBuf },
     /// Inspect an original-PTY migration without changing custody.
@@ -1071,9 +1265,17 @@ pub(crate) enum PersistentTerminalCommand {
 pub(crate) fn workspace(command: WorkspaceCommand) -> Result<u8> {
     match command {
         #[cfg(all(feature = "workspace", unix))]
-        WorkspaceCommand::Attach { .. } => return Err(Error::Denied("native PTY attach must be dispatched by root CLI")),
+        WorkspaceCommand::Attach { .. } => {
+            return Err(Error::Denied(
+                "native PTY attach must be dispatched by root CLI",
+            ))
+        }
         #[cfg(all(feature = "workspace", unix))]
-        WorkspaceCommand::Persistent { .. } => return Err(Error::Denied("persistent PTY requires direct native CLI dispatch")),
+        WorkspaceCommand::Persistent { .. } => {
+            return Err(Error::Denied(
+                "persistent PTY requires direct native CLI dispatch",
+            ))
+        }
         WorkspaceCommand::Open { .. } => {
             return Err(Error::Config(
                 "workspace open must be dispatched by the root CLI".into(),
@@ -2000,7 +2202,10 @@ pub(crate) enum SubagentCommand {
 
 pub(crate) fn subagent(command: SubagentCommand) -> Result<u8> {
     match command {
-        SubagentCommand::List { store: opts, parent } => {
+        SubagentCommand::List {
+            store: opts,
+            parent,
+        } => {
             let (store, actor) = store_and_actor(&opts)?;
             let relations = if let Some(parent) = parent {
                 store.subagents_for_parent(&actor, &parent)?
@@ -2009,8 +2214,8 @@ pub(crate) fn subagent(command: SubagentCommand) -> Result<u8> {
             };
             let mut children = Vec::with_capacity(relations.len());
             for relation in relations {
-                let execution = store
-                    .subagent_execution_binding_for_subagent(&actor, &relation.id)?;
+                let execution =
+                    store.subagent_execution_binding_for_subagent(&actor, &relation.id)?;
                 let allocation = relation
                     .delegation_allocation_id
                     .as_deref()
@@ -2057,7 +2262,10 @@ pub(crate) fn subagent(command: SubagentCommand) -> Result<u8> {
                 opts.json,
             )?;
         }
-        SubagentCommand::Budget { session, store: opts } => {
+        SubagentCommand::Budget {
+            session,
+            store: opts,
+        } => {
             let (store, actor) = store_and_actor(&opts)?;
             let budget = store
                 .delegation_root_for_session(&actor, &session)?
@@ -2396,7 +2604,9 @@ pub(crate) fn session(command: SessionCommand) -> Result<u8> {
                 .capabilities
                 .require(StoreCapability::ArchiveImport)?;
             let (session, branch, cursor) =
-                store.backend().import_document(&actor, decoded.document, binding)?;
+                store
+                    .backend()
+                    .import_document(&actor, decoded.document, binding)?;
             print(
                 &serde_json::json!({
                     "session": session,
@@ -2500,11 +2710,13 @@ fn context_apply_mode(
             aw_store::ApplyMode::NextPrompt
         }
         ContextApplyModeArg::Fork => aw_store::ApplyMode::Fork {
-            name: name.ok_or_else(|| Error::Config("--ui-mode fork requires --context-name".into()))?,
+            name: name
+                .ok_or_else(|| Error::Config("--ui-mode fork requires --context-name".into()))?,
         },
         ContextApplyModeArg::NewSession => aw_store::ApplyMode::NewSession {
-            title: name
-                .ok_or_else(|| Error::Config("--ui-mode new-session requires --context-name".into()))?,
+            title: name.ok_or_else(|| {
+                Error::Config("--ui-mode new-session requires --context-name".into())
+            })?,
         },
     })
 }
@@ -3930,7 +4142,11 @@ pub(crate) enum NetCommand {
         #[arg(long, requires = "remote_view_grant")]
         remote_view_max_ttl: Option<u64>,
         /// Exact read surfaces this identity-auth server may grant. Repeatable.
-        #[arg(long = "remote-view-grant", value_enum, requires = "remote_view_max_ttl")]
+        #[arg(
+            long = "remote-view-grant",
+            value_enum,
+            requires = "remote_view_max_ttl"
+        )]
         remote_view_grant: Vec<RemoteViewGrantArg>,
         #[arg(long, default_value = "0.0.0.0:0")]
         listen: SocketAddr,
@@ -4252,36 +4468,56 @@ pub(crate) enum NetCommand {
     },
     /// Explicit owner grants one signed AwNet peer access to the current Actor.
     ActorPeerGrant {
-        session_id: String, branch_id: String, peer: String,
-        #[arg(long,default_value="local")] site: String,
-        #[arg(long="permission", required=true)] permission: Vec<String>,
-        #[arg(long,default_value_t=60)] ttl: u64,
-        #[command(flatten)] store: StoreArgs,
+        session_id: String,
+        branch_id: String,
+        peer: String,
+        #[arg(long, default_value = "local")]
+        site: String,
+        #[arg(long = "permission", required = true)]
+        permission: Vec<String>,
+        #[arg(long, default_value_t = 60)]
+        ttl: u64,
+        #[command(flatten)]
+        store: StoreArgs,
     },
     /// Revoke a current peer Actor grant; prior signed MachineLink is insufficient.
     ActorPeerRevoke {
-        session_id: String, grant_id: String,
-        #[command(flatten)] store: StoreArgs,
+        session_id: String,
+        grant_id: String,
+        #[command(flatten)]
+        store: StoreArgs,
     },
     /// Enumerate bounded grants under the owning Session.
     ActorPeerList {
         session_id: String,
-        #[command(flatten)] store: StoreArgs,
+        #[command(flatten)]
+        store: StoreArgs,
     },
     /// Request one signed, capability-fenced Actor operation from a paired node.
     ActorRequest {
-        peer: String, session_id: String, branch_id: String,
-        #[arg(long)] room: String,
-        #[arg(long)] rendezvous: SocketAddr,
-        #[arg(long="request-file")] request_file: PathBuf,
+        peer: String,
+        session_id: String,
+        branch_id: String,
+        #[arg(long)]
+        room: String,
+        #[arg(long)]
+        rendezvous: SocketAddr,
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
         /// Optional concurrent exact active-Turn Control spec during Step.
         /// Explicit JSON {"delay_ms":100,"control":{"op":"control",...}}.
-        #[arg(long="control-file")] control_file: Option<PathBuf>,
-        #[command(flatten)] store: StoreArgs,
-        #[arg(long,default_value_t=60)] lease: u64,
-        #[arg(long,default_value="0.0.0.0:0")] listen: SocketAddr,
-        #[arg(long="stun")] stun: Vec<SocketAddr>,
-        #[arg(long,default_value_t=30)] timeout: u64,
+        #[arg(long = "control-file")]
+        control_file: Option<PathBuf>,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[arg(long, default_value_t = 60)]
+        lease: u64,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        listen: SocketAddr,
+        #[arg(long = "stun")]
+        stun: Vec<SocketAddr>,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
     /// Submit one exact prompt to a delegated remote Session. Reuse --execution-id only for lookup/recovery.
     RemoteSessionExecute {
@@ -5782,10 +6018,18 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
             #[cfg(not(feature = "net"))]
             {
                 let _ = (
-                    peer, room, rendezvous, o, grant, root,
+                    peer,
+                    room,
+                    rendezvous,
+                    o,
+                    grant,
+                    root,
                     #[cfg(feature = "surfaces")]
                     remote_view_workspace,
-                    lease, listen, stun, timeout,
+                    lease,
+                    listen,
+                    stun,
+                    timeout,
                 );
                 return Err(Error::Config(
                     "this build disabled the AwNet QUIC feature".into(),
@@ -5801,25 +6045,26 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                 let (s, actor) = store_and_actor(&o)?;
                 let git = trusted_git_path()?;
                 #[cfg(feature = "surfaces")]
-                let (remote_view_workspace_id, remote_workspace) =
-                    if let Some(selector) = remote_view_workspace {
-                        if !allowed.contains(&crate::awnet::MachineCapability::IdentityAuthenticate)
-                            || (!allowed.contains(&crate::awnet::MachineCapability::FileRead)
-                                && !allowed.contains(&crate::awnet::MachineCapability::GitRead))
-                        {
-                            return Err(Error::Config(
+                let (remote_view_workspace_id, remote_workspace) = if let Some(selector) =
+                    remote_view_workspace
+                {
+                    if !allowed.contains(&crate::awnet::MachineCapability::IdentityAuthenticate)
+                        || (!allowed.contains(&crate::awnet::MachineCapability::FileRead)
+                            && !allowed.contains(&crate::awnet::MachineCapability::GitRead))
+                    {
+                        return Err(Error::Config(
                                 "--remote-view-workspace requires --grant identity-authenticate and file-read and/or git-read"
                                     .into(),
                             ));
-                        }
-                        if o.domain.is_some() {
-                            return Err(Error::Config(
+                    }
+                    if o.domain.is_some() {
+                        return Err(Error::Config(
                                 "--remote-view-workspace is an exact Machine-hosted Workspace ID; --domain-id is not accepted in this mode"
                                     .into(),
                             ));
-                        }
-                        let workspace = s.local_hosted_workspace_exact(&selector)?;
-                        let host = std::sync::Arc::new(
+                    }
+                    let workspace = s.local_hosted_workspace_exact(&selector)?;
+                    let host = std::sync::Arc::new(
                             aw_surfaces::SurfaceHost::new(aw_surfaces::Options {
                                 root: root.clone(),
                                 git: git.clone(),
@@ -5835,7 +6080,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                                 )
                             })?,
                         );
-                        let projection: std::sync::Arc<
+                    let projection: std::sync::Arc<
                             dyn crate::awnet::RemoteWorkspaceProjection,
                         > = std::sync::Arc::new(
                             crate::awnet::remote_workspace_surface::SurfaceRemoteWorkspaceProjection::new(
@@ -5843,10 +6088,10 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                                 actor.as_str().to_owned(),
                             ),
                         );
-                        (Some(workspace.id), Some(projection))
-                    } else {
-                        (None, None)
-                    };
+                    (Some(workspace.id), Some(projection))
+                } else {
+                    (None, None)
+                };
                 #[cfg(not(feature = "surfaces"))]
                 let (remote_view_workspace_id, remote_workspace) = (None, None);
                 let service = crate::awnet::MachineServiceServeOptions {
@@ -6587,87 +6832,171 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                 print(&result, o.json)?;
             }
         }
-        NetCommand::ActorPeerGrant {session_id,branch_id,peer,site,permission,ttl,store:o} => {
-            let (s,owner)=store_and_actor(&o)?;
-            let info=s.session(&owner,&session_id)?;
-            let epoch=s.workspace_writer(&owner,None,&info.workspace_id)?.writer_epoch;
-            let grants=permission.iter().map(|label| match label.as_str() {
-                "query"=>Ok(aw_store::ActorPeerPermission::Query),
-                "inspect"=>Ok(aw_store::ActorPeerPermission::Inspect),
-                "enqueue"=>Ok(aw_store::ActorPeerPermission::Enqueue),
-                "step"=>Ok(aw_store::ActorPeerPermission::Step),
-                "control"=>Ok(aw_store::ActorPeerPermission::Control),
-                "notice-read"=>Ok(aw_store::ActorPeerPermission::NoticeRead),
-                _=>Err(Error::Denied("unknown explicit Actor peer permission")),
-            }).collect::<Result<BTreeSet<_>>>()?;
-            print(&s.grant_actor_peer(&owner,&session_id,&branch_id,&site,&peer,epoch,grants,ttl)?,o.json)?;
+        NetCommand::ActorPeerGrant {
+            session_id,
+            branch_id,
+            peer,
+            site,
+            permission,
+            ttl,
+            store: o,
+        } => {
+            let (s, owner) = store_and_actor(&o)?;
+            let info = s.session(&owner, &session_id)?;
+            let epoch = s
+                .workspace_writer(&owner, None, &info.workspace_id)?
+                .writer_epoch;
+            let grants = permission
+                .iter()
+                .map(|label| match label.as_str() {
+                    "query" => Ok(aw_store::ActorPeerPermission::Query),
+                    "inspect" => Ok(aw_store::ActorPeerPermission::Inspect),
+                    "enqueue" => Ok(aw_store::ActorPeerPermission::Enqueue),
+                    "step" => Ok(aw_store::ActorPeerPermission::Step),
+                    "control" => Ok(aw_store::ActorPeerPermission::Control),
+                    "notice-read" => Ok(aw_store::ActorPeerPermission::NoticeRead),
+                    _ => Err(Error::Denied("unknown explicit Actor peer permission")),
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            print(
+                &s.grant_actor_peer(
+                    &owner,
+                    &session_id,
+                    &branch_id,
+                    &site,
+                    &peer,
+                    epoch,
+                    grants,
+                    ttl,
+                )?,
+                o.json,
+            )?;
         }
-        NetCommand::ActorPeerRevoke {session_id,grant_id,store:o} => {
-            let (s,owner)=store_and_actor(&o)?;
-            let info=s.session(&owner,&session_id)?;
-            let epoch=s.workspace_writer(&owner,None,&info.workspace_id)?.writer_epoch;
-            print(&s.revoke_actor_peer(&owner,&session_id,&grant_id,epoch)?,o.json)?;
+        NetCommand::ActorPeerRevoke {
+            session_id,
+            grant_id,
+            store: o,
+        } => {
+            let (s, owner) = store_and_actor(&o)?;
+            let info = s.session(&owner, &session_id)?;
+            let epoch = s
+                .workspace_writer(&owner, None, &info.workspace_id)?
+                .writer_epoch;
+            print(
+                &s.revoke_actor_peer(&owner, &session_id, &grant_id, epoch)?,
+                o.json,
+            )?;
         }
-        NetCommand::ActorPeerList {session_id,store:o} => {
-            let (s,owner)=store_and_actor(&o)?;
-            print(&s.list_actor_peers(&owner,&session_id)?,o.json)?;
+        NetCommand::ActorPeerList {
+            session_id,
+            store: o,
+        } => {
+            let (s, owner) = store_and_actor(&o)?;
+            print(&s.list_actor_peers(&owner, &session_id)?, o.json)?;
         }
-        NetCommand::ActorRequest{peer,session_id,branch_id,room,rendezvous,request_file,
-            control_file,store:o,lease,listen,stun,timeout}=>{
-            #[cfg(not(all(feature="net",target_os="linux")))]
+        NetCommand::ActorRequest {
+            peer,
+            session_id,
+            branch_id,
+            room,
+            rendezvous,
+            request_file,
+            control_file,
+            store: o,
+            lease,
+            listen,
+            stun,
+            timeout,
+        } => {
+            #[cfg(not(all(feature = "net", target_os = "linux")))]
             {
-                let _=(peer,session_id,branch_id,room,rendezvous,request_file,control_file,o,
-                    lease,listen,stun,timeout);
-                return Err(Error::Denied("signed Actor remote transport requires Linux AwNet"));
+                let _ = (
+                    peer,
+                    session_id,
+                    branch_id,
+                    room,
+                    rendezvous,
+                    request_file,
+                    control_file,
+                    o,
+                    lease,
+                    listen,
+                    stun,
+                    timeout,
+                );
+                return Err(Error::Denied(
+                    "signed Actor remote transport requires Linux AwNet",
+                ));
             }
-            #[cfg(all(feature="net",target_os="linux"))]
+            #[cfg(all(feature = "net", target_os = "linux"))]
             {
-                let data=std::fs::read(&request_file)?;
-                if data.is_empty()||data.len()>192*1024 {
+                let data = std::fs::read(&request_file)?;
+                if data.is_empty() || data.len() > 192 * 1024 {
                     return Err(Error::Limit("Actor remote request must fit in 192 KiB"));
                 }
-                let request:crate::awnet::ActorRemoteRequest=serde_json::from_slice(&data)
-                    .map_err(|_|Error::Denied("invalid typed Actor remote request"))?;
+                let request: crate::awnet::ActorRemoteRequest = serde_json::from_slice(&data)
+                    .map_err(|_| Error::Denied("invalid typed Actor remote request"))?;
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct ConcurrentControl {
-                    delay_ms:u64,
-                    control:crate::awnet::ActorRemoteRequest,
+                    delay_ms: u64,
+                    control: crate::awnet::ActorRemoteRequest,
                 }
-                let control=if let Some(path)=control_file {
-                    let bytes=std::fs::read(path)?;
-                    if bytes.len()>4096 || bytes.is_empty() {
-                        return Err(Error::Limit("Actor concurrent Control specification must fit 4KiB"));
+                let control = if let Some(path) = control_file {
+                    let bytes = std::fs::read(path)?;
+                    if bytes.len() > 4096 || bytes.is_empty() {
+                        return Err(Error::Limit(
+                            "Actor concurrent Control specification must fit 4KiB",
+                        ));
                     }
-                    let command:ConcurrentControl=serde_json::from_slice(&bytes)
-                        .map_err(|_|Error::Denied("invalid strictly typed Actor concurrent Control specification"))?;
-                    if !matches!(request,crate::awnet::ActorRemoteRequest::Step {}) {
-                        return Err(Error::Denied("concurrent Actor Control requires a real Step"));
+                    let command: ConcurrentControl =
+                        serde_json::from_slice(&bytes).map_err(|_| {
+                            Error::Denied(
+                                "invalid strictly typed Actor concurrent Control specification",
+                            )
+                        })?;
+                    if !matches!(request, crate::awnet::ActorRemoteRequest::Step {}) {
+                        return Err(Error::Denied(
+                            "concurrent Actor Control requires a real Step",
+                        ));
                     }
                     Some(command)
-                }else{None};
-                let mut requested=BTreeSet::from([request.capability()]);
-                if control.is_some(){requested.insert(crate::awnet::MachineCapability::ActorControl);}
-                let dir=store_dir(&o)?;
-                let (s,_)=store_and_actor(&o)?;
-                let connection=crate::awnet::ActorRemoteClient::connect(&s,&dir,
+                } else {
+                    None
+                };
+                let mut requested = BTreeSet::from([request.capability()]);
+                if control.is_some() {
+                    requested.insert(crate::awnet::MachineCapability::ActorControl);
+                }
+                let dir = store_dir(&o)?;
+                let (s, _) = store_and_actor(&o)?;
+                let connection = crate::awnet::ActorRemoteClient::connect(
+                    &s,
+                    &dir,
                     crate::awnet::MachineLinkConnectOptions {
-                        route:crate::awnet::PunchOptions {
-                            peer_node_id:peer,room,rendezvous,listen,stun,
-                            timeout:Duration::from_secs(timeout),
+                        route: crate::awnet::PunchOptions {
+                            peer_node_id: peer,
+                            room,
+                            rendezvous,
+                            listen,
+                            stun,
+                            timeout: Duration::from_secs(timeout),
                         },
                         requested,
-                        lease:Duration::from_secs(lease),
-                    },&session_id,&branch_id)?;
-                if let Some(control)=control {
-                    let result=connection.step_and_control(control.control,control.delay_ms);
+                        lease: Duration::from_secs(lease),
+                    },
+                    &session_id,
+                    &branch_id,
+                )?;
+                if let Some(control) = control {
+                    let result = connection.step_and_control(control.control, control.delay_ms);
                     connection.close();
-                    let (step,signal)=result?;
-                    print(&serde_json::json!({"step":step,"control":signal}),o.json)?;
-                }else{
-                    let result=connection.request(request);
+                    let (step, signal) = result?;
+                    print(&serde_json::json!({"step":step,"control":signal}), o.json)?;
+                } else {
+                    let result = connection.request(request);
                     connection.close();
-                    print(&result?,o.json)?;
+                    print(&result?, o.json)?;
                 }
             }
         }

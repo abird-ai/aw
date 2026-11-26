@@ -293,9 +293,7 @@ impl SettingsState {
                     TuiMode::Fullscreen => TuiMode::Scrollback,
                 }
             }
-            SettingKey::AgentEditorPadding => {
-                ui.editor_padding_x = (ui.editor_padding_x + 1) % 4
-            }
+            SettingKey::AgentEditorPadding => ui.editor_padding_x = (ui.editor_padding_x + 1) % 4,
             SettingKey::AgentOutputPadding => ui.output_padding = (ui.output_padding + 1) % 4,
             SettingKey::WorkspaceEditorPadding => {
                 ui.workspace_editor_padding_x = (ui.workspace_editor_padding_x + 1) % 4

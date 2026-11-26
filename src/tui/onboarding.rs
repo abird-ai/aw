@@ -502,9 +502,7 @@ fn draw(frame: &mut Frame<'_>, wizard: &mut Wizard, theme_mode: aw::config::Them
                 })
                 .collect::<Vec<_>>();
             frame.render_stateful_widget(
-                List::new(rows).highlight_style(
-                    palette.selected_style(),
-                ),
+                List::new(rows).highlight_style(palette.selected_style()),
                 chunks[1],
                 &mut state,
             );
@@ -536,10 +534,20 @@ fn draw(frame: &mut Frame<'_>, wizard: &mut Wizard, theme_mode: aw::config::Them
                 Paragraph::new(vec![
                     Line::styled(
                         "Discovering available models…",
-                        Style::default().fg(SETUP_COLOR).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(SETUP_COLOR)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Line::styled(
-                        format!("{}  {}", wizard.endpoint, if wizard.api_key_env.is_empty() { "no credential" } else { "credential via environment" }),
+                        format!(
+                            "{}  {}",
+                            wizard.endpoint,
+                            if wizard.api_key_env.is_empty() {
+                                "no credential"
+                            } else {
+                                "credential via environment"
+                            }
+                        ),
                         Style::default().fg(palette.muted),
                     ),
                 ]),
@@ -549,7 +557,9 @@ fn draw(frame: &mut Frame<'_>, wizard: &mut Wizard, theme_mode: aw::config::Them
         Step::Models => {
             let total = wizard.models.len() + 1;
             let visible = usize::from(chunks[1].height.max(1));
-            let start = wizard.model_selected.saturating_sub(visible.saturating_sub(1));
+            let start = wizard
+                .model_selected
+                .saturating_sub(visible.saturating_sub(1));
             let mut rows = wizard
                 .models
                 .iter()
@@ -559,7 +569,11 @@ fn draw(frame: &mut Frame<'_>, wizard: &mut Wizard, theme_mode: aw::config::Them
                 .map(|(index, model)| {
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            if index == wizard.model_selected { "● " } else { "  " },
+                            if index == wizard.model_selected {
+                                "● "
+                            } else {
+                                "  "
+                            },
                             Style::default().fg(SETUP_COLOR),
                         ),
                         Span::styled(model, Style::default().fg(palette.foreground)),
@@ -569,15 +583,21 @@ fn draw(frame: &mut Frame<'_>, wizard: &mut Wizard, theme_mode: aw::config::Them
             if start + rows.len() <= wizard.models.len() && rows.len() < visible {
                 rows.push(ListItem::new(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled("Enter model ID manually…", Style::default().fg(palette.faint)),
+                    Span::styled(
+                        "Enter model ID manually…",
+                        Style::default().fg(palette.faint),
+                    ),
                 ])));
             }
             let mut state = ListState::default();
-            state.select(Some(wizard.model_selected.saturating_sub(start).min(rows.len().saturating_sub(1))));
+            state.select(Some(
+                wizard
+                    .model_selected
+                    .saturating_sub(start)
+                    .min(rows.len().saturating_sub(1)),
+            ));
             frame.render_stateful_widget(
-                List::new(rows).highlight_style(
-                    palette.selected_style(),
-                ),
+                List::new(rows).highlight_style(palette.selected_style()),
                 chunks[1],
                 &mut state,
             );
@@ -706,9 +726,7 @@ pub fn choose_chatgpt_model(
             let mut state = ListState::default();
             state.select(Some(selected.saturating_sub(start)));
             frame.render_stateful_widget(
-                List::new(rows).highlight_style(
-                    palette.selected_style(),
-                ),
+                List::new(rows).highlight_style(palette.selected_style()),
                 chunks[1],
                 &mut state,
             );
@@ -817,15 +835,13 @@ pub fn run_with_discovery(
                     wizard.model_selected = wizard.model_selected.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    wizard.model_selected =
-                        (wizard.model_selected + 1).min(wizard.models.len());
+                    wizard.model_selected = (wizard.model_selected + 1).min(wizard.models.len());
                 }
                 KeyCode::PageUp => {
                     wizard.model_selected = wizard.model_selected.saturating_sub(8);
                 }
                 KeyCode::PageDown => {
-                    wizard.model_selected =
-                        (wizard.model_selected + 8).min(wizard.models.len());
+                    wizard.model_selected = (wizard.model_selected + 8).min(wizard.models.len());
                 }
                 KeyCode::Home => wizard.model_selected = 0,
                 KeyCode::End => wizard.model_selected = wizard.models.len(),
@@ -878,10 +894,13 @@ mod tests {
 
     #[test]
     fn native_gemini_setup_uses_google_ai_studio_credential_reference() {
-        let preset=ProviderChoice::GeminiApi.preset().unwrap();
-        assert_eq!(preset.kind,ProviderKind::Gemini);
-        assert_eq!(preset.base_url,"https://generativelanguage.googleapis.com/v1beta");
-        assert_eq!(preset.api_key_env,Some("GEMINI_API_KEY"));
+        let preset = ProviderChoice::GeminiApi.preset().unwrap();
+        assert_eq!(preset.kind, ProviderKind::Gemini);
+        assert_eq!(
+            preset.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(preset.api_key_env, Some("GEMINI_API_KEY"));
         assert!(!preset.custom_endpoint);
     }
 

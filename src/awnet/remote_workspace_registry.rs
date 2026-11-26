@@ -1,15 +1,15 @@
+use super::remote_workspace_target::RemoteWorkspaceTargetAdmission;
 use super::{
     request_identity_auth, request_machine_service, IdentityAuthRequestOptions, MachineCapability,
     MachineLinkConnectOptions, MachineReadResponse, PunchOptions, RemoteViewGrantRequest,
     RemoteWorkspaceErrorCode, RemoteWorkspaceGitMode, RemoteWorkspaceRequest,
     RemoteWorkspaceResponse, RemoteWorkspaceViewRequest,
 };
-use super::remote_workspace_target::RemoteWorkspaceTargetAdmission;
-use aw::{Error, PrincipalId, Result};
 use aw::web::{
     RemoteWorkspaceTargetDescriptor as WebTargetDescriptor, RemoteWorkspaceTargetError,
     RemoteWorkspaceTargetErrorCode as WebErrorCode, RemoteWorkspaceTargetRouter,
 };
+use aw::{Error, PrincipalId, Result};
 use aw_store::{RemoteViewPermission, SessionStore};
 use aw_surfaces::{Command, GitMode, ViewRequest};
 use serde::Deserialize;
@@ -210,14 +210,10 @@ fn remote_error(
             WebErrorCode::ScopeChanged,
             "remote Workspace scope changed; refresh the exact target",
         ),
-        RemoteWorkspaceErrorCode::Denied => (
-            WebErrorCode::Denied,
-            "remote Workspace read denied",
-        ),
-        RemoteWorkspaceErrorCode::Invalid => (
-            WebErrorCode::Invalid,
-            "remote Workspace request invalid",
-        ),
+        RemoteWorkspaceErrorCode::Denied => (WebErrorCode::Denied, "remote Workspace read denied"),
+        RemoteWorkspaceErrorCode::Invalid => {
+            (WebErrorCode::Invalid, "remote Workspace request invalid")
+        }
         RemoteWorkspaceErrorCode::Conflict => (
             WebErrorCode::Conflict,
             "remote Workspace snapshot changed; refresh explicitly",
@@ -260,9 +256,7 @@ fn map_view_request(request: ViewRequest) -> RemoteWorkspaceViewRequest {
             inventory_id,
             item_id,
         },
-        ViewRequest::Review { review_id } => {
-            RemoteWorkspaceViewRequest::Review { review_id }
-        }
+        ViewRequest::Review { review_id } => RemoteWorkspaceViewRequest::Review { review_id },
     }
 }
 
@@ -396,9 +390,11 @@ impl RemoteWorkspaceTargetRegistry {
         &self,
         target_id: &str,
     ) -> std::result::Result<Arc<RemoteWorkspaceTargetAdmission>, RemoteWorkspaceTargetError> {
-        let target = self.targets.get(target_id).cloned().ok_or_else(|| {
-            denied("remote Workspace target unavailable", None, None)
-        })?;
+        let target = self
+            .targets
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| denied("remote Workspace target unavailable", None, None))?;
         target
             .revalidate(&self.store, &self.actor, &self.state_dir)
             .map_err(|_| denied("remote Workspace target authority changed", None, None))?;
@@ -413,8 +409,8 @@ impl RemoteWorkspaceTargetRegistry {
         let options = target
             .request_options(request)
             .map_err(|_| denied("remote Workspace read permission changed", None, None))?;
-        let result =
-            request_machine_service(&self.store, &self.state_dir, options).map_err(request_failure)?;
+        let result = request_machine_service(&self.store, &self.state_dir, options)
+            .map_err(request_failure)?;
         match result.response {
             MachineReadResponse::RemoteWorkspace { workspace } => Ok(workspace),
             _ => Err(unavailable(
@@ -428,10 +424,7 @@ impl RemoteWorkspaceTargetRegistry {
         target: &RemoteWorkspaceTargetAdmission,
         permission: RemoteViewPermission,
     ) -> std::result::Result<Value, RemoteWorkspaceTargetError> {
-        match self.request(
-            target,
-            RemoteWorkspaceRequest::Capabilities { permission },
-        )? {
+        match self.request(target, RemoteWorkspaceRequest::Capabilities { permission })? {
             RemoteWorkspaceResponse::Capabilities { capabilities } => Ok(capabilities),
             RemoteWorkspaceResponse::Error {
                 source_id,
@@ -463,9 +456,7 @@ impl RemoteWorkspaceTargetRegistry {
             .or_else(|| git.clone())
             .ok_or_else(|| denied("remote Workspace target has no read permission", None, None))?;
         if let (Some(files), Some(git)) = (&files, &git) {
-            if files["source_id"] != git["source_id"]
-                || files["view_root"] != git["view_root"]
-            {
+            if files["source_id"] != git["source_id"] || files["view_root"] != git["view_root"] {
                 return Err(RemoteWorkspaceTargetError {
                     code: WebErrorCode::Conflict,
                     message: "remote Workspace capability roots disagree",
@@ -474,9 +465,9 @@ impl RemoteWorkspaceTargetRegistry {
                 });
             }
         }
-        let object = merged.as_object_mut().ok_or_else(|| {
-            unavailable("remote Workspace capability payload is malformed")
-        })?;
+        let object = merged
+            .as_object_mut()
+            .ok_or_else(|| unavailable("remote Workspace capability payload is malformed"))?;
         object.insert("files".into(), Value::Bool(descriptor.files));
         object.insert("git_read".into(), Value::Bool(descriptor.git));
         object.insert("git_write".into(), Value::Bool(false));

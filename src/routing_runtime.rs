@@ -108,11 +108,7 @@ pub(crate) fn preflight_strategy(
     strategy: &aw_routing::RoutingStrategyDefinition,
 ) -> Result<BTreeMap<String, config::Profile>> {
     let profiles = profiles(file);
-    for candidate in strategy
-        .candidates
-        .iter()
-        .chain(strategy.classifier.iter())
-    {
+    for candidate in strategy.candidates.iter().chain(strategy.classifier.iter()) {
         let _ = target_profile(&profiles, candidate)?;
     }
     Ok(profiles)
@@ -165,7 +161,8 @@ where
         persistent.handle.session_id(),
         &branch.id,
         &options.role,
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     let strategy = &resolved.strategy.definition;
@@ -187,8 +184,15 @@ where
                 .fixed_target
                 .as_deref()
                 .ok_or(Error::Storage("fixed routing strategy lost its target"))?;
-            let target = target(strategy, target_id).map_err(|error| Error::Config(error.to_string()))?;
-            let selection = register_target(agent, &persistent.store, &profiles, target, environment.idle_timeout)?;
+            let target =
+                target(strategy, target_id).map_err(|error| Error::Config(error.to_string()))?;
+            let selection = register_target(
+                agent,
+                &persistent.store,
+                &profiles,
+                target,
+                environment.idle_timeout,
+            )?;
             let operation = persistent.store.routing_admit_resolved(
                 &persistent.actor,
                 &resolved.strategy.revision_id,
@@ -201,7 +205,10 @@ where
                 RoutingSelectionSource::Fixed,
                 target_id,
             )?;
-            Ok(Some(RouteDecision { selection, operation }))
+            Ok(Some(RouteDecision {
+                selection,
+                operation,
+            }))
         }
         RoutingMode::RouteOnce => {
             let affinity = persistent.store.routing_affinity(
@@ -217,7 +224,13 @@ where
             {
                 let target = target(strategy, &affinity.target_id)
                     .map_err(|error| Error::Config(error.to_string()))?;
-                let selection = register_target(agent, &persistent.store, &profiles, target, environment.idle_timeout)?;
+                let selection = register_target(
+                    agent,
+                    &persistent.store,
+                    &profiles,
+                    target,
+                    environment.idle_timeout,
+                )?;
                 // The fresh selection is the authority check. `grant_revision` is
                 // intentionally process-local and is never persisted as affinity
                 // authority; destination/model pins below survive process restart.
@@ -234,7 +247,10 @@ where
                     RoutingSelectionSource::Affinity,
                     &affinity.target_id,
                 )?;
-                return Ok(Some(RouteDecision { selection, operation }));
+                return Ok(Some(RouteDecision {
+                    selection,
+                    operation,
+                }));
             }
             classify(
                 agent,
@@ -284,10 +300,9 @@ async fn classify<C>(
 where
     C: Future<Output = ()> + Send,
 {
-    let classifier = strategy
-        .classifier
-        .as_ref()
-        .ok_or(Error::Storage("classified routing strategy lost its classifier"))?;
+    let classifier = strategy.classifier.as_ref().ok_or(Error::Storage(
+        "classified routing strategy lost its classifier",
+    ))?;
     let classifier_selection =
         register_target(agent, &persistent.store, profiles, classifier, idle_timeout)?;
     // Construct the tool-free evaluator before durable admission so a local
@@ -345,7 +360,9 @@ where
     let target_id = result
         .proposal
         .as_ref()
-        .ok_or(Error::Protocol("completed routing decision has no candidate"))?
+        .ok_or(Error::Protocol(
+            "completed routing decision has no candidate",
+        ))?
         .candidate_id
         .clone();
     let target = target(strategy, &target_id).map_err(|error| Error::Config(error.to_string()))?;
@@ -362,9 +379,11 @@ where
     let operation = persistent
         .store
         .routing_operation(&persistent.actor, &operation.id)?;
-    Ok(RouteDecision { selection, operation })
+    Ok(RouteDecision {
+        selection,
+        operation,
+    })
 }
-
 
 pub(crate) fn select_routed_retry(
     agent: &Agent,
@@ -382,10 +401,9 @@ pub(crate) fn select_routed_retry(
             "routed retry references a route selection that never admitted working Chat",
         ));
     }
-    let recorded = operation
-        .working_identity
-        .as_ref()
-        .ok_or(Error::Storage("consumed routing receipt has no working identity"))?;
+    let recorded = operation.working_identity.as_ref().ok_or(Error::Storage(
+        "consumed routing receipt has no working identity",
+    ))?;
     if recorded.actor != original.actor
         || recorded.account_id != original.account_id
         || recorded.account_owner != original.account_owner

@@ -726,14 +726,24 @@ impl Ui {
             "terminal-dock" => {
                 let id = self.terminal().map(|terminal| terminal.id.clone());
                 match (&self.terminal_pool, id) {
-                    (Some(pool), Some(id)) => match super::super::native_dock::invite(pool.clone(), &id) {
-                        Ok(invite) => self.notice = format!(
-                            "Dock: {}",
-                            super::super::native_dock::attach_hint(&invite)
-                        ),
-                        Err(error) => { self.notice = error.to_string(); accepted = false; }
-                    },
-                    _ => { self.notice = "Focus a running terminal before docking".into(); accepted = false; }
+                    (Some(pool), Some(id)) => {
+                        match super::super::native_dock::invite(pool.clone(), &id) {
+                            Ok(invite) => {
+                                self.notice = format!(
+                                    "Dock: {}",
+                                    super::super::native_dock::attach_hint(&invite)
+                                )
+                            }
+                            Err(error) => {
+                                self.notice = error.to_string();
+                                accepted = false;
+                            }
+                        }
+                    }
+                    _ => {
+                        self.notice = "Focus a running terminal before docking".into();
+                        accepted = false;
+                    }
                 }
             }
             #[cfg(unix)]
@@ -741,10 +751,20 @@ impl Ui {
                 let id = self.terminal().map(|terminal| terminal.id.clone());
                 match (&self.terminal_pool, id) {
                     (Some(pool), Some(id)) => match pool.cancel_dock(&id) {
-                        Ok(()) => self.notice = "Unused native PTY invitation revoked; shell remains owned here".into(),
-                        Err(error) => { self.notice = error.to_string(); accepted = false; }
+                        Ok(()) => {
+                            self.notice =
+                                "Unused native PTY invitation revoked; shell remains owned here"
+                                    .into()
+                        }
+                        Err(error) => {
+                            self.notice = error.to_string();
+                            accepted = false;
+                        }
                     },
-                    _ => { self.notice = "Focus a terminal with a pending invitation".into(); accepted = false; }
+                    _ => {
+                        self.notice = "Focus a terminal with a pending invitation".into();
+                        accepted = false;
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -753,13 +773,16 @@ impl Ui {
                     self.notice = "Terminal operation already pending".into();
                     return Some(false);
                 }
-                let Some(pool) = self.terminal_pool.clone() else { return Some(false) };
+                let Some(pool) = self.terminal_pool.clone() else {
+                    return Some(false);
+                };
                 let Some(id) = self.terminal().map(|terminal| terminal.id.clone()) else {
                     self.notice = "Focus a running locally controlled terminal".into();
                     return Some(false);
                 };
                 self.terminal_pending = true;
-                self.notice = "Moving original PTY custody; input paused until owner outcome is known".into();
+                self.notice =
+                    "Moving original PTY custody; input paused until owner outcome is known".into();
                 let out = self.background_tx.clone();
                 let panic_out = out.clone();
                 if let Err(error) = self.background.try_submit_with_panic(
@@ -858,8 +881,11 @@ impl Ui {
             "terminal-stop" => {
                 if let (Some(pool), Some(t)) = (&self.terminal_pool, self.terminal()) {
                     match pool.terminate_local(&t.id) {
-                        Ok(()) => self.notice =
-                            "PTY termination requested; inspect commands with uncertain effects".into(),
+                        Ok(()) => {
+                            self.notice =
+                                "PTY termination requested; inspect commands with uncertain effects"
+                                    .into()
+                        }
                         Err(error) => {
                             self.notice = error.to_string();
                             accepted = false;

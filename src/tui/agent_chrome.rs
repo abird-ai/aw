@@ -1,6 +1,12 @@
-use super::{agent_resources::LoadedResourceSummary, extensions, markdown, performance::PerformanceStats, status::StatusContext};
+use super::{
+    agent_resources::LoadedResourceSummary, extensions, markdown, performance::PerformanceStats,
+    status::StatusContext,
+};
 use aw_ui_extension::Slot;
-use ratatui::{style::Style, text::{Line, Span}};
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderMode {
@@ -17,7 +23,9 @@ pub struct AgentHeader {
 
 impl AgentHeader {
     pub fn from_resources(resources: &LoadedResourceSummary) -> Self {
-        Self { resources: resources.clone() }
+        Self {
+            resources: resources.clone(),
+        }
     }
 }
 
@@ -43,29 +51,52 @@ fn filled_line(text: String, style: Style, width: usize) -> Line<'static> {
     let mut line = Line::styled(text, style);
     if width > 0 {
         let used = line.width();
-        if used < width { line.spans.push(Span::styled(" ".repeat(width-used), style)); }
+        if used < width {
+            line.spans
+                .push(Span::styled(" ".repeat(width - used), style));
+        }
     }
     line
 }
 
-pub(crate) fn filled_block(mut body: Vec<String>, style: Style, width: usize) -> Vec<Line<'static>> {
-    if body.is_empty() { body.push(String::new()); }
-    let mut out=Vec::with_capacity(body.len()+2);
-    out.push(filled_line(String::new(),style,width));
-    out.extend(body.into_iter().map(|line|filled_line(line,style,width)));
-    out.push(filled_line(String::new(),style,width));
+pub(crate) fn filled_block(
+    mut body: Vec<String>,
+    style: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if body.is_empty() {
+        body.push(String::new());
+    }
+    let mut out = Vec::with_capacity(body.len() + 2);
+    out.push(filled_line(String::new(), style, width));
+    out.extend(body.into_iter().map(|line| filled_line(line, style, width)));
+    out.push(filled_line(String::new(), style, width));
     out
 }
 
-pub fn header_lines(header: &AgentHeader, mode: HeaderMode, ui: &aw::config::UiConfig) -> Vec<Line<'static>> {
-    let p=super::theme::palette_for(ui); let mut out=Vec::new();
+pub fn header_lines(
+    header: &AgentHeader,
+    mode: HeaderMode,
+    ui: &aw::config::UiConfig,
+) -> Vec<Line<'static>> {
+    let p = super::theme::palette_for(ui);
+    let mut out = Vec::new();
     if mode == HeaderMode::Hidden {
         return out;
     }
     if mode == HeaderMode::Full {
-        out.push(Line::from(vec![Span::styled(format!("aw v{}", env!("CARGO_PKG_VERSION")), p.user_marker_style())]));
-        out.push(Line::styled("Esc close · Ctrl+C clear/exit · F1 palette · / commands", Style::default().fg(p.muted)));
-        out.push(Line::styled("aw can explain its own features and loaded resources.", Style::default().fg(p.muted)));
+        out.push(Line::from(vec![Span::styled(
+            format!("aw v{}", env!("CARGO_PKG_VERSION")),
+            p.user_marker_style(),
+        )]));
+        out.push(Line::styled(
+            "Esc close · Ctrl+C clear/exit · F1 palette · / commands",
+            Style::default().fg(p.muted),
+        ));
+        out.push(Line::styled(
+            "aw can explain its own features and loaded resources.",
+            Style::default().fg(p.muted),
+        ));
         out.push(Line::default());
     }
     const MAX_SECTION_ITEMS: usize = 8;
@@ -78,41 +109,74 @@ pub fn header_lines(header: &AgentHeader, mode: HeaderMode, ui: &aw::config::UiC
     }
     if mode == HeaderMode::Full || !context.is_empty() {
         out.push(Line::styled("[Context]", p.markdown_heading_style()));
-    if context.is_empty() { out.push(Line::styled("  none loaded", Style::default().fg(p.muted))); }
-    else if context.len() <= MAX_SECTION_ITEMS { out.extend(context.iter().map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style()))); }
-    else {
-        out.push(Line::styled(format!("  {}", aw::presentation::safe_text(&context[0].label())), p.text_style()));
-        let tail = MAX_SECTION_ITEMS.saturating_sub(1);
-        let omitted = context.len().saturating_sub(1 + tail);
-        out.push(Line::styled(format!("  … {omitted} earlier loaded context resource{}", if omitted == 1 { "" } else { "s" }), Style::default().fg(p.muted)));
-        out.extend(context[context.len()-tail..].iter().map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style())));
-    }
+        if context.is_empty() {
+            out.push(Line::styled("  none loaded", Style::default().fg(p.muted)));
+        } else if context.len() <= MAX_SECTION_ITEMS {
+            out.extend(context.iter().map(|v| {
+                Line::styled(
+                    format!("  {}", aw::presentation::safe_text(&v.label())),
+                    p.text_style(),
+                )
+            }));
+        } else {
+            out.push(Line::styled(
+                format!("  {}", aw::presentation::safe_text(&context[0].label())),
+                p.text_style(),
+            ));
+            let tail = MAX_SECTION_ITEMS.saturating_sub(1);
+            let omitted = context.len().saturating_sub(1 + tail);
+            out.push(Line::styled(
+                format!(
+                    "  … {omitted} earlier loaded context resource{}",
+                    if omitted == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(p.muted),
+            ));
+            out.extend(context[context.len() - tail..].iter().map(|v| {
+                Line::styled(
+                    format!("  {}", aw::presentation::safe_text(&v.label())),
+                    p.text_style(),
+                )
+            }));
+        }
         out.push(Line::default());
     }
     if mode == HeaderMode::Full || !skills.is_empty() {
         out.push(Line::styled("[Skills]", p.markdown_heading_style()));
-    if skills.is_empty() { out.push(Line::styled("  none loaded", Style::default().fg(p.muted))); }
-    else {
-        out.extend(skills.iter().take(MAX_SECTION_ITEMS).map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style())));
-        if skills.len() > MAX_SECTION_ITEMS { out.push(Line::styled(format!("  … {} more loaded skills", skills.len()-MAX_SECTION_ITEMS), Style::default().fg(p.muted))); }
-    }
+        if skills.is_empty() {
+            out.push(Line::styled("  none loaded", Style::default().fg(p.muted)));
+        } else {
+            out.extend(skills.iter().take(MAX_SECTION_ITEMS).map(|v| {
+                Line::styled(
+                    format!("  {}", aw::presentation::safe_text(&v.label())),
+                    p.text_style(),
+                )
+            }));
+            if skills.len() > MAX_SECTION_ITEMS {
+                out.push(Line::styled(
+                    format!(
+                        "  … {} more loaded skills",
+                        skills.len() - MAX_SECTION_ITEMS
+                    ),
+                    Style::default().fg(p.muted),
+                ));
+            }
+        }
         out.push(Line::default());
     }
     out
 }
 
-pub fn prompt_lines(
-    prompt: &str,
-    ui: &aw::config::UiConfig,
-    width: usize,
-) -> Vec<Line<'static>> {
+pub fn prompt_lines(prompt: &str, ui: &aw::config::UiConfig, width: usize) -> Vec<Line<'static>> {
     let palette = super::theme::palette_for(ui);
     let style = palette.user_prompt_style();
     let safe = aw::presentation::safe_text(prompt);
     let width = width.max(1);
-    let mut body=Vec::new();
-    for source in safe.split('\n') { body.extend(wrap_cells(source,width)); }
-    filled_block(body,style,width)
+    let mut body = Vec::new();
+    for source in safe.split('\n') {
+        body.extend(wrap_cells(source, width));
+    }
+    filled_block(body, style, width)
 }
 
 pub fn turn_lines(
@@ -122,7 +186,9 @@ pub fn turn_lines(
     width: usize,
     highlight_code: bool,
 ) -> Vec<Line<'static>> {
-    let p=super::theme::palette_for(ui); let mut lines=Vec::new(); let thinking=stats.first_token.unwrap_or(stats.elapsed);
+    let p = super::theme::palette_for(ui);
+    let mut lines = Vec::new();
+    let thinking = stats.first_token.unwrap_or(stats.elapsed);
     let render_markdown = |text: &str| {
         if highlight_code {
             markdown::render(text, p, ui.theme, width)
@@ -130,22 +196,122 @@ pub fn turn_lines(
             markdown::render_plain(text, p, ui.theme, width)
         }
     };
-    if !thinking.is_zero(){lines.push(Line::styled(if ui.show_thinking{format!("Thinking {:.1}s",thinking.as_secs_f64())}else{"Thinking · hidden".into()},p.thinking_style()));lines.push(Line::default());}
-    let record_for=|id:&str|turn.tool_records.iter().find(|r|r.call.id==id); let trace=turn.context_messages.iter().skip(1).collect::<Vec<_>>(); let fallback=aw::presentation::settled_answer_fallback(turn); let mut assistant=false;
-    for m in trace { match m.role {
-        aw_agent_core::Role::Assistant=>{if !m.content.trim().is_empty(){assistant=true;lines.extend(render_markdown(&m.content));} for call in &m.tool_calls{let rec=record_for(&call.id);let style=p.tool_style(aw::presentation::tool_tone(rec));lines.push(Line::default());if ui.show_tool_calls{lines.extend(filled_block(vec![rec.map_or_else(
-    || format!("{} · unknown", aw::presentation::safe_text(&format!("{}  {}",call.name,call.arguments))),
-    |record| format!("{} · {}", aw::presentation::tool_title(record), factual_tool_status(record)),
-)],style,width));}else{let status=rec.map(factual_tool_status).unwrap_or("unknown");lines.extend(filled_block(vec![format!("tool {} · {status} · hidden",call.name)],style,width));}}}
-        aw_agent_core::Role::Tool if ui.show_tool_calls=>{let rec=m.tool_call_id.as_deref().and_then(record_for);let style=p.tool_style(aw::presentation::tool_tone(rec));let safe=aw::presentation::safe_text(&m.content);let all=safe.lines().collect::<Vec<_>>();const MAX:usize=12;let mut block=Vec::new();if all.len()>MAX{block.push(format!("… ({} earlier lines omitted)",all.len()-MAX));}block.extend(all.iter().skip(all.len().saturating_sub(MAX)).map(|line|(*line).to_owned()));lines.extend(filled_block(block,style,width));}
-        _=>{}
-    }}
-    if let Some(f)=fallback{if assistant{lines.push(Line::default());}lines.extend(render_markdown(&f));assistant=true;}
-    if turn.outcome!=aw::conversation::Outcome::Completed{if assistant{lines.push(Line::default());}let d=turn.error.as_deref().unwrap_or("model turn did not complete with visible output");lines.push(Line::styled(format!("! {}",aw::presentation::safe_text(d)),p.error_style()));}else if !assistant{lines.push(Line::styled("! completed turn contained no visible assistant output",p.error_style()));}
-    let perf=extensions::project(Slot::AfterTurn,ui,&StatusContext::default(),Some(stats));if !perf.is_empty(){lines.push(Line::default());lines.extend(perf);}lines.push(Line::default());lines
+    if !thinking.is_zero() {
+        lines.push(Line::styled(
+            if ui.show_thinking {
+                format!("Thinking {:.1}s", thinking.as_secs_f64())
+            } else {
+                "Thinking · hidden".into()
+            },
+            p.thinking_style(),
+        ));
+        lines.push(Line::default());
+    }
+    let record_for = |id: &str| turn.tool_records.iter().find(|r| r.call.id == id);
+    let trace = turn.context_messages.iter().skip(1).collect::<Vec<_>>();
+    let fallback = aw::presentation::settled_answer_fallback(turn);
+    let mut assistant = false;
+    for m in trace {
+        match m.role {
+            aw_agent_core::Role::Assistant => {
+                if !m.content.trim().is_empty() {
+                    assistant = true;
+                    lines.extend(render_markdown(&m.content));
+                }
+                for call in &m.tool_calls {
+                    let rec = record_for(&call.id);
+                    let style = p.tool_style(aw::presentation::tool_tone(rec));
+                    lines.push(Line::default());
+                    if ui.show_tool_calls {
+                        lines.extend(filled_block(
+                            vec![rec.map_or_else(
+                                || {
+                                    format!(
+                                        "{} · unknown",
+                                        aw::presentation::safe_text(&format!(
+                                            "{}  {}",
+                                            call.name, call.arguments
+                                        ))
+                                    )
+                                },
+                                |record| {
+                                    format!(
+                                        "{} · {}",
+                                        aw::presentation::tool_title(record),
+                                        factual_tool_status(record)
+                                    )
+                                },
+                            )],
+                            style,
+                            width,
+                        ));
+                    } else {
+                        let status = rec.map(factual_tool_status).unwrap_or("unknown");
+                        lines.extend(filled_block(
+                            vec![format!("tool {} · {status} · hidden", call.name)],
+                            style,
+                            width,
+                        ));
+                    }
+                }
+            }
+            aw_agent_core::Role::Tool if ui.show_tool_calls => {
+                let rec = m.tool_call_id.as_deref().and_then(record_for);
+                let style = p.tool_style(aw::presentation::tool_tone(rec));
+                let safe = aw::presentation::safe_text(&m.content);
+                let all = safe.lines().collect::<Vec<_>>();
+                const MAX: usize = 12;
+                let mut block = Vec::new();
+                if all.len() > MAX {
+                    block.push(format!("… ({} earlier lines omitted)", all.len() - MAX));
+                }
+                block.extend(
+                    all.iter()
+                        .skip(all.len().saturating_sub(MAX))
+                        .map(|line| (*line).to_owned()),
+                );
+                lines.extend(filled_block(block, style, width));
+            }
+            _ => {}
+        }
+    }
+    if let Some(f) = fallback {
+        if assistant {
+            lines.push(Line::default());
+        }
+        lines.extend(render_markdown(&f));
+        assistant = true;
+    }
+    if turn.outcome != aw::conversation::Outcome::Completed {
+        if assistant {
+            lines.push(Line::default());
+        }
+        let d = turn
+            .error
+            .as_deref()
+            .unwrap_or("model turn did not complete with visible output");
+        lines.push(Line::styled(
+            format!("! {}", aw::presentation::safe_text(d)),
+            p.error_style(),
+        ));
+    } else if !assistant {
+        lines.push(Line::styled(
+            "! completed turn contained no visible assistant output",
+            p.error_style(),
+        ));
+    }
+    let perf = extensions::project(Slot::AfterTurn, ui, &StatusContext::default(), Some(stats));
+    if !perf.is_empty() {
+        lines.push(Line::default());
+        lines.extend(perf);
+    }
+    lines.push(Line::default());
+    lines
 }
 
-pub fn progress_indicator(elapsed: std::time::Duration) -> (&'static str, &'static str, &'static str) {
+pub fn progress_indicator(
+    elapsed: std::time::Duration,
+) -> (&'static str, &'static str, &'static str) {
     const FRAMES: [(&str, &str, &str); 4] = [
         ("▪", "▫", "▫"),
         ("▫", "▪", "▫"),
@@ -256,7 +422,11 @@ fn factual_tool_status(record: &aw_agent_core::ToolRecord) -> &'static str {
     }
 }
 
-pub fn live_lines(live: &LiveProjection<'_>, ui: &aw::config::UiConfig, width: usize) -> Vec<Line<'static>> {
+pub fn live_lines(
+    live: &LiveProjection<'_>,
+    ui: &aw::config::UiConfig,
+    width: usize,
+) -> Vec<Line<'static>> {
     let p = super::theme::palette_for(ui);
     let mut lines = Vec::new();
     if !live.answer.is_empty() {
@@ -269,14 +439,29 @@ pub fn live_lines(live: &LiveProjection<'_>, ui: &aw::config::UiConfig, width: u
     for record in live.tools {
         let style = p.tool_style(aw::presentation::tool_tone(Some(record)));
         lines.push(Line::default());
-        let mut block=Vec::new();
+        let mut block = Vec::new();
         if ui.show_tool_calls {
-            block.push(format!("{} · {}", aw::presentation::tool_title(record), factual_tool_status(record)));
-            if let Some(output)=&record.output { block.extend(aw::presentation::safe_text(&output.content).lines().take(12).map(str::to_owned)); }
+            block.push(format!(
+                "{} · {}",
+                aw::presentation::tool_title(record),
+                factual_tool_status(record)
+            ));
+            if let Some(output) = &record.output {
+                block.extend(
+                    aw::presentation::safe_text(&output.content)
+                        .lines()
+                        .take(12)
+                        .map(str::to_owned),
+                );
+            }
         } else {
-            block.push(format!("tool {} · {} · hidden", record.call.name, factual_tool_status(record)));
+            block.push(format!(
+                "tool {} · {} · hidden",
+                record.call.name,
+                factual_tool_status(record)
+            ));
         }
-        lines.extend(filled_block(block,style,width));
+        lines.extend(filled_block(block, style, width));
     }
     lines
 }
@@ -343,8 +528,7 @@ pub fn inset_lines(lines: &mut [Line<'static>], padding_x: u8) {
     let spaces = " ".repeat(padding);
     for line in lines {
         let style = line.style;
-        line.spans
-            .insert(0, Span::styled(spaces.clone(), style));
+        line.spans.insert(0, Span::styled(spaces.clone(), style));
         line.spans.push(Span::styled(spaces.clone(), style));
     }
 }
@@ -386,9 +570,19 @@ fn wrap_cells(text: &str, max: usize) -> Vec<String> {
 fn truncate_cells(text: &str, max: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
-    if max == 0 { return String::new(); }
-    let mut out=String::new(); let mut used=0usize;
-    for g in UnicodeSegmentation::graphemes(text,true){let w=UnicodeWidthStr::width(g);if used.saturating_add(w)>max{break;}out.push_str(g);used=used.saturating_add(w);}
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for g in UnicodeSegmentation::graphemes(text, true) {
+        let w = UnicodeWidthStr::width(g);
+        if used.saturating_add(w) > max {
+            break;
+        }
+        out.push_str(g);
+        used = used.saturating_add(w);
+    }
     out
 }
 
@@ -400,32 +594,56 @@ pub fn composer_placeholder(width: u16, busy: bool, editing: bool) -> String {
     } else {
         "Ask anything…  i edit · / commands"
     };
-    if width < 18 { "Ask anything…".into() }
-    else if width < 42 { "Ask anything…  / commands".into() }
-    else { truncate_cells(full, usize::from(width)) }
+    if width < 18 {
+        "Ask anything…".into()
+    } else if width < 42 {
+        "Ask anything…  / commands".into()
+    } else {
+        truncate_cells(full, usize::from(width))
+    }
 }
 
 #[cfg(all(test, feature = "workspace"))]
 mod tests {
     use super::*;
     #[cfg(feature = "workspace")]
-    fn plain(lines:&[Line<'_>])->String{lines.iter().flat_map(|l|l.spans.iter()).map(|s|s.content.as_ref()).collect::<Vec<_>>().join("\n")}
+    fn plain(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
     #[cfg(feature = "workspace")]
     #[test]
-    fn full_and_embedded_headers_share_resources_but_only_full_has_outer_product_help(){
-        let ui=aw::config::UiConfig::default();
-        let mut resources=super::super::agent_resources::LoadedResourceSummary::with_system_prompt(super::super::agent_resources::SystemPromptOrigin::BuiltIn,128);
-        resources.add_instruction_file("./AGENTS.md",42);
-        let h=AgentHeader::from_resources(&resources);
-        let full=plain(&header_lines(&h,HeaderMode::Full,&ui));let embedded=plain(&header_lines(&h,HeaderMode::Embedded,&ui));
-        for token in ["[Context]", "system prompt · built-in · 128 B", "instructions · ./AGENTS.md · 42 B"] {
+    fn full_and_embedded_headers_share_resources_but_only_full_has_outer_product_help() {
+        let ui = aw::config::UiConfig::default();
+        let mut resources =
+            super::super::agent_resources::LoadedResourceSummary::with_system_prompt(
+                super::super::agent_resources::SystemPromptOrigin::BuiltIn,
+                128,
+            );
+        resources.add_instruction_file("./AGENTS.md", 42);
+        let h = AgentHeader::from_resources(&resources);
+        let full = plain(&header_lines(&h, HeaderMode::Full, &ui));
+        let embedded = plain(&header_lines(&h, HeaderMode::Embedded, &ui));
+        for token in [
+            "[Context]",
+            "system prompt · built-in · 128 B",
+            "instructions · ./AGENTS.md · 42 B",
+        ] {
             assert!(full.contains(token));
             assert!(embedded.contains(token));
         }
         assert!(full.contains("[Skills]") && full.contains("none loaded"));
         assert!(!embedded.contains("[Skills]") && !embedded.contains("none loaded"));
-        assert!(full.contains("F1 palette"));assert!(!full.contains("F1 help"));
-        assert!(full.contains("aw v"));assert!(full.contains("/ commands"));assert!(!embedded.contains("aw v"));assert!(!embedded.contains("/ commands"));
+        assert!(full.contains("F1 palette"));
+        assert!(!full.contains("F1 help"));
+        assert!(full.contains("aw v"));
+        assert!(full.contains("/ commands"));
+        assert!(!embedded.contains("aw v"));
+        assert!(!embedded.contains("/ commands"));
     }
 
     #[test]
@@ -440,7 +658,9 @@ mod tests {
         let mut resources = super::super::agent_resources::LoadedResourceSummary::default();
         resources.add_skill("review", "./SKILL.md", 100);
         let skills_only = plain(&header_lines(
-            &AgentHeader::from_resources(&resources), HeaderMode::Embedded, &ui,
+            &AgentHeader::from_resources(&resources),
+            HeaderMode::Embedded,
+            &ui,
         ));
         assert!(!skills_only.contains("[Context]"));
         assert!(skills_only.contains("[Skills]"));
@@ -448,7 +668,9 @@ mod tests {
 
         resources.add_instruction_file("./AGENTS.md", 42);
         let both = plain(&header_lines(
-            &AgentHeader::from_resources(&resources), HeaderMode::Embedded, &ui,
+            &AgentHeader::from_resources(&resources),
+            HeaderMode::Embedded,
+            &ui,
         ));
         assert!(both.contains("[Context]") && both.contains("[Skills]"));
         assert!(both.contains("./AGENTS.md"));
@@ -474,7 +696,11 @@ mod tests {
             make("denied", ToolStatus::Denied, None),
             make("interrupted", ToolStatus::Interrupted, None),
             make("failure", ToolStatus::Failed, None),
-            make("inconsistent", ToolStatus::Succeeded, Some(ToolOutput::error("not a success"))),
+            make(
+                "inconsistent",
+                ToolStatus::Succeeded,
+                Some(ToolOutput::error("not a success")),
+            ),
         ];
         for mode in [
             aw::config::ThemeMode::System,
@@ -485,11 +711,17 @@ mod tests {
                 theme: mode,
                 ..aw::config::UiConfig::default()
             };
-            let view = LiveProjection { answer: "", tools: &records };
+            let view = LiveProjection {
+                answer: "",
+                tools: &records,
+            };
             let full = plain(&live_lines(&view, &ui, 80));
             for label in [
-                "inflight · running", "finished · succeeded", "denied · denied",
-                "interrupted · interrupted", "failure · failed",
+                "inflight · running",
+                "finished · succeeded",
+                "denied · denied",
+                "interrupted · interrupted",
+                "failure · failed",
                 "inconsistent · failed",
             ] {
                 assert!(full.contains(label), "missing factual status: {label}");
@@ -519,11 +751,22 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.starts_with("hello"));
-        assert!(!text.starts_with(' '), "padding=0 must not invent a horizontal inset");
+        assert!(
+            !text.starts_with(' '),
+            "padding=0 must not invent a horizontal inset"
+        );
         assert!(!text.contains('›'));
-        assert!(lines.iter().all(|line| line.style.bg == Some(palette.user_prompt_background)));
-        assert!(lines[0].spans.iter().all(|span| span.content.trim().is_empty()));
-        assert!(lines[2].spans.iter().all(|span| span.content.trim().is_empty()));
+        assert!(lines
+            .iter()
+            .all(|line| line.style.bg == Some(palette.user_prompt_background)));
+        assert!(lines[0]
+            .spans
+            .iter()
+            .all(|span| span.content.trim().is_empty()));
+        assert!(lines[2]
+            .spans
+            .iter()
+            .all(|span| span.content.trim().is_empty()));
     }
 
     #[test]

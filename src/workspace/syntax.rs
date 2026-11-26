@@ -10,11 +10,7 @@ use ratatui::{
 };
 
 #[cfg(test)]
-pub fn highlight(
-    path: &str,
-    text: &str,
-    theme_mode: ThemeMode,
-) -> Option<Vec<Line<'static>>> {
+pub fn highlight(path: &str, text: &str, theme_mode: ThemeMode) -> Option<Vec<Line<'static>>> {
     crate::tui::syntax::highlight_path(path, text, theme_mode)
 }
 
@@ -92,7 +88,9 @@ pub fn highlight_diff_progressive(
             let mut out = Vec::with_capacity(highlighted.len());
             for (offset, code_line) in highlighted.into_iter().enumerate() {
                 let index = start + offset;
-                let Some(review_line) = lines.get(index) else { break };
+                let Some(review_line) = lines.get(index) else {
+                    break;
+                };
                 if !matches!(
                     review_line.kind,
                     aw_git::LineKind::Added | aw_git::LineKind::Removed | aw_git::LineKind::Context
@@ -204,7 +202,12 @@ mod tests {
 
     #[test]
     fn rust_file_gets_highlighted_without_ansi_or_background_escape_sequences() {
-        let lines = highlight("src/lib.rs", "pub fn bird() -> usize { 1 }", ThemeMode::Dark).unwrap();
+        let lines = highlight(
+            "src/lib.rs",
+            "pub fn bird() -> usize { 1 }",
+            ThemeMode::Dark,
+        )
+        .unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.len() > 1);
         assert!(lines[0]
@@ -215,10 +218,18 @@ mod tests {
 
     #[test]
     fn explicit_light_and_dark_use_distinct_syntect_palettes() {
-        let light = highlight("src/lib.rs", "pub fn bird() -> usize { 1 }", ThemeMode::Light)
-            .unwrap();
-        let dark = highlight("src/lib.rs", "pub fn bird() -> usize { 1 }", ThemeMode::Dark)
-            .unwrap();
+        let light = highlight(
+            "src/lib.rs",
+            "pub fn bird() -> usize { 1 }",
+            ThemeMode::Light,
+        )
+        .unwrap();
+        let dark = highlight(
+            "src/lib.rs",
+            "pub fn bird() -> usize { 1 }",
+            ThemeMode::Dark,
+        )
+        .unwrap();
         assert_ne!(light[0].spans[0].style.fg, dark[0].spans[0].style.fg);
     }
 
@@ -271,8 +282,14 @@ mod tests {
         assert_eq!(highlighted.len(), 2);
         assert!(highlighted[0].spans.len() > 2);
         assert!(highlighted[1].spans.len() > 2);
-        assert!(highlighted[0].spans.iter().any(|span| span.style.bg.is_some()));
-        assert!(highlighted[1].spans.iter().any(|span| span.style.bg.is_some()));
+        assert!(highlighted[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some()));
+        assert!(highlighted[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some()));
     }
 
     #[test]
@@ -289,12 +306,7 @@ mod tests {
             ThemeMode::Dark
         )
         .is_some());
-        assert!(highlight(
-            "flake.lock",
-            "{\"nodes\":{\"root\":{}}}",
-            ThemeMode::Dark
-        )
-        .is_some());
+        assert!(highlight("flake.lock", "{\"nodes\":{\"root\":{}}}", ThemeMode::Dark).is_some());
     }
 
     #[test]

@@ -260,7 +260,11 @@ pub fn palette(mode: ThemeMode) -> Palette {
 /// instead of emitting unsupported 24-bit escape sequences. TestBackend and
 /// noninteractive output retain exact RGB for reproducible visual fixtures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColorDepth { Ansi16, Ansi256, TrueColor }
+enum ColorDepth {
+    Ansi16,
+    Ansi256,
+    TrueColor,
+}
 
 fn terminal_depth() -> ColorDepth {
     if let Ok(override_depth) = std::env::var("AW_UI_COLOR_DEPTH") {
@@ -274,10 +278,16 @@ fn terminal_depth() -> ColorDepth {
     if !std::io::stdout().is_terminal() {
         return ColorDepth::TrueColor;
     }
-    let color_term = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
-    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let color_term = std::env::var("COLORTERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if matches!(color_term.as_str(), "truecolor" | "24bit")
-        || term.contains("direct") || term.contains("truecolor") {
+        || term.contains("direct")
+        || term.contains("truecolor")
+    {
         ColorDepth::TrueColor
     } else if term.contains("256color") {
         ColorDepth::Ansi256
@@ -287,35 +297,53 @@ fn terminal_depth() -> ColorDepth {
 }
 
 fn limited_color(value: Color, depth: ColorDepth) -> Color {
-    let Color::Rgb(r, g, b) = value else { return value };
+    let Color::Rgb(r, g, b) = value else {
+        return value;
+    };
     match depth {
         ColorDepth::TrueColor => value,
         ColorDepth::Ansi256 => {
             let cube = |channel: u8| -> u8 {
-                if channel < 48 { 0 } else if channel < 115 { 1 }
-                else { ((u16::from(channel) - 35) / 40).min(5) as u8 }
+                if channel < 48 {
+                    0
+                } else if channel < 115 {
+                    1
+                } else {
+                    ((u16::from(channel) - 35) / 40).min(5) as u8
+                }
             };
             Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
         }
         ColorDepth::Ansi16 => {
-            const CANDIDATES: [(u8,u8,u8,Color);16] = [
-                (0,0,0,Color::Black), (170,0,0,Color::Red),
-                (0,170,0,Color::Green), (170,85,0,Color::Yellow),
-                (0,0,170,Color::Blue), (170,0,170,Color::Magenta),
-                (0,170,170,Color::Cyan), (170,170,170,Color::Gray),
-                (85,85,85,Color::DarkGray), (255,85,85,Color::LightRed),
-                (85,255,85,Color::LightGreen), (255,255,85,Color::LightYellow),
-                (85,85,255,Color::LightBlue), (255,85,255,Color::LightMagenta),
-                (85,255,255,Color::LightCyan), (255,255,255,Color::White),
+            const CANDIDATES: [(u8, u8, u8, Color); 16] = [
+                (0, 0, 0, Color::Black),
+                (170, 0, 0, Color::Red),
+                (0, 170, 0, Color::Green),
+                (170, 85, 0, Color::Yellow),
+                (0, 0, 170, Color::Blue),
+                (170, 0, 170, Color::Magenta),
+                (0, 170, 170, Color::Cyan),
+                (170, 170, 170, Color::Gray),
+                (85, 85, 85, Color::DarkGray),
+                (255, 85, 85, Color::LightRed),
+                (85, 255, 85, Color::LightGreen),
+                (255, 255, 85, Color::LightYellow),
+                (85, 85, 255, Color::LightBlue),
+                (255, 85, 255, Color::LightMagenta),
+                (85, 255, 255, Color::LightCyan),
+                (255, 255, 255, Color::White),
             ];
-            let distance = |v: (u8,u8,u8,Color)| {
+            let distance = |v: (u8, u8, u8, Color)| {
                 let dr = i32::from(r) - i32::from(v.0);
                 let dg = i32::from(g) - i32::from(v.1);
                 let db = i32::from(b) - i32::from(v.2);
-                2*dr*dr + 4*dg*dg + 3*db*db
+                2 * dr * dr + 4 * dg * dg + 3 * db * db
             };
-            CANDIDATES.iter().min_by_key(|candidate| distance(**candidate))
-                .expect("fixed palette has 16 colors").3
+            CANDIDATES
+                .iter()
+                .min_by_key(|candidate| distance(**candidate))
+                .expect("fixed palette has 16 colors")
+                .3
         }
     }
 }
@@ -363,14 +391,22 @@ impl Palette {
             projected.faint = projected.muted;
             // Never collapse success and failure into one nearest-gray ANSI
             // code. Factual status words remain the primary distinction.
-            projected.tool_foreground = if dark { Color::LightGreen } else { Color::Green };
+            projected.tool_foreground = if dark {
+                Color::LightGreen
+            } else {
+                Color::Green
+            };
             projected.tool_error_foreground = if dark { Color::LightRed } else { Color::Red };
             projected.tool_neutral_foreground = projected.muted;
             #[cfg(feature = "workspace")]
             {
                 projected.success = projected.tool_foreground;
                 projected.danger = projected.tool_error_foreground;
-                projected.warning = if dark { Color::LightYellow } else { Color::Yellow };
+                projected.warning = if dark {
+                    Color::LightYellow
+                } else {
+                    Color::Yellow
+                };
             }
         }
         projected
@@ -473,26 +509,39 @@ mod tests {
             assert!(matches!(indexed.background, Color::Indexed(16..=231)));
             assert_ne!(indexed.foreground, indexed.background);
             let basic = rgb.limited(ColorDepth::Ansi16, mode);
-            assert_eq!(basic.foreground, if mode == ThemeMode::Dark {
-                Color::White
-            } else {
-                Color::Black
-            });
-            assert_eq!(basic.background, if mode == ThemeMode::Dark {
-                Color::Black
-            } else {
-                Color::White
-            });
+            assert_eq!(
+                basic.foreground,
+                if mode == ThemeMode::Dark {
+                    Color::White
+                } else {
+                    Color::Black
+                }
+            );
+            assert_eq!(
+                basic.background,
+                if mode == ThemeMode::Dark {
+                    Color::Black
+                } else {
+                    Color::White
+                }
+            );
             assert_ne!(basic.tool_foreground, basic.tool_error_foreground);
         }
         let system = palette(ThemeMode::System);
-        for depth in [ColorDepth::Ansi16, ColorDepth::Ansi256, ColorDepth::TrueColor] {
+        for depth in [
+            ColorDepth::Ansi16,
+            ColorDepth::Ansi256,
+            ColorDepth::TrueColor,
+        ] {
             let selected = system.limited(depth, ThemeMode::System);
             assert_eq!(selected.foreground, Color::Reset);
             assert_eq!(selected.background, Color::Reset);
             assert_eq!(selected.user_prompt_background, Color::Blue);
         }
-        assert_eq!(limited_color(Color::Reset, ColorDepth::Ansi16), Color::Reset);
+        assert_eq!(
+            limited_color(Color::Reset, ColorDepth::Ansi16),
+            Color::Reset
+        );
     }
 
     #[test]

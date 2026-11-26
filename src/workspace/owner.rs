@@ -83,7 +83,7 @@ pub struct Snapshot {
     pub activity: VecDeque<String>,
     /// P6-8C opt-in factual, ephemeral v2 UI-only EventRail, never Agent
     /// messages, paid receipts, or a second durable Session event log.
-    pub event_rail:Option<aw_ui_extension::status_events::EventRail>,
+    pub event_rail: Option<aw_ui_extension::status_events::EventRail>,
     pub sessions: Vec<SavedSession>,
     pub subagents: Vec<SavedSubagent>,
     pub delegation_budget: Option<SavedDelegationBudget>,
@@ -140,7 +140,7 @@ impl Snapshot {
             rejected_prompt: String::new(),
             rejected_revision: 0,
             activity: VecDeque::new(),
-            event_rail:None,
+            event_rail: None,
             sessions: vec![],
             subagents: vec![],
             delegation_budget: None,
@@ -208,7 +208,10 @@ pub enum Command {
     Switch(String),
     New,
     Title(String),
-    SetSessionsArchived { sessions: Vec<String>, archived: bool },
+    SetSessionsArchived {
+        sessions: Vec<String>,
+        archived: bool,
+    },
     Fork {
         name: String,
         at: Option<String>,
@@ -610,15 +613,17 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
                 .clone()
                 .ok_or(Error::Storage("prompt cancellation token missing"))?;
             let events = view.clone();
-            let event_enabled=host.file_config.ui.show_event_notices;
-            let event_registry=crate::tui::extensions::event_registry(&host.file_config.ui);
+            let event_enabled = host.file_config.ui.show_event_notices;
+            let event_registry = crate::tui::extensions::event_registry(&host.file_config.ui);
             // Host::ensure has already selected/created the real Session.
             // A first-turn Snapshot can still have session=None until refresh;
             // use the ORIGINAL bound handle to avoid mislabeling/dropping the
             // first factual rail as a transient "memory" Session.
-            let event_session=host.persistent.as_ref()
-                .map(|p|p.handle.session_id().to_owned())
-                .unwrap_or_else(||"memory".into());
+            let event_session = host
+                .persistent
+                .as_ref()
+                .map(|p| p.handle.session_id().to_owned())
+                .unwrap_or_else(|| "memory".into());
             let turns_before = host.agent.as_ref().map_or(0, |a| a.turns().len());
             let recovery = prompt.clone();
             let first_delta = Arc::new(Mutex::new(None::<std::time::Duration>));
@@ -639,97 +644,117 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
                             move |event| {
                                 events.change(|s| {
                                     if event_enabled {
-                                        let session=event_session.clone();
-                                        if s.event_rail.as_ref().is_some_and(|r|r.session()!=session) {
-                                            s.event_rail=None;
+                                        let session = event_session.clone();
+                                        if s.event_rail
+                                            .as_ref()
+                                            .is_some_and(|r| r.session() != session)
+                                        {
+                                            s.event_rail = None;
                                         }
-                                        if s.event_rail.is_none(){
-                                            s.event_rail=aw_ui_extension::status_events::EventRail::new(&session).ok();
+                                        if s.event_rail.is_none() {
+                                            s.event_rail =
+                                                aw_ui_extension::status_events::EventRail::new(
+                                                    &session,
+                                                )
+                                                .ok();
                                         }
-                                        let ctx=aw_ui_extension::Context{
-                                            model:s.model.clone(),profile:s.profile.clone(),
-                                            provider:s.provider.clone(),effort:s.effort.clone(),
-                                            directory:s.root.clone(),agent:s.session_title.clone().unwrap_or_default(),
-                                            branch:s.branch.clone(),tools:s.tools.clone(),session,
-                                            state:s.status.clone(),session_tps:s.session_tps,performance:None,
+                                        let ctx = aw_ui_extension::Context {
+                                            model: s.model.clone(),
+                                            profile: s.profile.clone(),
+                                            provider: s.provider.clone(),
+                                            effort: s.effort.clone(),
+                                            directory: s.root.clone(),
+                                            agent: s.session_title.clone().unwrap_or_default(),
+                                            branch: s.branch.clone(),
+                                            tools: s.tools.clone(),
+                                            session,
+                                            state: s.status.clone(),
+                                            session_tps: s.session_tps,
+                                            performance: None,
                                         };
-                                        if let Some(rail)=&mut s.event_rail {
-                                            if let Some(seq)=rail.last_sequence().checked_add(1) {
-                                                let facts=aw::extension_status::factual_event_contexts(event,&ctx,seq);
+                                        if let Some(rail) = &mut s.event_rail {
+                                            if let Some(seq) = rail.last_sequence().checked_add(1) {
+                                                let facts =
+                                                    aw::extension_status::factual_event_contexts(
+                                                        event, &ctx, seq,
+                                                    );
                                                 for fact in facts {
                                                     // Presentation errors MUST NOT change the original
                                                     // paid/effect/Turn outcome or replay the event.
-                                                    let _=rail.publish(&event_registry,&fact);
+                                                    let _ = rail.publish(&event_registry, &fact);
                                                 }
                                             }
                                         }
                                     }
                                     match event {
-                                    AgentEvent::Started { turn_id, model, .. } => {
-                                        s.thinking = true;
-                                        s.status = format!("Running turn {turn_id}");
-                                        s.activity(format!("turn {turn_id} started / {model}"));
-                                    }
-                                    AgentEvent::Delta { text, .. } => {
-                                        s.thinking = false;
-                                        let mut first = first_delta_events
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
-                                        if first.is_none() {
-                                            *first = Some(started.elapsed());
+                                        AgentEvent::Started { turn_id, model, .. } => {
+                                            s.thinking = true;
+                                            s.status = format!("Running turn {turn_id}");
+                                            s.activity(format!("turn {turn_id} started / {model}"));
                                         }
-                                        if s.live.len().saturating_add(text.len())
-                                            <= aw::config::MAX_OUTPUT_BYTES
-                                        {
-                                            s.live.push_str(text);
+                                        AgentEvent::Delta { text, .. } => {
+                                            s.thinking = false;
+                                            let mut first = first_delta_events
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            if first.is_none() {
+                                                *first = Some(started.elapsed());
+                                            }
+                                            if s.live.len().saturating_add(text.len())
+                                                <= aw::config::MAX_OUTPUT_BYTES
+                                            {
+                                                s.live.push_str(text);
+                                            }
                                         }
-                                    }
-                                    AgentEvent::ToolStarted { record, .. } => {
-                                        s.thinking = false;
-                                        s.status = format!("Tool {} running", record.call.name);
-                                        if let Some(existing) = s
-                                            .live_tools
-                                            .iter_mut()
-                                            .find(|item| item.call.id == record.call.id)
-                                        {
-                                            *existing = record.clone();
-                                        } else if s.live_tools.len() < 32 {
-                                            s.live_tools.push(record.clone());
+                                        AgentEvent::ToolStarted { record, .. } => {
+                                            s.thinking = false;
+                                            s.status = format!("Tool {} running", record.call.name);
+                                            if let Some(existing) = s
+                                                .live_tools
+                                                .iter_mut()
+                                                .find(|item| item.call.id == record.call.id)
+                                            {
+                                                *existing = record.clone();
+                                            } else if s.live_tools.len() < 32 {
+                                                s.live_tools.push(record.clone());
+                                            }
+                                            s.activity(format!(
+                                                "tool {} started on {}",
+                                                record.call.name, record.execution_site
+                                            ));
                                         }
-                                        s.activity(format!(
-                                            "tool {} started on {}",
-                                            record.call.name, record.execution_site
-                                        ));
-                                    }
-                                    AgentEvent::ToolFinished { record, .. } => {
-                                        s.thinking = false;
-                                        if let Some(existing) = s
-                                            .live_tools
-                                            .iter_mut()
-                                            .find(|item| item.call.id == record.call.id)
-                                        {
-                                            *existing = record.clone();
-                                        } else if s.live_tools.len() < 32 {
-                                            s.live_tools.push(record.clone());
+                                        AgentEvent::ToolFinished { record, .. } => {
+                                            s.thinking = false;
+                                            if let Some(existing) = s
+                                                .live_tools
+                                                .iter_mut()
+                                                .find(|item| item.call.id == record.call.id)
+                                            {
+                                                *existing = record.clone();
+                                            } else if s.live_tools.len() < 32 {
+                                                s.live_tools.push(record.clone());
+                                            }
+                                            s.activity(format!(
+                                                "tool {}: {:?}",
+                                                record.call.name, record.status
+                                            ));
                                         }
-                                        s.activity(format!(
-                                            "tool {}: {:?}",
-                                            record.call.name, record.status
-                                        ));
-                                    }
-                                    AgentEvent::InvocationFinished { record, .. } => {
-                                        s.thinking = false;
-                                        s.activity(format!(
-                                            "model invocation completed / {} / {}",
-                                            record.identity.actor.as_str(),
-                                            record.identity.account_id
-                                        ))
-                                    }
-                                    AgentEvent::Finished { turn } => {
-                                        s.thinking = false;
-                                        s.status = format!("Turn {}: {:?}", turn.id, turn.outcome)
-                                    }
-                                    AgentEvent::Rejected { message } => s.status = message.clone(),
+                                        AgentEvent::InvocationFinished { record, .. } => {
+                                            s.thinking = false;
+                                            s.activity(format!(
+                                                "model invocation completed / {} / {}",
+                                                record.identity.actor.as_str(),
+                                                record.identity.account_id
+                                            ))
+                                        }
+                                        AgentEvent::Finished { turn } => {
+                                            s.thinking = false;
+                                            s.status =
+                                                format!("Turn {}: {:?}", turn.id, turn.outcome)
+                                        }
+                                        AgentEvent::Rejected { message } => {
+                                            s.status = message.clone()
+                                        }
                                     }
                                 });
                                 Ok(())
@@ -881,7 +906,9 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
             let count = sessions.len();
             view.change(|s| {
                 s.status = match (archived, count) {
-                    (true, 1) => "Session archived for this user; durable history was retained".into(),
+                    (true, 1) => {
+                        "Session archived for this user; durable history was retained".into()
+                    }
                     (true, _) => format!(
                         "{count} Sessions archived for this user; durable history was retained"
                     ),
@@ -961,8 +988,7 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
             let prompt = format!(
                 "Answer this side question directly using the current conversation context. This answer is out-of-band and will not be added to Agent history. Do not call tools or claim to change workspace state.\n\n{question}"
             );
-            let answer =
-                host.auxiliary_inference(aw_agent_core::AuxiliaryKind::Side, &prompt)?;
+            let answer = host.auxiliary_inference(aw_agent_core::AuxiliaryKind::Side, &prompt)?;
             view.change(|s| {
                 s.auxiliary_output = Some(aw::presentation::safe_text(&answer));
                 s.status = "BTW answer completed · not added to Agent history".into();

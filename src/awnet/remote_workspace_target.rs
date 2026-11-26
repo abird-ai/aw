@@ -1,6 +1,9 @@
 use super::machinelink::{MachineCapability, MachineLinkConnectOptions};
 use super::reachability::{validate_room, PunchOptions};
-use super::{ensure_identity, MachineReadRequest, MachineServiceRequestOptions, RemoteViewReadOptions, RemoteWorkspaceRequest};
+use super::{
+    ensure_identity, MachineReadRequest, MachineServiceRequestOptions, RemoteViewReadOptions,
+    RemoteWorkspaceRequest,
+};
 use aw::{Error, PrincipalId, Result};
 use aw_store::{RemoteViewGrant, RemoteViewGrantState, RemoteViewPermission, SessionStore};
 use ed25519_dalek::SigningKey;
@@ -59,7 +62,10 @@ fn target_id() -> Result<String> {
         .map_err(|_| Error::Storage("OS randomness unavailable for remote Workspace target"))?;
     Ok(format!(
         "rwt_{}",
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     ))
 }
 
@@ -87,10 +93,14 @@ impl RemoteWorkspaceTargetAdmission {
     ) -> Result<String> {
         validate_room(&route.room)?;
         if grant.state != RemoteViewGrantState::Active || grant.expires_at <= now_micros() {
-            return Err(Error::Denied("remote Workspace grant is revoked or expired"));
+            return Err(Error::Denied(
+                "remote Workspace grant is revoked or expired",
+            ));
         }
         if grant.permissions.is_empty() {
-            return Err(Error::Denied("remote Workspace grant has no read permission"));
+            return Err(Error::Denied(
+                "remote Workspace grant has no read permission",
+            ));
         }
         if route.peer_node_id != grant.target_machine_node_id {
             return Err(Error::Denied(
@@ -200,9 +210,15 @@ impl RemoteWorkspaceTargetAdmission {
         .map(|_| ())
     }
 
-    pub fn request_options(&self, workspace: RemoteWorkspaceRequest) -> Result<MachineServiceRequestOptions> {
-        if self.grant.state != RemoteViewGrantState::Active || self.grant.expires_at <= now_micros() {
-            return Err(Error::Denied("remote Workspace grant is revoked or expired"));
+    pub fn request_options(
+        &self,
+        workspace: RemoteWorkspaceRequest,
+    ) -> Result<MachineServiceRequestOptions> {
+        if self.grant.state != RemoteViewGrantState::Active || self.grant.expires_at <= now_micros()
+        {
+            return Err(Error::Denied(
+                "remote Workspace grant is revoked or expired",
+            ));
         }
         let permission = workspace.permission();
         if !self.grant.permissions.contains(&permission) {
@@ -217,10 +233,7 @@ impl RemoteWorkspaceTargetAdmission {
         Ok(MachineServiceRequestOptions {
             link: MachineLinkConnectOptions {
                 route: self.route.clone(),
-                requested: BTreeSet::from([
-                    MachineCapability::IdentityAuthenticate,
-                    required,
-                ]),
+                requested: BTreeSet::from([MachineCapability::IdentityAuthenticate, required]),
                 lease: self.lease,
             },
             request: MachineReadRequest::RemoteWorkspace { workspace },
@@ -243,7 +256,10 @@ mod tests {
         fn new(name: &str) -> Self {
             let mut entropy = [0u8; 8];
             getrandom::fill(&mut entropy).unwrap();
-            let suffix = entropy.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let suffix = entropy
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let path = std::env::temp_dir().join(format!("aw-{name}-{suffix}"));
             fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -333,10 +349,7 @@ mod tests {
             device_binding_id: "p_remote_fixture".into(),
             device_id: "udev_remote_fixture".into(),
             device_public_key: public_key,
-            permissions: BTreeSet::from([
-                RemoteViewPermission::Files,
-                RemoteViewPermission::Git,
-            ]),
+            permissions: BTreeSet::from([RemoteViewPermission::Files, RemoteViewPermission::Git]),
             state: RemoteViewGrantState::Active,
             revision: 1,
             issued_at: now,
@@ -396,7 +409,10 @@ mod tests {
             .requested
             .contains(&MachineCapability::IdentityAuthenticate));
         assert!(options.link.requested.contains(&MachineCapability::GitRead));
-        assert!(!options.link.requested.contains(&MachineCapability::FileRead));
+        assert!(!options
+            .link
+            .requested
+            .contains(&MachineCapability::FileRead));
     }
 
     #[test]

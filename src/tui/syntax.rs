@@ -124,13 +124,12 @@ fn ratatui_style(style: syntect::highlighting::Style) -> Style {
     out
 }
 
-fn detect_path<'a>(
-    syntaxes: &'a SyntaxSet,
-    path: &str,
-    text: &str,
-) -> Option<&'a SyntaxReference> {
+fn detect_path<'a>(syntaxes: &'a SyntaxSet, path: &str, text: &str) -> Option<&'a SyntaxReference> {
     let path = Path::new(path);
-    let filename = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     if filename.eq_ignore_ascii_case("Cargo.lock") {
         return syntaxes.find_syntax_by_name("TOML");
     }
@@ -178,10 +177,7 @@ fn normalized_language(language: &str) -> Option<&str> {
     })
 }
 
-fn detect_language<'a>(
-    syntaxes: &'a SyntaxSet,
-    language: &str,
-) -> Option<&'a SyntaxReference> {
+fn detect_language<'a>(syntaxes: &'a SyntaxSet, language: &str) -> Option<&'a SyntaxReference> {
     let token = normalized_language(language)?;
     syntaxes
         .find_syntax_by_token(token)
@@ -226,10 +222,7 @@ fn highlight_with_progressive(
             Ok(regions) => regions
                 .into_iter()
                 .map(|(style, token)| {
-                    Span::styled(
-                        aw_workspace::editor::display(token),
-                        ratatui_style(style),
-                    )
+                    Span::styled(aw_workspace::editor::display(token), ratatui_style(style))
                 })
                 .collect::<Vec<_>>(),
             Err(_) => vec![Span::raw(aw_workspace::editor::display(line))],
@@ -265,11 +258,7 @@ pub fn highlight_path_progressive(
 }
 
 #[cfg(test)]
-pub fn highlight_path(
-    path: &str,
-    text: &str,
-    mode: ThemeMode,
-) -> Option<Vec<Line<'static>>> {
+pub fn highlight_path(path: &str, text: &str, mode: ThemeMode) -> Option<Vec<Line<'static>>> {
     let syntax = detect_path(syntax_set(), path, text)?;
     highlight_with(syntax, text, mode)
 }
@@ -294,7 +283,10 @@ mod tests {
         assert_eq!(detect_language(syntaxes, "rs").unwrap().name, "Rust");
         assert_eq!(detect_language(syntaxes, "python").unwrap().name, "Python");
         assert_eq!(detect_language(syntaxes, "py").unwrap().name, "Python");
-        assert_eq!(detect_language(syntaxes, "javascript").unwrap().name, "JavaScript");
+        assert_eq!(
+            detect_language(syntaxes, "javascript").unwrap().name,
+            "JavaScript"
+        );
         assert_eq!(detect_language(syntaxes, "js").unwrap().name, "JavaScript");
         assert!(detect_language(syntaxes, "typescript").is_some());
         assert!(detect_language(syntaxes, "ts").is_some());
@@ -331,7 +323,10 @@ mod tests {
                 true
             },
         ));
-        assert!(starts.len() >= 4, "large fixture should highlight progressively");
+        assert!(
+            starts.len() >= 4,
+            "large fixture should highlight progressively"
+        );
         assert_eq!(starts[0], 0);
         assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(rows, 300);

@@ -73,7 +73,11 @@ impl Viewport {
 
     pub fn page(&mut self, down: bool) {
         let step = self.height.saturating_sub(2).max(1);
-        self.scroll(if down { step as isize } else { -(step as isize) });
+        self.scroll(if down {
+            step as isize
+        } else {
+            -(step as isize)
+        });
     }
 
     pub fn home(&mut self) {

@@ -81,8 +81,9 @@ impl TerminalSession {
             .map_err(|_| Error::Storage("another native terminal presenter is already active"))?;
         ACTIVE_FLAGS.store(0, Ordering::Release);
         PRIMARY_EXIT_ROW.store(0, Ordering::Release);
-        *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) =
-            Some(std::thread::current().id());
+        *ACTIVE_THREAD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(std::thread::current().id());
         let mut guard = Self {
             owner,
             active: true,
@@ -197,18 +198,15 @@ fn keyboard_enhancement_allowed(
 
 fn restore_owner(owner: u64) {
     if ACTIVE_OWNER
-        .compare_exchange(
-            owner,
-            RESTORING_OWNER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
+        .compare_exchange(owner, RESTORING_OWNER, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return;
     }
     let flags = ACTIVE_FLAGS.swap(0, Ordering::AcqRel);
-    *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    *ACTIVE_THREAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     restore_flags(flags);
     ACTIVE_OWNER.store(0, Ordering::Release);
 }
@@ -270,26 +268,25 @@ pub(crate) fn emergency_restore() {
             continue;
         }
         if ACTIVE_OWNER
-            .compare_exchange(
-                owner,
-                RESTORING_OWNER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(owner, RESTORING_OWNER, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             break;
         }
     }
     let flags = ACTIVE_FLAGS.swap(0, Ordering::AcqRel);
-    *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    *ACTIVE_THREAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     restore_flags(flags);
     ACTIVE_OWNER.store(0, Ordering::Release);
 }
 
 fn restore_for_owner_thread_panic() {
     let current = std::thread::current().id();
-    let owner = *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner());
+    let owner = *ACTIVE_THREAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if owner == Some(current) {
         emergency_restore();
     }
@@ -367,7 +364,9 @@ mod tests {
         ACTIVE_OWNER.store(0, Ordering::Release);
         ACTIVE_FLAGS.store(0, Ordering::Release);
         PRIMARY_EXIT_ROW.store(0, Ordering::Release);
-        *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        *ACTIVE_THREAD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     #[test]
@@ -396,8 +395,9 @@ mod tests {
         let _guard = TERMINAL_GLOBALS.lock().unwrap();
         reset();
         ACTIVE_OWNER.store(41, Ordering::Release);
-        *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) =
-            Some(std::thread::current().id());
+        *ACTIVE_THREAD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(std::thread::current().id());
 
         std::thread::spawn(restore_for_owner_thread_panic)
             .join()
@@ -414,14 +414,17 @@ mod tests {
         let _guard = TERMINAL_GLOBALS.lock().unwrap();
         reset();
         ACTIVE_OWNER.store(41, Ordering::Release);
-        *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()) =
-            Some(std::thread::current().id());
+        *ACTIVE_THREAD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(std::thread::current().id());
 
         let result = catch_isolated_panic(|| panic!("caught background-style panic"));
         assert!(result.is_err());
         assert_eq!(ACTIVE_OWNER.load(Ordering::Acquire), 41);
         assert_eq!(
-            *ACTIVE_THREAD.lock().unwrap_or_else(|error| error.into_inner()),
+            *ACTIVE_THREAD
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
             Some(std::thread::current().id())
         );
         reset();

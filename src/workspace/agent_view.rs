@@ -64,11 +64,7 @@ pub(super) fn lines(
             answer: &snapshot.live,
             tools: &snapshot.live_tools,
         };
-        live_lines.extend(crate::tui::agent_chrome::live_lines(
-            &live,
-            ui,
-            inner_width,
-        ));
+        live_lines.extend(crate::tui::agent_chrome::live_lines(&live, ui, inner_width));
         crate::tui::agent_chrome::inset_lines(&mut live_lines, ui.workspace_output_padding);
         lines.extend(live_lines);
     }

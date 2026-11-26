@@ -108,9 +108,15 @@ impl Executor {
                 Err(Error::Conflict(match label {
                     "files" => "UI background queue full while loading files; retry explicitly",
                     "git" => "UI background queue full while loading Git data; retry explicitly",
-                    "syntax" => "UI background queue full while highlighting; plain text remains available",
-                    "terminal" => "UI background queue full while launching terminal; retry explicitly",
-                    "layout" => "UI background queue full while saving/loading layout; retry explicitly",
+                    "syntax" => {
+                        "UI background queue full while highlighting; plain text remains available"
+                    }
+                    "terminal" => {
+                        "UI background queue full while launching terminal; retry explicitly"
+                    }
+                    "layout" => {
+                        "UI background queue full while saving/loading layout; retry explicitly"
+                    }
                     "find" => "UI background queue full while searching view; retry explicitly",
                     _ => "UI background queue full; retry explicitly",
                 }))
@@ -179,12 +185,18 @@ mod tests {
         let executor = Executor::with_limits(1, 1).unwrap();
         let (gate_tx, gate_rx) = channel::sync_channel::<()>(0);
         executor
-            .try_submit("test", move || { let _ = gate_rx.recv(); })
+            .try_submit("test", move || {
+                let _ = gate_rx.recv();
+            })
             .unwrap();
         // Give the worker a chance to consume the first task, then occupy queue.
         std::thread::sleep(Duration::from_millis(20));
         let (done_tx, _done_rx) = channel::channel::<()>();
-        executor.try_submit("test", move || { let _ = done_tx.send(()); }).unwrap();
+        executor
+            .try_submit("test", move || {
+                let _ = done_tx.send(());
+            })
+            .unwrap();
         let start = std::time::Instant::now();
         let error = executor.try_submit("test", || {}).unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(50));

@@ -71,16 +71,22 @@ impl Pool {
     }
     #[cfg(target_os = "linux")]
     pub fn begin_migration(&self, id: &str) -> aw::Result<super::terminal_control::Migration> {
-        self.control.begin_migration(self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?)
+        self.control.begin_migration(
+            self.get(id)
+                .ok_or(aw::Error::Denied("unknown retained PTY"))?,
+        )
     }
     #[cfg(target_os = "linux")]
     pub fn adopt(&self, escrow: aw_terminal::Adoption) -> aw::Result<String> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if self.control.is_shutdown() || !inner.terminals.is_empty() || inner.starting != 0 {
-            return Err(aw::Error::Denied("adoption requires an empty live broker pool"));
+            return Err(aw::Error::Denied(
+                "adoption requires an empty live broker pool",
+            ));
         }
         let tick = self.tick.clone();
-        let terminal = escrow.activate(move || tick.send_modify(|n| *n = n.wrapping_add(1)))
+        let terminal = escrow
+            .activate(move || tick.send_modify(|n| *n = n.wrapping_add(1)))
             .map_err(|error| aw::Error::Config(error.to_string()))?;
         let id = terminal.id.clone();
         self.control.register(&id)?;
@@ -98,25 +104,34 @@ impl Pool {
     /// A human-approved invitation transfers only this exact terminal's
     /// input/size controller. Snapshot reads stay tied to the original Pool.
     pub fn prepare_dock(&self, id: &str) -> aw::Result<Invitation> {
-        let terminal = self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?;
+        let terminal = self
+            .get(id)
+            .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         let invite = self.control.invite(id, &terminal)?;
-        self.tick.send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.tick
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(invite)
     }
     pub fn cancel_dock(&self, id: &str) -> aw::Result<()> {
         self.control.cancel(id)?;
-        self.tick.send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.tick
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
     }
     pub fn accept_dock(&self, id: &str, ticket: &str) -> aw::Result<Lease> {
-        let terminal = self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?;
+        let terminal = self
+            .get(id)
+            .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         let mut accepted = self.control.accept(id, ticket, &terminal)?;
         let tick = self.tick.clone();
         accepted.on_drop(move || tick.send_modify(|revision| *revision = revision.wrapping_add(1)));
-        self.tick.send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.tick
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(accepted)
     }
-    pub fn is_shutting_down(&self) -> bool { self.control.is_shutdown() }
+    pub fn is_shutting_down(&self) -> bool {
+        self.control.is_shutdown()
+    }
     pub fn has_invitation(&self, id: &str, ticket: &str) -> bool {
         self.control.has_offer(id, ticket)
     }
@@ -125,34 +140,49 @@ impl Pool {
         self.control.mode(id, &terminal)
     }
     pub fn input_local(&self, id: &str, bytes: Vec<u8>) -> aw::Result<()> {
-        let terminal = self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?;
+        let terminal = self
+            .get(id)
+            .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         self.control.local(id, &terminal, || terminal.input(bytes))
     }
     pub fn resize_local(&self, id: &str, rows: u16, cols: u16) -> aw::Result<()> {
-        let terminal = self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?;
-        self.control.local(id, &terminal, || terminal.resize(rows, cols))
+        let terminal = self
+            .get(id)
+            .ok_or(aw::Error::Denied("unknown retained PTY"))?;
+        self.control
+            .local(id, &terminal, || terminal.resize(rows, cols))
     }
     pub fn terminate_local(&self, id: &str) -> aw::Result<()> {
-        let terminal = self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?;
+        let terminal = self
+            .get(id)
+            .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         self.control.local(id, &terminal, || {
             terminal.terminate();
             Ok(())
         })
     }
     pub fn input_docked(&self, lease: &Lease, bytes: Vec<u8>) -> aw::Result<()> {
-        let terminal = self.get(lease.terminal_id())
+        let terminal = self
+            .get(lease.terminal_id())
             .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         self.control.docked(lease, || terminal.input(bytes))
     }
     pub fn resize_docked(&self, lease: &Lease, rows: u16, cols: u16) -> aw::Result<()> {
-        let terminal = self.get(lease.terminal_id())
+        let terminal = self
+            .get(lease.terminal_id())
             .ok_or(aw::Error::Denied("unknown retained PTY"))?;
         self.control.docked(lease, || terminal.resize(rows, cols))
     }
-    pub fn snapshot_docked(&self, lease: &Lease, scrollback: usize) -> aw::Result<aw_terminal::Snapshot> {
-        let terminal = self.get(lease.terminal_id())
+    pub fn snapshot_docked(
+        &self,
+        lease: &Lease,
+        scrollback: usize,
+    ) -> aw::Result<aw_terminal::Snapshot> {
+        let terminal = self
+            .get(lease.terminal_id())
             .ok_or(aw::Error::Denied("unknown retained PTY"))?;
-        self.control.docked(lease, || Ok(terminal.snapshot(scrollback)))
+        self.control
+            .docked(lease, || Ok(terminal.snapshot(scrollback)))
     }
 
     pub fn all(&self) -> Vec<Arc<Terminal>> {
@@ -178,11 +208,18 @@ impl Pool {
         if matches!(terminal.status(), Status::Running | Status::Stopping) {
             return Err(aw::Error::Denied("stop the terminal before forgetting it"));
         }
-        let forgettable = matches!(self.control.mode(id, terminal), Some(Mode::Local | Mode::Offered));
+        let forgettable = matches!(
+            self.control.mode(id, terminal),
+            Some(Mode::Local | Mode::Offered)
+        );
         #[cfg(target_os = "linux")]
-        let forgettable = forgettable || (terminal.status() == Status::Released
-            && matches!(terminal.source_release(), aw_terminal::SourceRelease::Released(_))
-            && self.control.mode(id, terminal) == Some(Mode::Migrating));
+        let forgettable = forgettable
+            || (terminal.status() == Status::Released
+                && matches!(
+                    terminal.source_release(),
+                    aw_terminal::SourceRelease::Released(_)
+                )
+                && self.control.mode(id, terminal) == Some(Mode::Migrating));
         if !forgettable {
             return Err(aw::Error::Denied(
                 "detach the other native terminal before forgetting this PTY",
@@ -254,7 +291,10 @@ pub fn draw(
     controller: Option<Mode>,
 ) {
     if area.width < 4 || area.height < 3 {
-        frame.render_widget(Paragraph::new("Enlarge terminal view; existing PTY size retained"), area);
+        frame.render_widget(
+            Paragraph::new("Enlarge terminal view; existing PTY size retained"),
+            area,
+        );
         return;
     }
     let snapshot = terminal.snapshot(scrollback);
@@ -263,7 +303,12 @@ pub fn draw(
 
 /// Exact same VT100 cell projection in the independently attached native
 /// terminal. This renderer never holds or creates a child shell.
-pub fn draw_snapshot(frame: &mut Frame<'_>, area: Rect, snapshot: &aw_terminal::Snapshot, focused: bool) {
+pub fn draw_snapshot(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &aw_terminal::Snapshot,
+    focused: bool,
+) {
     render_snapshot(frame, area, snapshot, focused, Some(Mode::Docked), true);
 }
 fn render_snapshot(
@@ -275,7 +320,10 @@ fn render_snapshot(
     remote: bool,
 ) {
     if area.width < 4 || area.height < 3 {
-        frame.render_widget(Paragraph::new("Enlarge the receiving terminal; PTY size retained"), area);
+        frame.render_widget(
+            Paragraph::new("Enlarge the receiving terminal; PTY size retained"),
+            area,
+        );
         return;
     }
     let body = Rect {
@@ -345,7 +393,11 @@ fn render_snapshot(
         format!(
             "{:?} · {path} · UNSANDBOXED · P p commands{}{}",
             snapshot.status,
-            if snapshot.scrollback > 0 { " · scrollback" } else { "" },
+            if snapshot.scrollback > 0 {
+                " · scrollback"
+            } else {
+                ""
+            },
             controller_label,
         )
     };
@@ -406,17 +458,24 @@ mod tests {
         getrandom::fill(&mut suffix).expect("synthetic terminal identity entropy");
         let root = std::env::temp_dir().join(format!(
             "aw-native-pty-test-{}",
-            suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            suffix
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         ));
         std::fs::create_dir(&root).unwrap();
         let pool = Pool::new();
-        let id = pool.launch(root.clone(), bash, "synthetic_actor".into()).unwrap();
+        let id = pool
+            .launch(root.clone(), bash, "synthetic_actor".into())
+            .unwrap();
         (pool, id, root)
     }
     #[cfg(unix)]
     pub(super) fn wait_local(pool: &Pool, id: &str) {
         for _ in 0..120 {
-            if pool.dock_mode(id) == Some(Mode::Local) { return; }
+            if pool.dock_mode(id) == Some(Mode::Local) {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("original terminal controller did not settle");
@@ -435,35 +494,51 @@ mod tests {
         assert_eq!(invitation.ticket.len(), 64);
         assert_eq!(pool.dock_mode(&id), Some(Mode::Offered));
         assert!(
-            pool.input_local(&id, b"echo LOCAL_BEFORE_DOCK\n".to_vec()).is_ok(),
+            pool.input_local(&id, b"echo LOCAL_BEFORE_DOCK\n".to_vec())
+                .is_ok(),
             "invitation alone does not move PTY ownership"
         );
         assert!(pool.accept_dock(&id, "f".repeat(64).as_str()).is_err());
         for _ in 0..120 {
-            if original.snapshot(0).pending_input == 0 { break; }
+            if original.snapshot(0).pending_input == 0 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(15));
         }
         let lease = pool.accept_dock(&id, &invitation.ticket).unwrap();
         assert_eq!(lease.terminal_id(), id);
         assert_eq!(pool.dock_mode(&id), Some(Mode::Docked));
-        assert!(pool.input_local(&id, b"echo ILLEGAL_SOURCE\n".to_vec()).is_err());
+        assert!(pool
+            .input_local(&id, b"echo ILLEGAL_SOURCE\n".to_vec())
+            .is_err());
         assert!(pool.resize_local(&id, 40, 100).is_err());
         assert!(pool.terminate_local(&id).is_err());
         assert!(pool.accept_dock(&id, &invitation.ticket).is_err());
         assert!(pool.prepare_dock(&id).is_err());
         assert_eq!(pool.snapshot_docked(&lease, 0).unwrap().id, initial.id);
         assert!(std::sync::Arc::ptr_eq(&original, &pool.get(&id).unwrap()));
-        pool.input_docked(&lease, b"echo ORIGINAL_PTY_DOCKED\n".to_vec()).unwrap();
+        pool.input_docked(&lease, b"echo ORIGINAL_PTY_DOCKED\n".to_vec())
+            .unwrap();
         for _ in 0..120 {
-            if original.snapshot(0).pending_input == 0 { break; }
+            if original.snapshot(0).pending_input == 0 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(15));
         }
         drop(lease);
         wait_local(&pool, &id);
-        assert!(pool.input_local(&id, b"echo ORIGINAL_PTY_RESTORED\n".to_vec()).is_ok());
-        assert_eq!(pool.get(&id).unwrap().id, initial.id, "no new shell created");
+        assert!(pool
+            .input_local(&id, b"echo ORIGINAL_PTY_RESTORED\n".to_vec())
+            .is_ok());
+        assert_eq!(
+            pool.get(&id).unwrap().id,
+            initial.id,
+            "no new shell created"
+        );
         pool.shutdown();
-        assert!(pool.input_local(&id, b"echo NOT_AUTHORIZED\n".to_vec()).is_err());
+        assert!(pool
+            .input_local(&id, b"echo NOT_AUTHORIZED\n".to_vec())
+            .is_err());
         drop(pool);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -530,7 +605,10 @@ mod tests {
     fn revoked_old_native_invitation_cannot_replace_new_generation() {
         let (pool, id, root) = fixture();
         let original = pool.prepare_dock(&id).unwrap();
-        assert!(pool.prepare_dock(&id).is_err(), "one pending invitation per PTY");
+        assert!(
+            pool.prepare_dock(&id).is_err(),
+            "one pending invitation per PTY"
+        );
         pool.cancel_dock(&id).unwrap();
         assert!(pool.accept_dock(&id, &original.ticket).is_err());
         let fresh = pool.prepare_dock(&id).unwrap();

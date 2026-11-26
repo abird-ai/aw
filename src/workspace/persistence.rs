@@ -211,7 +211,10 @@ mod tests {
             (3, 4),
             (4, 3),
         ] {
-            let workspace = Workspace { version: inner, ..Workspace::default() };
+            let workspace = Workspace {
+                version: inner,
+                ..Workspace::default()
+            };
             let bytes = write_saved(&f, &d, outer, workspace);
             assert!(
                 load(&f, &d, &ScopeId::launch()).is_err(),
@@ -221,7 +224,10 @@ mod tests {
         }
         save(&f, &d, &Workspace::default()).unwrap();
         let original = std::fs::read(&f).unwrap();
-        let legacy = Workspace { version: 1, ..Workspace::default() };
+        let legacy = Workspace {
+            version: 1,
+            ..Workspace::default()
+        };
         assert!(save(&f, &d, &legacy).is_err());
         assert_eq!(std::fs::read(&f).unwrap(), original);
         std::fs::remove_dir_all(d).unwrap();
@@ -232,7 +238,10 @@ mod tests {
     fn v1_new_targets_and_invalid_migrated_graph_are_rejected() {
         let d = directory();
         let f = d.join("view.json");
-        let mut legacy = Workspace { version: 1, ..Workspace::default() };
+        let mut legacy = Workspace {
+            version: 1,
+            ..Workspace::default()
+        };
         legacy.tabs.get_mut(&3).unwrap().target = aw_workspace::Target::AgentView {
             store_id: "store".into(),
             session_id: "session".into(),
@@ -240,7 +249,11 @@ mod tests {
         };
         write_saved(&f, &d, 1, legacy);
         assert!(load(&f, &d, &ScopeId::launch()).is_err());
-        let invalid = Workspace { version: 1, focused: 999, ..Workspace::default() };
+        let invalid = Workspace {
+            version: 1,
+            focused: 999,
+            ..Workspace::default()
+        };
         write_saved(&f, &d, 1, invalid);
         assert!(load(&f, &d, &ScopeId::launch()).is_err());
         std::fs::remove_dir_all(d).unwrap();

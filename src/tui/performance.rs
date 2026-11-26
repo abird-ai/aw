@@ -56,9 +56,8 @@ impl SessionPerformance {
     }
 
     pub fn average_output_tps(&self) -> Option<f64> {
-        (self.measured_turns > 0 && !self.generation.is_zero()).then(|| {
-            self.output_tokens as f64 / self.generation.as_secs_f64()
-        })
+        (self.measured_turns > 0 && !self.generation.is_zero())
+            .then(|| self.output_tokens as f64 / self.generation.as_secs_f64())
     }
 
     pub fn clear(&mut self) {
