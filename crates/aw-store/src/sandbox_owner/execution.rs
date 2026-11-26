@@ -1,4 +1,4 @@
-//! Exact, live native source execution admission. This is an owner-local
+//! Exact, live direct source execution admission. This is an owner-local
 //! handle to an independent policy, not a persisted grant or another
 //! execution owner. The ordinary source-unaware Session paths stay closed.
 use super::{agent_project_and_layout, snapshot_with_sources, SandboxEffectAuthority};
@@ -18,7 +18,7 @@ use std::{path::PathBuf, sync::Arc};
 
 type HeldPolicy = Box<dyn SandboxEffectAuthority + Send>;
 
-/// Host-selected direct native route for one exact existing Actor/Session.
+/// Host-selected fixed direct routes for one exact existing Actor/Session.
 /// The factory must acquire the actual independent policy guard on every
 /// call and hold it until dropped. It may not reconstruct a durable grant.
 /// Tool authority is the original registry's weak handle; never create a
@@ -55,20 +55,30 @@ impl SandboxExecution {
             ));
         }
         let bindings = tools.permitted_bindings(&actor)?;
+        let process_count = bindings
+            .iter()
+            .filter(|binding| binding.effect == ToolEffect::Process)
+            .count();
         if bindings.is_empty()
+            || process_count > 1
             || bindings.iter().any(|binding| {
                 let native = Tool::from_name(&binding.name).is_some_and(|tool| {
-                    tool != Tool::Remove && binding.effect == native_effect(tool)
+                    tool != Tool::Remove
+                        && binding.effect == native_effect(tool)
+                        && (process_count == 0
+                            || binding.claim_route
+                                == Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1))
                 });
-                // One fixed foreground Process constructor, not general Graph execution.
-                let process = bindings.len() == 1
-                    && matches!(binding.name.as_str(), "bash" | "pwsh" | "powershell")
+                // At most one fixed foreground Process constructor,
+                // optionally alongside the original marked native routes.
+                let process = matches!(binding.name.as_str(), "bash" | "pwsh" | "powershell")
                     && binding.effect == ToolEffect::Process
                     && binding.claim_route
                         == Some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1);
                 !(native || process)
                     || binding.source != ToolSource::trusted_host()
                     || binding.execution_site != bindings[0].execution_site
+                    || (process_count != 0 && binding.execution_site != "local")
             })
         {
             return Err(Error::Denied(
@@ -301,7 +311,7 @@ impl SandboxExecutionGuard<'_> {
             })
             .map(|binding| binding.claim_route)
             .ok_or(Error::Denied(
-                "source execution tool differs from original native route",
+                "source execution tool differs from original fixed route",
             ))
     }
 }

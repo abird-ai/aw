@@ -1075,6 +1075,8 @@ mod tests {
 
         const PROCESS_COMMAND: &str = "printf process-owned > process-created; printf process-stdout; printf process-stderr >&2";
         const RECOVERY_COMMAND: &str = "printf recovered-process > process-recovery; printf process-stdout; printf process-stderr >&2";
+        const MIXED_COMMAND: &str =
+            "printf mixed-process > mixed-process-created; printf mixed-stdout";
 
         // A reviewed fixed builtin-only fixture, NOT a general shell
         // containment driver. It never interprets arbitrary model text.
@@ -1101,6 +1103,8 @@ mod tests {
                     PROCESS_COMMAND
                 } else if arguments == &json!({"command":RECOVERY_COMMAND}) {
                     RECOVERY_COMMAND
+                } else if arguments == &json!({"command":MIXED_COMMAND}) {
+                    MIXED_COMMAND
                 } else {
                     return Err(Error::Denied(
                         "fixture driver admits only reviewed fixed commands",
@@ -1182,10 +1186,43 @@ mod tests {
                         assert!(tools[0].parameters["properties"]
                             .get("background")
                             .is_none());
+                    } else if prompt == "interrupt-mixed-before-claim" {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<std::collections::BTreeSet<_>>(),
+                            std::collections::BTreeSet::from(["bash", "read", "write"])
+                        );
                     } else {
                         assert_eq!(tools.len(), 2);
                     }
                     let call = match (prompt, results.len()) {
+                        ("interrupt-mixed-before-claim", 0) => Some(ToolCall {
+                            id: "mixed-read".into(),
+                            name: "read".into(),
+                            arguments: json!({"path":"tracked"}),
+                        }),
+                        ("interrupt-mixed-before-claim", 1) => {
+                            assert!(results[0].content.contains("fixture data"));
+                            Some(ToolCall {
+                                id: "mixed-process".into(),
+                                name: "bash".into(),
+                                arguments: json!({"command":MIXED_COMMAND}),
+                            })
+                        }
+                        ("interrupt-mixed-before-claim", 2) => {
+                            assert!(
+                                results[1].content.contains("mixed-stdout"),
+                                "{:?}",
+                                results[1]
+                            );
+                            Some(ToolCall {
+                                id: "mixed-unclaimed".into(),
+                                name: "write".into(),
+                                arguments: json!({"path":"mixed-not-started","content":"must not exist"}),
+                            })
+                        }
                         ("perform source Process" | "reject uncontained Process", 0) => {
                             Some(ToolCall {
                                 id: "source-process-fixture".into(),
@@ -1705,7 +1742,9 @@ mod tests {
             (false, 6, "perform source Process"),
             (false, 7, "interrupt-process-before-claim"),
             (false, 8, "interrupt-process-before-release"),
+            (false, 9, "interrupt-mixed-before-claim"),
         ] {
+            let mixed = prompt == "interrupt-mixed-before-claim";
             let store =
                 SessionStore::open_with_sources(&state, registry.clone(), Default::default())
                     .unwrap();
@@ -1733,6 +1772,25 @@ mod tests {
                     },
                 )
                 .unwrap();
+            let mixed_host = if mixed {
+                let native = drivers
+                    .register(
+                        DriverKey::builtin("native-filesystem").unwrap(),
+                        NativeFilesystemDriver,
+                    )
+                    .unwrap();
+                Some(
+                    GitNativeSourceHost::new(
+                        approval.clone(),
+                        handle.clone(),
+                        drivers.clone(),
+                        native,
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
             let independent = approval.clone();
             let host = aw_host::source_process::SourceProcessHost::new(
                 drivers,
@@ -1744,19 +1802,29 @@ mod tests {
                 repo.clone(),
                 aw_tools_adapter::ToolMode::Trusted,
             );
-            options.selected_tools = vec!["bash".into()];
+            options.selected_tools = if mixed {
+                vec!["read".into(), "bash".into(), "write".into()]
+            } else {
+                vec!["bash".into()]
+            };
             options.bash = None;
             let build_process = |options: &aw_tools_adapter::LocalToolOptions| {
-                host.build_execution(
-                    &store,
-                    owner.clone(),
-                    execution.clone(),
-                    Agent::builder_from_selection(
-                        selection.clone(),
-                        AgentOptions::new("fixture", "model"),
-                    ),
-                    options,
-                )
+                let builder = Agent::builder_from_selection(
+                    selection.clone(),
+                    AgentOptions::new("fixture", "model"),
+                );
+                if let Some(native) = &mixed_host {
+                    native.build_execution_with_process(
+                        &store,
+                        owner.clone(),
+                        execution.clone(),
+                        builder,
+                        options,
+                        driver.clone(),
+                    )
+                } else {
+                    host.build_execution(&store, owner.clone(), execution.clone(), builder, options)
+                }
             };
             assert!(build_process(&options).is_err());
             grant_rev = approval
@@ -1768,14 +1836,30 @@ mod tests {
             } else {
                 aw_tools_adapter::process::ContainmentRequirement::BestAvailable
             };
+            if mixed {
+                let mut unsupported = options.clone();
+                unsupported.selected_tools.push("batch".into());
+                assert!(build_process(&unsupported).is_err());
+                unsupported.selected_tools.pop();
+                unsupported.selected_tools.push("pwsh".into());
+                assert!(build_process(&unsupported).is_err());
+            }
             let (mut agent, source, jobs) = build_process(&options).unwrap();
             let jobs_weak = Arc::downgrade(&jobs);
-            assert_eq!(agent.registered_tool_names(), ["bash"]);
+            assert_eq!(
+                agent.registered_tool_names(),
+                if mixed {
+                    vec!["bash", "read", "write"]
+                } else {
+                    vec!["bash"]
+                }
+            );
             let request_id = match prompt {
                 "reject uncontained Process" => "fixture:process-strict",
                 "perform source Process" => "fixture:process",
                 "interrupt-process-before-claim" => "fixture:process-no-start",
                 "interrupt-process-before-release" => "fixture:process-unreleased",
+                "interrupt-mixed-before-claim" => "fixture:mixed-no-start",
                 _ => unreachable!(),
             };
             let (view, journal) = store.activate_with_source(&source).unwrap();
@@ -1808,8 +1892,8 @@ mod tests {
                     .request_id,
                 request_id
             );
-            if prompt.starts_with("interrupt-process-") {
-                let no_start = prompt == "interrupt-process-before-claim";
+            if prompt.starts_with("interrupt-process-") || mixed {
+                let no_start = prompt == "interrupt-process-before-claim" || mixed;
                 // The actual journal ACK precedes each event. In the
                 // second case Process wait/reap and physical proof have
                 // committed, but the post-journal release hook has not run.
@@ -1818,7 +1902,7 @@ mod tests {
                         .run_once(&mut agent, |event| {
                             let record = match event {
                                 aw_agent_core::AgentEvent::ToolStarted { record, .. }
-                                    if no_start =>
+                                    if no_start && (!mixed || record.call.name == "write") =>
                                 {
                                     record
                                 }
@@ -1830,7 +1914,7 @@ mod tests {
                                 }
                                 _ => return Ok(()),
                             };
-                            assert_eq!(record.call.name, "bash");
+                            assert_eq!(record.call.name, if mixed { "write" } else { "bash" });
                             panic!("fixture lost original Process Actor");
                         })
                         .await
@@ -1843,10 +1927,11 @@ mod tests {
                     panic.downcast_ref::<&str>(),
                     Some(&"fixture lost original Process Actor")
                 );
-                assert_eq!(
-                    store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
-                    current
-                );
+                let mut expected = current.clone();
+                expected.rev += u64::from(mixed);
+                let before_restart = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+                assert_eq!(before_restart.rev, expected.rev);
+                assert_eq!(before_restart.sources, expected.sources);
                 assert_eq!(
                     store
                         .actor_queue_fact(&owner, &session, request_id)
@@ -1858,6 +1943,7 @@ mod tests {
                 drop(jobs);
                 assert!(jobs_weak.upgrade().is_none());
                 drop(host);
+                drop(mixed_host);
                 drop(approval);
                 drop(store);
 
@@ -1877,15 +1963,20 @@ mod tests {
                 let original = interrupted.history.turns.last().unwrap();
                 assert_eq!(original.id, turn_id);
                 assert_eq!(original.outcome, aw_agent_core::Outcome::Failed);
-                assert_eq!(original.tool_records.len(), 1);
+                assert_eq!(original.tool_records.len(), if mixed { 3 } else { 1 });
                 assert_eq!(
-                    original.tool_records[0].status,
+                    original.tool_records.last().unwrap().status,
                     if no_start {
                         aw_agent_core::ToolStatus::Interrupted
                     } else {
                         aw_agent_core::ToolStatus::Succeeded
                     }
                 );
+                if mixed {
+                    assert!(original.tool_records[..2]
+                        .iter()
+                        .all(|record| record.status == aw_agent_core::ToolStatus::Succeeded));
+                }
                 assert!(store
                     .reconcile_native_turn(&manager, &reference, turn_id)
                     .is_err());
@@ -1895,7 +1986,51 @@ mod tests {
                     call_id: "source-process-recovery",
                 };
                 let unavailable = SandboxDriverRegistry::new();
-                if no_start {
+                if mixed {
+                    assert_eq!(
+                        fs::read(repo.join("mixed-process-created")).unwrap(),
+                        b"mixed-process"
+                    );
+                    assert!(!repo.join("mixed-not-started").exists());
+                    assert_eq!(
+                        store
+                            .sandbox_recover_tool_source_effect(
+                                &manager,
+                                &reference,
+                                turn_id,
+                                "mixed-read",
+                                |_| panic!("released read must not inspect")
+                            )
+                            .unwrap(),
+                        aw_store::SandboxEffectOutcome::Settled
+                    );
+                    assert_eq!(
+                        aw_host::source_process::recover_source_process(
+                            &store,
+                            &manager,
+                            aw_host::source_process::SourceToolRecoveryTarget {
+                                agent_ref: &reference,
+                                turn_id,
+                                call_id: "mixed-process",
+                            },
+                            &sandbox.canonical_ref,
+                            &unavailable,
+                            &driver,
+                            |_, _| -> Result<()> { panic!("released Process must not inspect") }
+                        )
+                        .unwrap(),
+                        aw_store::SandboxEffectOutcome::Settled
+                    );
+                    assert!(store
+                        .sandbox_recover_tool_source_effect(
+                            &manager,
+                            &reference,
+                            turn_id,
+                            "mixed-unclaimed",
+                            |_| panic!("no-start write must not inspect")
+                        )
+                        .is_err());
+                } else if no_start {
                     assert!(!repo.join("process-recovery").exists());
                     assert!(aw_host::source_process::recover_source_process(
                         &store,
@@ -1950,7 +2085,10 @@ mod tests {
                 let result = store
                     .reconcile_source_turn(&manager, &reference, turn_id)
                     .unwrap();
-                assert_eq!(result.source_effects, usize::from(!no_start));
+                assert_eq!(
+                    result.source_effects,
+                    if mixed { 2 } else { usize::from(!no_start) }
+                );
                 assert_eq!(result.unclaimed_no_start, usize::from(no_start));
                 assert!(result.hazard_cleared && result.changed);
                 assert_eq!(result.input, aw_store::InputAdmissionState::Inspected);
@@ -1978,7 +2116,7 @@ mod tests {
                         .sandbox_get(&manager, &sandbox.canonical_ref)
                         .unwrap()
                         .rev,
-                    current.rev + u64::from(!no_start)
+                    current.rev + u64::from(!no_start || mixed)
                 );
                 assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
                 continue;
@@ -2056,10 +2194,11 @@ mod tests {
                 "source Job runtime retained its owner"
             );
             drop(host);
+            drop(mixed_host);
             drop(approval);
             drop(store);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 11);
+        assert_eq!(calls.load(Ordering::SeqCst), 14);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -2081,8 +2220,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 8
-                            && v.history.turns[7].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 9
+                            && v.history.turns[8].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -2092,7 +2231,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 14);
+        assert_eq!(calls.load(Ordering::SeqCst), 17);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

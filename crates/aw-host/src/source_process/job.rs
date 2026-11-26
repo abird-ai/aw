@@ -89,6 +89,18 @@ where
         builder: AgentBuilder,
         options: &LocalToolOptions,
     ) -> Result<(Agent, SandboxExecution, Arc<JobRuntime>)> {
+        self.build_with_native(store, actor, execution, builder, options, None)
+    }
+
+    pub(crate) fn build_with_native(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+        native: Option<Arc<dyn aw_tools_adapter::operation_router::OperationRouter>>,
+    ) -> Result<(Agent, SandboxExecution, Arc<JobRuntime>)> {
         let driver = self.registry.reader()?.get(&self.driver)?;
         let route = Arc::new(SourceProcessRoute {
             store: store.clone(),
@@ -104,13 +116,23 @@ where
         });
         // The Agent extension/source handle own the route; the shell
         // registry only retains a weak reference. Avoid a Store/registry cycle.
-        let configured = aw_tools_adapter::configure_source_process(
-            builder,
-            actor.clone(),
-            options,
-            route.operation,
-            route.clone(),
-        )?;
+        let configured = match native {
+            Some(native) => aw_tools_adapter::configure_source_tools(
+                builder,
+                actor.clone(),
+                options,
+                native,
+                route.operation,
+                route.clone(),
+            )?,
+            None => aw_tools_adapter::configure_source_process(
+                builder,
+                actor.clone(),
+                options,
+                route.operation,
+                route.clone(),
+            )?,
+        };
         let jobs = configured
             .job_runtime
             .ok_or(Error::Storage("source Process Job owner unavailable"))?;

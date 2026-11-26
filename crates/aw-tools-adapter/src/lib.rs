@@ -1014,7 +1014,7 @@ pub fn configure(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
-    Ok(configure_inner(builder, actor, options, None, None)?.builder)
+    Ok(configure_inner(builder, actor, options, None)?.builder)
 }
 
 pub struct ConfiguredLocalTools {
@@ -1031,7 +1031,7 @@ pub fn configure_with_runtime(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<ConfiguredLocalTools> {
-    configure_inner(builder, actor, options, None, None)
+    configure_inner(builder, actor, options, None)
 }
 
 /// Apply metadata hooks and configured limits through the original AW Agent
@@ -1044,45 +1044,70 @@ pub fn configure_with_toolset(
 ) -> Result<AgentBuilder> {
     let mut configured = options.clone();
     configured.limits = options.limits.with_toolset(toolset);
-    Ok(configure_inner(builder, actor, &configured, Some(toolset), None)?.builder)
+    Ok(configure_inner(builder, actor, &configured, Some(toolset))?.builder)
 }
-/// Register only explicit canonical native tools through the existing
-/// router/policy owner, without opening or reconciling a workspace root.
-/// No shell, Job, control, or ambient fallback. Remove needs separate
-/// durable private-artifact admission before it can join this surface.
+/// Register only explicit canonical native tools. No ambient root, shell,
+/// Job or mutable router fallback.
 pub fn configure_routed_native(
     builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
     route: Arc<dyn operation_router::OperationRouter>,
 ) -> Result<AgentBuilder> {
-    Ok(configure_inner(builder, actor, options, None, Some(route))?.builder)
+    Ok(configure_fixed_sources(builder, actor, options, Some(route), None)?.builder)
 }
 
-/// Explicit host-only foreground Process Job selection. The existing
-/// JobRuntime owns its one node and output; no ambient filesystem root,
-/// native interpreter, dynamic router or other constructor is registered.
-/// The embedding host retains the actual executor owner (the source shell
-/// registry holds a weak reference).
+/// Explicit host-selected foreground Process Job. The embedding host
+/// retains the actual executor owner; the shell registry holds it weakly.
 pub fn configure_source_process(
-    mut builder: AgentBuilder,
+    builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
     operation: aw_tools::OperationId,
     executor: Arc<dyn process::SourceJobProcessExecutor>,
 ) -> Result<ConfiguredLocalTools> {
-    if !matches!(
-        operation,
-        aw_tools::OperationId::Bash
-            | aw_tools::OperationId::Pwsh
-            | aw_tools::OperationId::Powershell
-    ) || options.selected_tools.as_slice() != [operation.model_name()]
-        || !options
-            .mode
-            .access()
-            .permits(aw_tools::filesystem::access::Action::Shell)
-        || options.execution_site != "local"
-        || options.bash.is_some()
+    configure_fixed_sources(builder, actor, options, None, Some((operation, executor)))
+}
+
+/// Compose the original fixed native tools and one fixed foreground
+/// Process Job in the same Agent registry. No ambient root, Graph or
+/// additional tool/control grants are constructed. The embedding host
+/// supplies the actual authority and retains both route owners.
+pub fn configure_source_tools(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    native: Arc<dyn operation_router::OperationRouter>,
+    operation: aw_tools::OperationId,
+    executor: Arc<dyn process::SourceJobProcessExecutor>,
+) -> Result<ConfiguredLocalTools> {
+    configure_fixed_sources(
+        builder,
+        actor,
+        options,
+        Some(native),
+        Some((operation, executor)),
+    )
+}
+
+fn configure_fixed_sources(
+    mut builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    native: Option<Arc<dyn operation_router::OperationRouter>>,
+    process: Option<(
+        aw_tools::OperationId,
+        Arc<dyn process::SourceJobProcessExecutor>,
+    )>,
+) -> Result<ConfiguredLocalTools> {
+    use aw_tools::{filesystem::schema::Tool as FsTool, OperationId};
+    let selected = options
+        .selected_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty()
+        || selected.len() != options.selected_tools.len()
         || options.process_input
         || options.allow_agent_graph
         || options.allow_wake
@@ -1090,48 +1115,130 @@ pub fn configure_source_process(
         || options.operation_router.is_installed()?
     {
         return Err(Error::Denied(
-            "source Process requires one explicit foreground host driver selection",
+            "fixed source tools require an explicit host selection",
         ));
     }
-    let limits = options.limits.validate_for_core_tools(&[], true, true)?;
-    let mut concurrency = options.concurrency.validate()?;
-    concurrency.graph_width = 1;
-    concurrency.parallelism.allow_parallel_shell = false;
+    let mut native_tools = Vec::new();
+    let mut process_selected = false;
+    for name in &selected {
+        if let Some(tool) = FsTool::from_name(name) {
+            if native.is_none()
+                || tool == FsTool::Remove
+                || !options.mode.access().permits(tool.action())
+            {
+                return Err(Error::Denied(
+                    "source native tool selection exceeds host capability",
+                ));
+            }
+            native_tools.push(tool);
+        } else if process.as_ref().is_some_and(|(operation, _)| {
+            matches!(
+                operation,
+                OperationId::Bash | OperationId::Pwsh | OperationId::Powershell
+            ) && operation.model_name() == *name
+        }) {
+            process_selected = true;
+        } else {
+            return Err(Error::Denied("unsupported fixed source tool selection"));
+        }
+    }
+    if native.is_some() == native_tools.is_empty()
+        || process.is_some() != process_selected
+        || (process_selected
+            && (!options
+                .mode
+                .access()
+                .permits(aw_tools::filesystem::access::Action::Shell)
+                || options.execution_site != "local"
+                || options.bash.is_some()))
+    {
+        return Err(Error::Denied(
+            "source selection differs from registered driver routes",
+        ));
+    }
+    let limits = options.limits.validate_for_core_tools(
+        &native_tools,
+        process_selected,
+        process_selected,
+    )?;
+    let concurrency = options.concurrency.validate()?;
     let mut policy = builder.tool_policy_snapshot();
     if policy.execution_site != options.execution_site {
-        return Err(Error::Denied(
-            "source Process requires the original local tool authority",
-        ));
+        if process_selected || policy.execution_site != ToolPolicy::default().execution_site {
+            return Err(Error::Config(
+                "fixed source tools cannot retarget host authority".into(),
+            ));
+        }
+        policy.execution_site = options.execution_site.clone();
     }
-    policy.allow_parallel_bash = false;
     policy.max_parallel_reads = policy
         .max_parallel_reads
         .min(concurrency.parallelism.max_parallel_reads);
-    policy.max_parallel_bash = 1;
-    let runtime = job_runtime::JobRuntime::new_source_process(
-        builder.tool_binding_authority(),
-        limits,
-        concurrency,
-    )?;
-    let shell = Arc::new(shell::NativeShell::source(
-        options.root.clone(),
-        operation,
-        limits.shell_stream_bytes,
-        executor,
-    )?);
-    runtime.register_shell(shell.clone())?;
-    policy.permit_host(actor, operation.model_name(), &ToolEffect::Process)?;
-    builder = builder
-        .scope_lifecycle(runtime.clone())
-        .tool_policy_lifecycle(runtime.clone())
-        .tool_policy_lifecycle(Arc::new(ParallelismCeiling {
-            ceiling: concurrency.parallelism,
-        }))
-        .tool_policy(policy)
-        .shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
+    policy.allow_parallel_bash &= concurrency.parallelism.allow_parallel_shell;
+    policy.max_parallel_bash = policy
+        .max_parallel_bash
+        .min(concurrency.parallelism.max_parallel_shell);
+    if process_selected {
+        // Complete source custody is exclusive, including reads. A mixed
+        // direct tool set never starts two source effects in a wave.
+        policy.max_parallel_reads = 1;
+        policy.allow_parallel_bash = false;
+        policy.max_parallel_bash = 1;
+    }
+    let effective = LocalToolConcurrency {
+        graph_width: if process_selected {
+            1
+        } else {
+            concurrency.graph_width
+        },
+        parallelism: policy.parallelism(),
+    };
+    builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
+        ceiling: effective.parallelism,
+    }));
+    if let Some(native) = native {
+        for tool in native_tools {
+            let fixed = operation_router::RoutedTool::fixed(
+                Arc::new(RoutedNativeTool { tool, limits }),
+                native.clone(),
+            )?;
+            if process_selected
+                && fixed.claim_route() != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
+            {
+                return Err(Error::Denied(
+                    "mixed source tools require exact fixed native claim gate",
+                ));
+            }
+            let spec = fixed.spec();
+            policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
+            builder = builder.shared_tool(Arc::new(fixed));
+        }
+    }
+    let job_runtime = if let Some((operation, executor)) = process {
+        let runtime = job_runtime::JobRuntime::new_source_process(
+            builder.tool_binding_authority(),
+            limits,
+            effective,
+        )?;
+        let shell = Arc::new(shell::NativeShell::source(
+            options.root.clone(),
+            operation,
+            limits.shell_stream_bytes,
+            executor,
+        )?);
+        runtime.register_shell(shell.clone())?;
+        policy.permit_host(actor, operation.model_name(), &ToolEffect::Process)?;
+        builder = builder
+            .scope_lifecycle(runtime.clone())
+            .tool_policy_lifecycle(runtime.clone())
+            .shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
+        Some(runtime)
+    } else {
+        None
+    };
     Ok(ConfiguredLocalTools {
-        builder,
-        job_runtime: Some(runtime),
+        builder: builder.tool_policy(policy),
+        job_runtime,
     })
 }
 
@@ -1140,25 +1247,7 @@ fn configure_inner(
     actor: PrincipalId,
     options: &LocalToolOptions,
     catalog: Option<&aw_tools::toolset::Toolset>,
-    native_route: Option<Arc<dyn operation_router::OperationRouter>>,
 ) -> Result<ConfiguredLocalTools> {
-    if native_route.is_some()
-        && (options.selected_tools.is_empty()
-            || options.process_input
-            || options.allow_agent_graph
-            || options.allow_wake
-            || builder.tool_policy_snapshot().has_grants()
-            || options.selected_tools.iter().any(|name| {
-                aw_tools::filesystem::schema::Tool::from_name(name).is_none_or(|tool| {
-                    tool == aw_tools::filesystem::schema::Tool::Remove
-                        || !options.mode.access().permits(tool.action())
-                })
-            }))
-    {
-        return Err(Error::Denied(
-            "routed native tools require an explicit native-only host selection",
-        ));
-    }
     if options.mode == ToolMode::Off {
         if options.selected_tools.is_empty() {
             return Ok(ConfiguredLocalTools {
@@ -1280,28 +1369,6 @@ fn configure_inner(
     builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
         ceiling: effective_concurrency.parallelism,
     }));
-    if let Some(route) = native_route {
-        let mut available = BTreeSet::new();
-        let mut offered = OfferContext {
-            selected: &selected,
-            available: &mut available,
-            policy: &mut policy,
-            actor: &actor,
-            router: &options.operation_router,
-            catalog,
-        };
-        for tool in active_tools {
-            let fixed = operation_router::RoutedTool::fixed(
-                Arc::new(RoutedNativeTool { tool, limits }),
-                route.clone(),
-            )?;
-            builder = offer_unrouted_shared(builder, Arc::new(fixed), &mut offered)?;
-        }
-        return Ok(ConfiguredLocalTools {
-            builder: builder.tool_policy(policy),
-            job_runtime: None,
-        });
-    }
     let root = Arc::new(private_artifacts::open_root(
         &options.root,
         options.private_state_dir.as_deref(),

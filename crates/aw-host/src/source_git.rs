@@ -901,29 +901,104 @@ impl GitNativeSourceHost {
             execution,
             base,
             &agent.tool_binding_authority(),
-            move || {
-                let approval = host.approval.read()?;
-                if !base_pin.is_current(approval.base())? {
-                    return Err(Error::Denied("native source base identity changed"));
-                }
-                host.registry.reader()?.get(&host.native)?;
-                let driver = host.resolver.store.source_driver(&host.resolver.driver)?;
-                let mut repositories = Vec::with_capacity(approval.roots().len());
-                for root in approval.roots() {
-                    let physical = &root.physical;
-                    repositories.push(driver.verify_materialization(
-                        &root.source.binding.binding,
-                        &physical.path,
-                        (physical.volume, physical.object),
-                    )?);
-                }
-                Ok(GitExecutionFence {
-                    approval,
-                    _repositories: repositories,
-                })
-            },
+            move || host.execution_fence(&base_pin),
         )?;
         Ok((agent, source))
+    }
+
+    fn execution_fence(
+        &self,
+        base_pin: &aw_platform::DirectoryIdentity,
+    ) -> Result<GitExecutionFence> {
+        let approval = self.approval.read()?;
+        if !base_pin.is_current(approval.base())? {
+            return Err(Error::Denied("native source base identity changed"));
+        }
+        self.registry.reader()?.get(&self.native)?;
+        let driver = self.resolver.store.source_driver(&self.resolver.driver)?;
+        let mut repositories = Vec::with_capacity(approval.roots().len());
+        for root in approval.roots() {
+            let physical = &root.physical;
+            repositories.push(driver.verify_materialization(
+                &root.source.binding.binding,
+                &physical.path,
+                (physical.volume, physical.object),
+            )?);
+        }
+        Ok(GitExecutionFence {
+            approval,
+            _repositories: repositories,
+        })
+    }
+
+    fn native_route(
+        &self,
+        store: &SessionStore,
+        agent: AgentExecutionBinding,
+        builder: &AgentBuilder,
+        options: &LocalToolOptions,
+    ) -> Result<
+        Arc<
+            impl aw_tools_adapter::operation_router::OperationRouter
+                + aw_agent_core::Extension
+                + 'static,
+        >,
+    > {
+        let host = self.clone();
+        Ok(Arc::new(SourceFilesystemRoute::new(
+            store.clone(),
+            agent,
+            self.registry.clone(),
+            self.native.clone(),
+            builder.tool_binding_authority(),
+            options.limits,
+            move |ctx, tool| host.resolve(ctx, tool),
+        )?))
+    }
+
+    /// Compose the fixed native route and one registered foreground Process
+    /// driver with the same independent Git approval and exact Agent scope.
+    /// No ambient shell, native root, or additional Graph grant.
+    pub fn build_execution_with_process<D: crate::source_process::SourceProcessDriver>(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+        process: SandboxDriverHandle<D>,
+    ) -> Result<(
+        Agent,
+        SandboxExecution,
+        Arc<aw_tools_adapter::job_runtime::JobRuntime>,
+    )> {
+        let mut native_options = options.clone();
+        native_options
+            .selected_tools
+            .retain(|name| FsTool::from_name(name).is_some());
+        self.preflight(store, &actor, &execution, &native_options)?;
+        let native = self.native_route(store, execution.clone(), &builder, options)?;
+        let base = self.approval.read()?.base().to_owned();
+        if base != options.root {
+            return Err(Error::Denied(
+                "mixed source tool root differs from approval",
+            ));
+        }
+        let base_pin = aw_platform::DirectoryIdentity::open(&base)?;
+        let host = self.clone();
+        let process = crate::source_process::SourceProcessHost::new(
+            self.registry.clone(),
+            process,
+            move || host.execution_fence(&base_pin),
+        )?;
+        process.build_with_native(
+            store,
+            actor,
+            execution,
+            builder.shared_extension(native.clone()),
+            options,
+            Some(native),
+        )
     }
 
     /// Construct the actual root-free tool route on the original builder.
@@ -944,16 +1019,9 @@ impl GitNativeSourceHost {
         }
         // The native executor is fixed to this builder; reusable options
         // cannot replace or clear the original claim-gated route.
-        let host = self.clone();
-        let route = Arc::new(SourceFilesystemRoute::new(
-            store.clone(),
-            agent,
-            self.registry.clone(),
-            self.native.clone(),
-            builder.tool_binding_authority(),
-            options.limits,
-            move |ctx, tool| host.resolve(ctx, tool),
-        )?);
-        route.configure(builder, actor, options)
+        let route = self.native_route(store, agent, &builder, options)?;
+        let builder =
+            aw_tools_adapter::configure_routed_native(builder, actor, options, route.clone())?;
+        Ok(builder.shared_extension(route))
     }
 }

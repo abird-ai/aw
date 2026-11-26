@@ -26,7 +26,85 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: original Process Run/Input/queue reconciliation
+## Latest local implementation delta — 2026-11-26: mixed direct native/Process source execution
+
+Parent `3eb2da2280dd1f2860e1303d64297e0710d7e93f`, independently verified
+published AW main. Dotlink main `85ceccc1` was also confirmed published;
+tracking refs synchronized and both complete worktrees clean at entry.
+L5 only. Store v60, Git recovery v4 and product 0.15.0 unchanged.
+
+- Remove the artificial native-only versus Process-only split for the
+  qualified direct source route. The adapter's original fixed native and
+  foreground Process registration paths share one
+  `configure_fixed_sources` helper. `configure_source_tools` explicitly
+  selects both, with exact marked native routes and at most one fixed
+  foreground Process constructor in the same original Agent registry.
+  No ambient filesystem root, executable fallback, dynamic router,
+  background/interactive/wake/Graph or control grant. The ordinary local
+  tool configuration remains independent. Mixed source tools use a serial
+  tool-policy ceiling (including reads) and the same root-free one-node Job
+  runtime. The original complete source barrier, claim-before-effect gate
+  and Process launch fence remain authoritative.
+- `GitNativeSourceHost::build_execution_with_process` composes the
+  original native route and registered typed Process driver from the
+  same SandboxDriver registry and independent Git approval. The base
+  identity and all approved Git materializations are verified in the
+  shared live execution fence, reusing the native-only fence. Both
+  routes use the original Agent binding, ToolBindingAuthority, post-
+  ToolFinished settlement hooks, complete source authority and original
+  claim/release owner. No extra source grant, registry or runtime.
+  The Process driver still owns its actual containment and independent
+  quiescence proof; shared Git identity approval is not OS isolation.
+- `SandboxExecution` permits mixed direct selection only with exact
+  `NativeSourceV1` and `ProcessSourceV1` trusted-local bindings and at
+  most one shell operation. Native-only historical binding compatibility
+  retained. Extend the existing bounded intent scan and original
+  `reconcile_source_turn` transaction to both marked routes in one Run.
+  Require original positive releases or exact unclaimed no-start per
+  effect, complete original versioned source digest for claims, exact
+  original native driver and Git layout when native intents participate.
+  Reject mixed unmarked native intents, changed shell name, revised
+  intent, generic Graph/Job and legacy Process. The native-only API/CLI
+  still refuses Process Runs. No new schema, effect owner or recovery
+  identity.
+- Extend the existing real Actor/Store/Job lifecycle fixture with one
+  mixed Run: native read, actual reviewed fixed Process, then lose the
+  Actor at the original write ToolStarted ACK before claim. Verify both
+  completed receipts and source releases, actual Process stdout/file,
+  original Git index, absent final write, runtime retirement, exact
+  restart without a source driver registry, released per-effect replay
+  without inspection, 2 source releases + 1 unclaimed no-start, atomic
+  hazard/Input/queue disposition and immutable original Turn. Later
+  pending Input untouched until its normal dispatch. Mixed selection
+  without live grant, with batch, or with another shell refused.
+  Previous native/Process-only interruption and executable fixtures kept.
+
+Validation (L5, locked/offline, final source): Actor lifecycle 3/3
+(16.45s, five deliberate caught Actor losses), adapter library 259/259
+(1.41s).
+Host native/Process 2/2 (6.73s), Store Sandbox owner 4/4 (2.28s),
+native executable 1/1 (34.45s, ordinary and linked layouts). Strict
+affected all-feature/all-target Clippy, durable/minimal all-target
+checks (existing feature-specific dead-code warnings), actual CLI
+version/help and scoped fmt/diff passed. Full workspace, pinned Nix
+and other native platforms not repeated.
+
+Scope: qualified direct Git-backed native + one foreground Process
+embedding-host composition. The test driver is a reviewed fixed-command
+fixture; not arbitrary shell containment. General multi-node Graph,
+background/interactive and extension execution need their own exact
+original node/effect custody and independent physical authority.
+No arbitrary shell CLI, strong Unix backend, shared/forked/participant
+scope or frozen 017 promotion. No implicit driver replacement or schema
+migration.
+
+Next: extend the original Job/Graph and extension dispatch using exact
+node-level source custody, rather than aliasing an outer ToolStarted
+claim across multiple node effects; qualify the actual containment
+driver and then remaining Vault projection/host RPC/retention gates.
+Phase 3 remains underway.
+
+## Previous local implementation delta — 2026-11-26: original Process Run/Input/queue reconciliation
 
 Parent `8bcdb13b294b669b8a47e7c4f27c0e2758f3b5e6` (source-aware foreground
 Process Job dispatch). Published AW main remains `7b92686`. L5, clean at

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: original Process Run/Input/queue reconciliation (this checkpoint; local parent `8bcdb13b294b669b8a47e7c4f27c0e2758f3b5e6`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: mixed direct native/Process source execution (this checkpoint; local parent `3eb2da2280dd1f2860e1303d64297e0710d7e93f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1747,10 +1747,26 @@ Current implementation: original Process Run/Input/queue reconciliation (this ch
       Host native/Process 2/2, native executable 1/1, Store Sandbox
       owner 4/4, strict affected Clippy, durable/minimal checks, version/help
       and scoped fmt/diff passed.
-      **Next:** general reviewed containment driver and broader
-      source-aware Job/Graph/extension dispatch. No arbitrary shell CLI or
-      strong Unix backend promoted; nonstandard/overlapping linked layouts
-      and unmarked legacy native/Process no-start remain held.
+      **Mixed direct native/Process source execution:** shared fixed-tool
+      adapter composition, one original Agent/registry/approval and Git
+      execution fence, one foreground Process constructor, serial source
+      tool ceiling; no ambient root or fallback. Exact marked native and
+      Process bindings may coexist, with original per-effect custody and
+      post-journal release. Shared whole-Run recovery consumes each exact
+      release or positive original no-start; native-only API stays narrow.
+      Real mixed Actor regression: native read + actual reviewed Process +
+      interrupted unclaimed write, original releases preserved, exact
+      Store reopen/replay/queue retirement and later pending Input only.
+      Refuse missing grant, batch and second shell. Actor lifecycle 3/3,
+      adapter 259/259 passed.
+      Host native/Process 2/2, Store Sandbox owner 4/4, native executable
+      1/1, strict affected Clippy, durable/minimal checks, version/help and
+      scoped fmt/diff passed.
+      **Next:** exact node-level source custody for broader Job/Graph and
+      extension dispatch, reviewed actual containment driver, then Vault
+      projection and remaining host RPC/retention. No arbitrary shell CLI
+      or strong Unix backend promoted; nonstandard/overlapping linked
+      layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
@@ -1773,8 +1789,8 @@ Current implementation: original Process Run/Input/queue reconciliation (this ch
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.
-      Last independently verified published AW main `7b92686`; local signed implementation
-      through `a747e78`. No new remote verification or publication.
+      Last independently verified published AW main `3eb2da22`, dotlink main
+      `85ceccc1`; this next local checkpoint not yet published.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;

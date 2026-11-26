@@ -19,6 +19,8 @@ const NATIVE_NOTE: &str =
     "Original native source releases or claim-gated no-start verified; original Run retained, no replay";
 const PROCESS_NOTE: &str =
     "Original Process source releases or claim-gated no-start verified; original Run retained, no replay";
+const MIXED_NOTE: &str =
+    "Original native and Process source releases or claim-gated no-start verified; original Run retained, no replay";
 
 /// Data-only result of reconciliation, not a new execution receipt.
 /// Inspected Input/queue custody is not a successful Turn or provider proof.
@@ -92,24 +94,61 @@ impl IntentRoute {
 pub(super) struct IntentSummary {
     pub count: usize,
     pub possible_effect: bool,
-    route: Option<IntentRoute>,
+    native: bool,
+    legacy_native: bool,
+    process: Option<OperationId>,
 }
 
 impl IntentSummary {
+    fn observe_route(
+        &mut self,
+        route: IntentRoute,
+        observed: &Observation,
+        scope: RecoveryScope,
+    ) -> Result<()> {
+        match route {
+            IntentRoute::Native => {
+                self.native = true;
+                self.legacy_native |=
+                    observed.source.claim_route != Some(ToolClaimRoute::NativeSourceV1);
+            }
+            IntentRoute::Process(operation) => {
+                if scope == RecoveryScope::NativeOnly
+                    || self.process.is_some_and(|old| old != operation)
+                {
+                    return Err(Error::Denied(
+                        "Run differs from its original fixed source route",
+                    ));
+                }
+                self.process = Some(operation);
+            }
+        }
+        if self.process.is_some() && self.legacy_native {
+            return Err(Error::Denied(
+                "mixed source Run contains an unmarked native intent",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn require_layout(&self, sandbox: &SandboxSnapshot) -> Result<()> {
-        match self.route {
-            Some(IntentRoute::Process(_)) if !sandbox.sources.is_empty() => Ok(()),
-            Some(IntentRoute::Process(_)) => Err(Error::Denied(
+        if self.native || self.process.is_none() {
+            // Preserve original native and pre-tool Git restriction,
+            // including mixed direct native/Process runs.
+            require_git_layout(sandbox)
+        } else if sandbox.sources.is_empty() {
+            Err(Error::Denied(
                 "Process Run recovery requires its original source layout",
-            )),
-            // Preserve the original native and pre-tool Git restriction.
-            _ => require_git_layout(sandbox),
+            ))
+        } else {
+            Ok(())
         }
     }
 
     fn note(&self) -> &'static str {
-        match self.route {
-            Some(IntentRoute::Process(_)) => PROCESS_NOTE,
+        match (self.native, self.process.is_some()) {
+            (true, true) => MIXED_NOTE,
+            (false, true) => PROCESS_NOTE,
             _ => NATIVE_NOTE,
         }
     }
@@ -179,7 +218,9 @@ pub(super) fn inspect_source_intents(
     let mut summary = IntentSummary {
         count: 0,
         possible_effect: false,
-        route: None,
+        native: false,
+        legacy_native: false,
+        process: None,
     };
     let mut count = 0;
     while let Some(row) = db(rows.next())? {
@@ -204,16 +245,10 @@ pub(super) fn inspect_source_intents(
                     return Err(Error::Denied("source intent differs from original Run"));
                 }
                 let route = IntentRoute::from_observed(&observed)?;
-                // Original admission supports either native tools or one
-                // fixed Process constructor; never mix routes or shell names.
-                if (scope == RecoveryScope::NativeOnly && route != IntentRoute::Native)
-                    || summary.route.is_some_and(|original| original != route)
-                {
-                    return Err(Error::Denied(
-                        "Run differs from its original fixed source route",
-                    ));
-                }
-                summary.route = Some(route);
+                // Fixed marked native routes may coexist with one
+                // foreground Process constructor. Never mix shell names
+                // or reinterpret an unmarked legacy tool.
+                summary.observe_route(route, &observed, scope)?;
                 inspect(&observed, route)?;
                 summary.possible_effect |= record.effect != ToolEffect::Read;
             }
@@ -313,7 +348,7 @@ impl SessionStore {
         self.reconcile_source_turn_in(manager, agent_ref, turn, RecoveryScope::NativeOnly)
     }
 
-    /// Original direct native or fixed foreground source Process Run.
+    /// Original direct native and/or fixed foreground source Process Run.
     /// Require all original positive releases (including claimed no-spawn)
     /// or exact claim-gated unclaimed no-start; no physical inspection,
     /// new Process launch, or reinterpretation of the immutable Turn.
