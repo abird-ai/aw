@@ -1,4 +1,4 @@
-//! Exact logical reconciliation of one original direct native Run.
+//! Exact logical reconciliation of one original direct source Run.
 //! Physical recovery stays with each existing source-effect owner. No
 //! provider receipt, immutable Turn, source release or grant is rewritten.
 use super::*;
@@ -8,16 +8,22 @@ use crate::{
     secret_store::SecretStore,
     QueueState, StoreMode,
 };
-use aw_tools::filesystem::{access::Action, schema::Tool};
+use aw_agent_core::tool::ToolClaimRoute;
+use aw_tools::{
+    filesystem::{access::Action, schema::Tool},
+    OperationId,
+};
 use std::collections::BTreeSet;
 
-const NOTE: &str =
+const NATIVE_NOTE: &str =
     "Original native source releases or claim-gated no-start verified; original Run retained, no replay";
+const PROCESS_NOTE: &str =
+    "Original Process source releases or claim-gated no-start verified; original Run retained, no replay";
 
 /// Data-only result of reconciliation, not a new execution receipt.
 /// Inspected Input/queue custody is not a successful Turn or provider proof.
 #[derive(Debug, Serialize)]
-pub struct NativeTurnReconciliation {
+pub struct SourceTurnReconciliation {
     pub turn: u64,
     pub source_effects: usize,
     pub unclaimed_no_start: usize,
@@ -27,12 +33,98 @@ pub struct NativeTurnReconciliation {
     pub changed: bool,
 }
 
-/// Only the original durable, fixed native executor contract proves that
-/// this particular intent could not enter the native worker without its
-/// claim. A generic trusted-host identity or absent claim is insufficient.
-pub(super) fn require_unclaimed_no_start(c: &Connection, observed: &Observation) -> Result<()> {
+/// Compatibility name for the original native-only entry point.
+pub type NativeTurnReconciliation = SourceTurnReconciliation;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryScope {
+    NativeOnly,
+    DirectSources,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IntentRoute {
+    Native,
+    Process(OperationId),
+}
+
+impl IntentRoute {
+    fn from_observed(observed: &Observation) -> Result<Self> {
+        let record = &observed.record;
+        if let Some(tool) = Tool::from_name(&record.call.name) {
+            let effect = if tool.action() == Action::Read {
+                ToolEffect::Read
+            } else {
+                ToolEffect::Write
+            };
+            if tool != Tool::Remove
+                && record.effect == effect
+                && matches!(
+                    observed.source.claim_route,
+                    None | Some(ToolClaimRoute::NativeSourceV1)
+                )
+            {
+                return Ok(Self::Native);
+            }
+        } else if let Some(
+            operation @ (OperationId::Bash | OperationId::Pwsh | OperationId::Powershell),
+        ) = OperationId::from_model_name(&record.call.name)
+        {
+            // Only the original fixed foreground Process constructor,
+            // never a legacy shell, generic Job/Graph, or extension.
+            if record.effect == ToolEffect::Process
+                && observed.source.claim_route == Some(ToolClaimRoute::ProcessSourceV1)
+            {
+                return Ok(Self::Process(operation));
+            }
+        }
+        Err(Error::Denied("Run contains an unsupported source intent"))
+    }
+
+    fn marker(self) -> ToolClaimRoute {
+        match self {
+            Self::Native => ToolClaimRoute::NativeSourceV1,
+            Self::Process(_) => ToolClaimRoute::ProcessSourceV1,
+        }
+    }
+}
+
+pub(super) struct IntentSummary {
+    pub count: usize,
+    pub possible_effect: bool,
+    route: Option<IntentRoute>,
+}
+
+impl IntentSummary {
+    pub(super) fn require_layout(&self, sandbox: &SandboxSnapshot) -> Result<()> {
+        match self.route {
+            Some(IntentRoute::Process(_)) if !sandbox.sources.is_empty() => Ok(()),
+            Some(IntentRoute::Process(_)) => Err(Error::Denied(
+                "Process Run recovery requires its original source layout",
+            )),
+            // Preserve the original native and pre-tool Git restriction.
+            _ => require_git_layout(sandbox),
+        }
+    }
+
+    fn note(&self) -> &'static str {
+        match self.route {
+            Some(IntentRoute::Process(_)) => PROCESS_NOTE,
+            _ => NATIVE_NOTE,
+        }
+    }
+}
+
+/// Only the original durable, fixed executor contract proves that this
+/// intent could not enter its worker or OS launch without its claim.
+/// Generic trusted-host identity or absent custody is insufficient.
+pub(super) fn require_unclaimed_no_start(
+    c: &Connection,
+    observed: &Observation,
+    route: IntentRoute,
+) -> Result<()> {
     let effect_id = observed.intent.effect_id();
-    if observed.source.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1)
+    if observed.source.claim_route != Some(route.marker())
         || claim_in(c, &effect_id)?.is_some()
         || fact_in::<SandboxEffectOutcome>(c, &effect_id, QUIESCENT)?.is_some()
         || fact_in::<Release>(c, &effect_id, RELEASED)?.is_some()
@@ -53,7 +145,7 @@ pub(super) fn require_unclaimed_no_start(c: &Connection, observed: &Observation)
     ))?;
     if leased {
         return Err(Error::Conflict(
-            "unclaimed native intent has contradictory source custody",
+            "unclaimed source intent has contradictory source custody",
         ));
     }
     Ok(())
@@ -70,20 +162,25 @@ pub(super) fn require_git_layout(sandbox: &SandboxSnapshot) -> Result<()> {
 }
 
 /// One bounded original intent scan for startup and terminal reconciliation.
-pub(super) fn inspect_native_intents(
+pub(super) fn inspect_source_intents(
     c: &Connection,
     run: &str,
     agent: &str,
     turn: u64,
     actor: &PrincipalId,
-    mut inspect: impl FnMut(&Observation) -> Result<()>,
-) -> Result<(usize, bool)> {
+    scope: RecoveryScope,
+    mut inspect: impl FnMut(&Observation, IntentRoute) -> Result<()>,
+) -> Result<IntentSummary> {
     let mut query = db(c.prepare_cached(
         "SELECT seq,payload FROM run_events WHERE run_id=?1 ORDER BY seq LIMIT 513",
     ))?;
     let mut rows = db(query.query([run]))?;
     let mut starts = BTreeSet::new();
-    let mut writes = false;
+    let mut summary = IntentSummary {
+        count: 0,
+        possible_effect: false,
+        route: None,
+    };
     let mut count = 0;
     while let Some(row) = db(rows.next())? {
         count += 1;
@@ -93,20 +190,9 @@ pub(super) fn inspect_native_intents(
         let seq: u64 = db(row.get(0))?;
         match crate::decode::<JournalEntry>(&db(row.get::<_, String>(1))?)? {
             JournalEntry::ToolStarted { record, .. } => {
-                let tool = Tool::from_name(&record.call.name)
-                    .ok_or(Error::Denied("Run contains a non-native tool intent"))?;
-                let effect = if tool.action() == Action::Read {
-                    ToolEffect::Read
-                } else {
-                    ToolEffect::Write
-                };
-                if tool == Tool::Remove
-                    || record.effect != effect
-                    || record.execution_site != "local"
-                    || !starts.insert(record.call.id.clone())
-                {
+                if record.execution_site != "local" || !starts.insert(record.call.id.clone()) {
                     return Err(Error::Denied(
-                        "Run contains an unsupported or ambiguous native intent",
+                        "Run contains an unsupported or ambiguous source intent",
                     ));
                 }
                 let observed = observe(c, agent, turn, &record.call.id)?;
@@ -115,12 +201,21 @@ pub(super) fn inspect_native_intents(
                     || &observed.intent.actor != actor
                     || !observed.source.is_trusted_host()
                 {
+                    return Err(Error::Denied("source intent differs from original Run"));
+                }
+                let route = IntentRoute::from_observed(&observed)?;
+                // Original admission supports either native tools or one
+                // fixed Process constructor; never mix routes or shell names.
+                if (scope == RecoveryScope::NativeOnly && route != IntentRoute::Native)
+                    || summary.route.is_some_and(|original| original != route)
+                {
                     return Err(Error::Denied(
-                        "native intent differs from original settled Run",
+                        "Run differs from its original fixed source route",
                     ));
                 }
-                inspect(&observed)?;
-                writes |= effect == ToolEffect::Write;
+                summary.route = Some(route);
+                inspect(&observed, route)?;
+                summary.possible_effect |= record.effect != ToolEffect::Read;
             }
             JournalEntry::ToolFinished { record } if !starts.contains(&record.call.id) => {
                 return Err(Error::Conflict(
@@ -129,13 +224,14 @@ pub(super) fn inspect_native_intents(
             }
             JournalEntry::ToolRevised { .. } => {
                 return Err(Error::Denied(
-                    "native Run recovery does not admit revised tool intents",
+                    "source Run recovery does not admit revised tool intents",
                 ))
             }
             _ => {}
         }
     }
-    Ok((starts.len(), writes))
+    summary.count = starts.len();
+    Ok(summary)
 }
 
 /// Require each original effect's positive release or exact gated no-start.
@@ -147,49 +243,58 @@ fn require_releases(
     sandbox: &SandboxSnapshot,
     turn: u64,
     actor: &PrincipalId,
-) -> Result<(usize, usize, bool)> {
-    let driver = DriverKey::builtin("native-filesystem")?;
-    require_git_layout(sandbox)?;
-    // Validate the complete original versioned binding digest without
-    // requiring a current driver registration or probing a checkout.
+    scope: RecoveryScope,
+) -> Result<(IntentSummary, usize)> {
+    let native = DriverKey::builtin("native-filesystem")?;
+    // The original complete versioned binding digest is sufficient for
+    // logical recovery: do not require a current driver or physical probe.
     let bindings =
         sandbox_owner::source_bindings::versioned_bindings_in(c, &sandbox.canonical_ref)?;
     let mut no_start = 0;
-    let (count, writes) = inspect_native_intents(c, run, agent, turn, actor, |observed| {
+    let summary = inspect_source_intents(c, run, agent, turn, actor, scope, |observed, route| {
         if observed.active {
-            return Err(Error::Denied("native Run is still active"));
+            return Err(Error::Denied("source Run is still active"));
         }
         if claim_in(c, &observed.intent.effect_id())?.is_none() {
-            require_unclaimed_no_start(c, observed)?;
+            require_unclaimed_no_start(c, observed, route)?;
             let (_, record) =
                 terminal_in_with(c, observed, observed.record.effect != ToolEffect::Read)?;
             if record.status == ToolStatus::Succeeded {
                 return Err(Error::Conflict(
-                    "unclaimed native intent cannot have succeeded",
+                    "unclaimed source intent cannot have succeeded",
                 ));
             }
             no_start += 1;
             return Ok(());
         }
         let claim = require_claim(c, &observed.intent)?;
-        if claim.driver != driver
+        if (route == IntentRoute::Native && claim.driver != native)
             || claim.sandbox_ref != sandbox.canonical_ref
             || claim.sources.len() != sandbox.sources.len()
         {
             return Err(Error::Denied(
-                "Run effect differs from original complete native source custody",
+                "Run effect differs from original complete source custody",
             ));
         }
         verify_claim_bindings(&claim, bindings.clone())?;
-        let (terminal, _) = terminal_in(c, observed)?;
-        if released_in(c, observed, &terminal)?.is_none() {
-            return Err(Error::Conflict(
-                "original native effect has no positive source release",
-            ));
+        let (terminal, record) = terminal_in(c, observed)?;
+        match released_in(c, observed, &terminal)? {
+            Some(SandboxEffectOutcome::NotStarted) if record.status == ToolStatus::Succeeded => {
+                return Err(Error::Conflict(
+                    "no-start release contradicts original success",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                return Err(Error::Conflict(
+                    "original effect has no positive source release",
+                ))
+            }
         }
         Ok(())
     })?;
-    Ok((count - no_start, no_start, writes))
+    summary.require_layout(sandbox)?;
+    Ok((summary, no_start))
 }
 
 impl SessionStore {
@@ -205,10 +310,33 @@ impl SessionStore {
         agent_ref: &str,
         turn: u64,
     ) -> Result<NativeTurnReconciliation> {
+        self.reconcile_source_turn_in(manager, agent_ref, turn, RecoveryScope::NativeOnly)
+    }
+
+    /// Original direct native or fixed foreground source Process Run.
+    /// Require all original positive releases (including claimed no-spawn)
+    /// or exact claim-gated unclaimed no-start; no physical inspection,
+    /// new Process launch, or reinterpretation of the immutable Turn.
+    pub fn reconcile_source_turn(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn: u64,
+    ) -> Result<SourceTurnReconciliation> {
+        self.reconcile_source_turn_in(manager, agent_ref, turn, RecoveryScope::DirectSources)
+    }
+
+    fn reconcile_source_turn_in(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn: u64,
+        scope: RecoveryScope,
+    ) -> Result<SourceTurnReconciliation> {
         label(agent_ref, 2048)?;
         if turn == 0 || self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
-                "native Turn recovery requires exact Turn and exclusive Store owner",
+                "source Turn recovery requires exact Turn and exclusive Store owner",
             ));
         }
         let process = self
@@ -221,7 +349,7 @@ impl SessionStore {
             let key = AgentKey::new(&session, &branch);
             if agent_owner::canonical_ref(&tx, key)? != agent_ref {
                 return Err(Error::Denied(
-                    "native recovery requires exact canonical Agent",
+                    "source recovery requires exact canonical Agent",
                 ));
             }
             agent_owner::authorize_permission(&tx, manager, key, AgentPermission::Manage)?;
@@ -230,7 +358,7 @@ impl SessionStore {
             sandbox_owner::authorize_project(&tx, manager, &project, true)?;
             let sandbox = sandbox_owner::snapshot_with_sources(
                 &tx,
-                &sandbox.ok_or(Error::Denied("native recovery requires bound Sandbox"))?,
+                &sandbox.ok_or(Error::Denied("source recovery requires bound Sandbox"))?,
             )?;
             if lifecycle != "open"
                 || sandbox.lifecycle != SandboxLifecycle::Open
@@ -240,7 +368,7 @@ impl SessionStore {
                 || sandbox.working_directory.to_str() != Some(layout.working_directory.as_str())
             {
                 return Err(Error::Denied(
-                    "native recovery differs from original Agent layout",
+                    "source recovery differs from original Agent layout",
                 ));
             }
 
@@ -257,7 +385,7 @@ impl SessionStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional())?;
             let (run, final_node, root_key, possible) = row.ok_or(Error::Denied(
-                "native recovery requires original attached Run of a previous quiescent Store owner",
+                "source recovery requires original attached Run of a previous quiescent Store owner",
             ))?;
             let original = direct_run_in(&tx, &session, &branch, &run, turn)?;
             let node = crate::node_in(&tx, &session, &final_node)?;
@@ -267,11 +395,13 @@ impl SessionStore {
                 || node.payload["id"].as_u64() != Some(turn)
                 || crate::key(&crate::session_in(&tx, &session)?.binding)? != root_key
             {
-                return Err(Error::Conflict("settled native Run identity changed"));
+                return Err(Error::Conflict("settled source Run identity changed"));
             }
-            let (source_effects, unclaimed_no_start, writes) =
-                require_releases(&tx, &run, agent_ref, &sandbox, turn, &original.actor)?;
-            if writes != possible {
+            let (summary, unclaimed_no_start) =
+                require_releases(&tx, &run, agent_ref, &sandbox, turn, &original.actor, scope)?;
+            let effectful = summary.possible_effect;
+            let note = summary.note();
+            if effectful != possible {
                 return Err(Error::Conflict(
                     "original Run mutation intent differs from its hazard",
                 ));
@@ -286,22 +416,22 @@ impl SessionStore {
                 )
                 .optional())?;
             let hazard_cleared = match hazard {
-                None if !writes => false,
-                Some((s, root, state)) if writes && s == session && root == root_key => {
+                None if !effectful => false,
+                Some((s, root, state)) if effectful && s == session && root == root_key => {
                     match state.as_str() {
                         "settled" => false,
                         "needs_inspection" => {
                             db(tx.execute(
                                 "UPDATE hazards SET state='settled',note=?1,updated_at=?2
                              WHERE run_id=?3 AND state='needs_inspection'",
-                                params![NOTE, crate::now(), run],
+                                params![note, crate::now(), run],
                             ))?;
                             crate::audit(
                                 &tx,
                                 &session,
                                 manager,
                                 "effects.inspected",
-                                serde_json::json!({"run_id":run,"note":NOTE}),
+                                serde_json::json!({"run_id":run,"note":note}),
                             )?;
                             true
                         }
@@ -311,7 +441,7 @@ impl SessionStore {
                 _ => return Err(Error::Conflict("original Run hazard identity differs")),
             };
             let (input, input_changed) =
-                crate::actor_admission::inspect_recovered_in(&tx, manager, &original.input, NOTE)?;
+                crate::actor_admission::inspect_recovered_in(&tx, manager, &original.input, note)?;
             let (queue, queue_changed) = crate::actor_queue::retire_recovered_in(
                 &tx,
                 manager,
@@ -319,15 +449,15 @@ impl SessionStore {
                 &original.process_id,
                 process.store_generation,
                 input,
-                NOTE,
+                note,
             )?;
             let changed = hazard_cleared || input_changed || queue_changed;
             if changed {
                 agent_owner::changed(&tx, key)?;
             }
-            let result = NativeTurnReconciliation {
+            let result = SourceTurnReconciliation {
                 turn,
-                source_effects,
+                source_effects: summary.count - unclaimed_no_start,
                 unclaimed_no_start,
                 hazard_cleared,
                 input,

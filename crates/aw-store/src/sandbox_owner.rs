@@ -22,7 +22,7 @@ pub use effects::{
     NativeTurnReconciliation, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch,
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
     SandboxEffectRequest, SandboxToolRecovery, SandboxToolRecoverySelection,
-    SandboxToolTerminalRef,
+    SandboxToolTerminalRef, SourceTurnReconciliation,
 };
 pub(crate) mod construction;
 pub use construction::{

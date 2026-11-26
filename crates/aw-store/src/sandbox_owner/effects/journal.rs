@@ -703,7 +703,7 @@ fn direct_run_in(
 }
 
 /// Exclusive restart without a claim: exact pre-tool Run or an original
-/// fixed native route whose durable intent proves the claim-before-effect gate.
+/// fixed source route whose durable intent proves the claim-before-effect gate.
 fn require_unclaimed_run_in(
     c: &Connection,
     session: &str,
@@ -720,32 +720,33 @@ fn require_unclaimed_run_in(
     ))?;
     let original = direct_run_in(c, session, branch, run, turn)?;
     let reference = agent_owner::canonical_ref(c, AgentKey::new(session, branch))?;
-    let (count, writes) = run_recovery::inspect_native_intents(
+    let summary = run_recovery::inspect_source_intents(
         c,
         run,
         &reference,
         turn,
         &original.actor,
-        |observed| run_recovery::require_unclaimed_no_start(c, observed),
+        run_recovery::RecoveryScope::DirectSources,
+        |observed, route| run_recovery::require_unclaimed_no_start(c, observed, route),
     )?;
-    if writes != possible || (!writes && hazard) {
+    if summary.possible_effect != possible || (!summary.possible_effect && hazard) {
         return Err(Error::Conflict(
             "original unclaimed Run hazard differs from its intents",
         ));
     }
-    if count != 0 {
+    if summary.count != 0 {
         let (_, _, sandbox, _, _) = super::super::agent_project_and_layout(c, session, branch)?;
         let sandbox = super::super::snapshot_with_sources(
             c,
-            &sandbox.ok_or(Error::Denied("original native Run has no Sandbox"))?,
+            &sandbox.ok_or(Error::Denied("original source Run has no Sandbox"))?,
         )?;
-        run_recovery::require_git_layout(&sandbox)?;
+        summary.require_layout(&sandbox)?;
     }
     Ok(())
 }
 
 mod run_recovery;
-pub use run_recovery::NativeTurnReconciliation;
+pub use run_recovery::{NativeTurnReconciliation, SourceTurnReconciliation};
 
 /// Exclusive owner restart may expose source-bearing metadata for
 /// original journal recovery. Each unresolved Run must have its own

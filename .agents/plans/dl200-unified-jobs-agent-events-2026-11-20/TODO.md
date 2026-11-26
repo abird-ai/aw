@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: source-aware foreground Process Job dispatch (this checkpoint; local parent `a58e39e1ede99a5ec0119380daa6d8dd57565c9e`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: original Process Run/Input/queue reconciliation (this checkpoint; local parent `8bcdb13b294b669b8a47e7c4f27c0e2758f3b5e6`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1733,12 +1733,25 @@ Current implementation: source-aware foreground Process Job dispatch (this check
       Actor lifecycle 3/3, adapter 259/259, shared Process 8/8.
       Host native/Process 2/2, executable recovery 1/1, strict affected
       Clippy, durable/minimal checks, version/help and scoped fmt/diff passed.
-      **Next:** exact original Process Run/Input/queue disposition for
-      qualified source routes and positive original no-start/quiescence;
-      general reviewed containment driver and broader Job/Graph/extension
-      dispatch remain open. No arbitrary shell CLI or strong Unix backend
-      promoted; nonstandard/overlapping linked layouts and unmarked legacy
-      native/Process no-start remain held. Separately qualify legacy participant
+      **Exact original Process Run/Input/queue reconciliation:** shared
+      bounded scan and original logical recovery transaction; native-only
+      API/CLI stays narrow. Fixed original local `ProcessSourceV1` admits
+      positive claim-gated no-start (never absent-claim alone) and exact
+      claimed positive release; actual quiescence must first be consumed
+      by the original per-effect owner. Reject legacy/unmarked Process,
+      mixed routes and unsupported intents. Real Actor losses at original
+      intent ACK and after actual reaped Process, quiescence + ToolFinished
+      ACK before release; exact Store restart, release refusal/recovery,
+      immutable Turn, hazard/Input/queue Inspected, idempotent replay and
+      later pending Input only. Actor lifecycle 3/3 passed.
+      Host native/Process 2/2, native executable 1/1, Store Sandbox
+      owner 4/4, strict affected Clippy, durable/minimal checks, version/help
+      and scoped fmt/diff passed.
+      **Next:** general reviewed containment driver and broader
+      source-aware Job/Graph/extension dispatch. No arbitrary shell CLI or
+      strong Unix backend promoted; nonstandard/overlapping linked layouts
+      and unmarked legacy native/Process no-start remain held.
+      Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

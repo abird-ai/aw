@@ -26,7 +26,85 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: source-aware foreground Process Job dispatch
+## Latest local implementation delta — 2026-11-26: original Process Run/Input/queue reconciliation
+
+Parent `8bcdb13b294b669b8a47e7c4f27c0e2758f3b5e6` (source-aware foreground
+Process Job dispatch). Published AW main remains `7b92686`. L5, clean at
+entry; Store v60, Git recovery v4 and product 0.15.0 unchanged.
+
+- Generalize the existing bounded original Run intent scan and logical
+  reconciliation transaction, not a second Process recovery owner.
+  `SessionStore::reconcile_source_turn` returns `SourceTurnReconciliation`
+  with the same fields as the original native result (compatibility alias
+  `NativeTurnReconciliation`). The existing native-only API/CLI keeps its
+  narrow original route and Git-layout restrictions. The source entry
+  admits only the exact original local trusted-host native set or one
+  fixed foreground Process constructor (`ProcessSourceV1`, exact bash/
+  pwsh/powershell operation); no mixed route/shell name, revised intent,
+  unmarked Process, generic Job/Graph or extension promotion. Process
+  layouts must be nonempty; claimed effects retain the complete original
+  versioned binding digest, Sandbox and DriverKey checks. No current
+  physical driver lookup or grant required for this logical disposition.
+- Exclusive Store restart without a claim uses the same intent scan.
+  Positive original `ProcessSourceV1` gate proves that the OS launch
+  cannot precede the original claim transaction. Missing claim alone
+  proves nothing: reject contradictory source lease, quiescence/release
+  or successful original ToolFinished. This is no-start of the source
+  effect, not a claim that no transient Job metadata ever existed.
+  Preserve native legacy *claimed* release compatibility; legacy
+  unmarked no-start and unmarked Process remain held.
+- Claimed effects require each existing exact positive release, including
+  claimed no-spawn. A quiescence fact is not a substitute for release:
+  consume it through `recover_source_process`/original source-effect
+  settlement before whole-Run reconciliation; no synthesis or new
+  physical proof. All Process intents count toward original possible
+  effect/hazard, even read-only source grants. Recheck previous stopped/
+  fenced exclusive owner, Store scope, direct original owner Input and
+  authority segment, current Agent/Project writer and immutable layout,
+  exact terminal attached Run. Retire only that Run's hazard, Input and
+  accepted queue fact in one transaction, then original encrypted
+  payload. Preserve original Turn, paid/provider receipts and uncertainty,
+  Sandbox revision, other hazards and pending Inputs. Idempotent replay.
+- Extend actual Actor lifecycle fixture, real fixed-command source driver
+  and original Job runtime (no fake journal events). Lose Actor at actual
+  ToolStarted ACK before claim and at actual ToolFinished ACK after the
+  Process completed/reaped and its independent quiescence was committed,
+  before the release hook. Reopen exclusive Store, unclaimed case without
+  source-driver registry. Native-only reconciliation refuses both; physical
+  recovery refuses unclaimed; claimed whole-Run recovery refuses until
+  exact Process release consumes prior quiescence, with no new physical
+  driver lookup. Then exact logical reconciliation, immutable failed
+  Run/Interrupted or Succeeded original tool record, Inspected Input and
+  queue, exact replay, unchanged Git index and later pending Input.
+  Previous actual strict-containment no-spawn/success fixture remains.
+  Fixture fixes only: choose normal priorities consistent with existing
+  four-urgent fairness cap and explicitly release the temporary Git
+  resolver before reopening its Store. No queue/owner-lock changes.
+
+Validation (L5, locked/offline final source): Actor lifecycle 3/3
+(15.62s, four deliberate caught Actor losses).
+Host native/Process 2/2 (7.45s), native executable 1/1 (34.78s, both
+Git layouts), Store Sandbox owner 4/4 (2.70s). Initial integration
+filter matched zero tests; corrected to the actual Store library owner
+suite. Strict all-feature/all-target affected Clippy, durable/minimal
+all-target checks (existing feature-specific dead-code warnings), actual
+CLI version/help and scoped fmt/diff passed. Full workspace, pinned Nix
+and other native platforms not repeated.
+
+Scope: exact direct embedding-host source Process route only. Original
+proof is trusted, not inferred from direct Unix group absence or missing
+PID. Actual OS loss inside arbitrary Process effects, unqualified driver
+containment, general Job/Graph/extension dispatch, participant/shared/
+forked admission and broader Run hazards remain held. Git-backed fixture
+qualified on L5; other physical layouts/platforms not independently
+qualified. No new CLI command or frozen 017 promotion.
+
+Next: broaden reviewed source-aware Process/Job/Graph and extension
+dispatch only with the actual independent containment/authority contracts;
+then remaining Vault projection and host RPC/retention gates. Phase 3
+remains underway.
+
+## Previous local implementation delta — 2026-11-26: source-aware foreground Process Job dispatch
 
 Parent `a58e39e1ede99a5ec0119380daa6d8dd57565c9e` (exact Process
 receipt custody and independent recovery fence). Published AW main remains

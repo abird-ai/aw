@@ -221,7 +221,7 @@ pub use sandbox_owner::{
     SandboxMaterializationRequest, SandboxPolicyEvidence, SandboxRecoverySelection,
     SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease, SandboxToolRecovery,
     SandboxToolRecoverySelection, SandboxToolTerminalRef, SourceBindingCompatibility,
-    SourceBindingSummary,
+    SourceBindingSummary, SourceTurnReconciliation,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;

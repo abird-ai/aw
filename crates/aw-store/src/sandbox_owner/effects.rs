@@ -21,7 +21,7 @@ use std::future::Future;
 pub(crate) mod journal;
 pub use journal::{
     NativeTurnReconciliation, SandboxToolRecovery, SandboxToolRecoverySelection,
-    SandboxToolTerminalRef,
+    SandboxToolTerminalRef, SourceTurnReconciliation,
 };
 
 /// A live decision of the trusted policy/tool authority owner. Implementors
