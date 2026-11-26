@@ -60,6 +60,24 @@ pub trait SourceProcessDriver: Send + Sync + 'static {
         ))
     }
 
+    /// File/Socket require explicit review of the descriptor consumer and
+    /// its complete physical lifetime. Legacy Env-only drivers stay narrow.
+    fn prepare_with_signing_capability(
+        &self,
+        plan: &SandboxEffectPlan,
+        arguments: &serde_json::Value,
+        selection: &SigningProcessProof,
+        projection: VaultProjection,
+    ) -> Result<(PreparedPipeLaunch<Self::Pins>, Self::Witness)> {
+        if projection == VaultProjection::Env {
+            self.prepare_with_signing_proof(plan, arguments, selection)
+        } else {
+            Err(Error::Denied(
+                "source Process driver has no reviewed capability projection",
+            ))
+        }
+    }
+
     fn prove_quiescent(
         &self,
         witness: Self::Witness,
@@ -74,6 +92,7 @@ pub struct SigningProcessProjection {
     registry: VaultProviderRegistry,
     handle: VaultProviderHandle<SigningVaultProvider>,
     selection: SigningProcessProof,
+    projection: VaultProjection,
     binding: [u8; 32],
 }
 
@@ -83,7 +102,24 @@ impl SigningProcessProjection {
         handle: VaultProviderHandle<SigningVaultProvider>,
         selection: SigningProcessProof,
     ) -> Result<Self> {
+        Self::for_projection(registry, handle, selection, VaultProjection::Env)
+    }
+
+    /// Exact host-selected transport, never inferred from model arguments
+    /// or from a different current grant. Unsupported platforms refuse.
+    pub fn for_projection(
+        registry: VaultProviderRegistry,
+        handle: VaultProviderHandle<SigningVaultProvider>,
+        selection: SigningProcessProof,
+        projection: VaultProjection,
+    ) -> Result<Self> {
         selection.validate()?;
+        let kind = match projection {
+            VaultProjection::Env => 0,
+            VaultProjection::File if cfg!(target_os = "linux") => 1,
+            VaultProjection::Socket if cfg!(target_os = "linux") => 2,
+            _ => return Err(Error::Denied("signing Process projection unavailable")),
+        };
         let reader = registry.reader()?;
         reader.get(&handle)?;
         let descriptor = handle.descriptor();
@@ -92,7 +128,7 @@ impl SigningProcessProjection {
                 provider: descriptor.provider.clone(),
                 entry: selection.entry.clone(),
             },
-            VaultProjection::Env,
+            projection,
         )?;
         // This is only an in-memory sealed plan identity. No proof, key,
         // challenge or entry details are added to Agent history or receipts.
@@ -119,11 +155,16 @@ impl SigningProcessProjection {
         }
         hash.update(descriptor.registration_revision.to_le_bytes());
         hash.update(selection.grant_rev.to_le_bytes());
+        // Retain existing Env plan identity; bind other transport kinds.
+        if kind != 0 {
+            hash.update([kind]);
+        }
         let binding = hash.finalize().into();
         Ok(Self {
             registry,
             handle,
             selection,
+            projection,
             binding,
         })
     }
@@ -399,10 +440,11 @@ where
                     ));
                 }
                 let (launch, proof) = match &self.signing {
-                    Some(signing) => driver.prepare_with_signing_proof(
+                    Some(signing) => driver.prepare_with_signing_capability(
                         plan,
                         request.arguments,
                         &signing.selection,
+                        signing.projection,
                     )?,
                     None => driver.prepare(plan, request.arguments)?,
                 };
@@ -422,6 +464,7 @@ where
                     signing.registry.reader()?,
                     signing.handle.clone(),
                     signing.selection.clone(),
+                    signing.projection,
                 );
                 run_fenced_source_process(
                     prepared,

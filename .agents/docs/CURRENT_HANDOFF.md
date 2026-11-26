@@ -26,7 +26,95 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: provider-selected signing proof in original Process/Graph runtime
+## Latest local implementation delta — 2026-11-27: anonymous Vault file/socket proof capabilities
+
+Parent `34ebeb284e7587fd3f190e80b9d388504e135ea7`; published AW main
+`0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only, scoped clean at entry. Store v60, product 0.15.0,
+Git recovery v4 and frozen release unchanged.
+
+- Linux platform primitive `install_child_read_capability` owns an
+  anonymous kernel read capability in the original one-shot Command.
+  File uses non-executable sealed memfd (write/grow/shrink/seal seals,
+  MFD_NOEXEC_SEAL; unsupported kernel fails closed), rewound to start,
+  exposed through the child's /proc/self/fd/N. Socket uses connected
+  UnixStream pair, bounded nonblocking producer, read-only consumer,
+  queued payload then EOF; no listener or surviving producer. Neither
+  creates a named file, socket path, helper Process or second lifetime.
+  Kernel-allocated nonstdio descriptor remains close-on-exec in parent;
+  owned pre_exec callback clears CLOEXEC only in the exact child.
+  Command drop retires parent descriptor on success, refusal, error or
+  cancellation. Child ownership remains with actual Process/descendants;
+  trusted driver must exclude unauthorized readers/handoffs and prove
+  permanent quiescence. No general OS containment promotion.
+- Shared Process SpawnOnce adds reserved file/socket insertion and
+  reusable environment collision precheck. Original final cancellation/
+  deadline/spawn/attachment gate remains sole launcher. Linux only;
+  other targets refuse, never fall back to temp paths or ambient env.
+  No ordinary path overhead or new dependency. Existing Process
+  capture, stop/reap, receipt, Job output and source custody unchanged.
+- Existing SigningVaultProvider explicitly advertises File and Socket
+  on Linux, alongside existing Broker and Env. Derived proof transport
+  selected by `SigningProcessProjection::for_projection`; legacy
+  `new` remains Env, old proof encoding unchanged. New kinds have
+  separately domain-separated HMAC and sealed runtime identity. Exact
+  provider entry, grant revision and actual selected kind rechecked
+  inside original Sandbox/Actor/Tool/Store/provider final launch fence.
+  No raw key material. Reviewed driver opt-in
+  `prepare_with_signing_capability` defaults to original Env behavior,
+  refuses File/Socket unless explicitly implemented. The fixed provider
+  names are AW_VAULT_SIGNING_PROOF (hex), AW_VAULT_SIGNING_PROOF_FILE
+  (child-local sealed file path), AW_VAULT_SIGNING_PROOF_SOCKET_FD
+  (connected one-shot input descriptor). File/socket carry 64 hex
+  bytes plus newline. All three reserved names checked for collision,
+  including non-selected kinds, before materializing the capability.
+  Existing direct finite/interactive Env API remains compatible.
+- Actual original Process runtime test consumes each anonymous
+  capability; verifies parent CLOEXEC and exact parent object retired,
+  sealed file read and write/execute refusal, socket payload then EOF;
+  late cancellation or unused launch token after materialization
+  must retire the original parent object without spawning. Real
+  grouped Actor fixture adds four Linux cases: file requested with
+  Socket grant refuses; valid direct and Graph sealed-file consumers;
+  Socket with reserved Env collision refuses; valid direct and
+  Graph connected-socket consumers. Fixed reviewed Bash commands
+  emit only approved nonsecret constants, no raw proof/key output
+  or persisted named projection. Exact claimed no-start and writable
+  revision counts, whole Run recovery, unchanged original history,
+  source index and later queued Input. Earlier Env, native and Process
+  cases retained.
+
+Validation (L5 locked/offline): real Actor lifecycle 3/3 (52.80s;
+nineteen deliberate caught Actor losses), shared Process 9/9, Unix
+platform 14/14, Host source Process 2/2 (6.26s), standalone Vault
+signing 2/2, Sandbox owner 4/4 (2.07s), adapter library 259/259
+(1.38s), native executable 1/1 (34.29s, ordinary and linked layouts).
+Initial standalone Vault run found an obsolete universal Socket
+unsupported assertion; now verifies Linux-only File/Socket advertisement,
+while the actual cross-kind grant refusal is independently tested by
+the Actor fixture. No runtime relaxation. Strict affected all-feature/
+all-target Clippy, durable/minimal checks (existing profile dead-code
+warnings), version and scoped fmt/diff passed. 294 distinct selected
+tests passed. Full workspace, pinned Nix and other platforms not rerun.
+
+Scope: qualified concrete derived signing proof, Linux anonymous
+file and one-shot connected socket, fixed reviewed direct/foreground
+Graph consumers. Socket is a bounded one-shot delivery capability,
+not an interactive signing broker/service or arbitrary socket path.
+File requires kernel non-executable sealing and visible trusted procfs.
+Parent fd closure is factual, not proof of erasure from a child or
+arbitrary descendant; independent physical containment and quiescence
+still required. No raw secret projection, generic disclosure laundering,
+mount convergence, general arbitrary shell or cross-platform support.
+Provider rotation governs future materialization, not already-delivered
+proof bytes. No retroactive revoke claim.
+
+Next: protected raw Vault/Source disclosure propagation through original
+Job/Tool/Run owner and authorized Views; then provider-specific live
+broker/socket revocation and production containment/dispatch as required.
+Remaining host RPC, extension and retention gates remain. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-26: provider-selected signing proof in original Process/Graph runtime
 
 Parent `0f9807f41456f9a29817de4a18fbf304da6417a5`, independently
 verified published AW main at preceding push. Dotlink main `85ceccc1`, frozen

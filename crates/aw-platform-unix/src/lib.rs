@@ -22,6 +22,10 @@ pub mod fd_transfer;
 pub mod pid_identity;
 #[cfg(target_os = "linux")]
 mod process_observation;
+#[cfg(target_os = "linux")]
+mod process_projection;
+#[cfg(target_os = "linux")]
+pub use process_projection::{install_child_read_capability, ReadCapabilityKind};
 pub mod pty_poll;
 pub use aw_tools_fs_unix::scoped_fs;
 

@@ -256,6 +256,7 @@ pub use vault_grants::{
 };
 pub use vault_signing::{
     SigningBroker, SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV,
+    SIGNING_PROOF_FILE_ENV, SIGNING_PROOF_SOCKET_ENV,
 };
 pub use workspace_replica::*;
 pub use workspace_writer::{WorkspaceWriterEventInfo, WorkspaceWriterInfo};

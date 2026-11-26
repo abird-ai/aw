@@ -328,6 +328,7 @@ fn signing_projection<A, S>(
     registry: aw_agent_core::VaultProviderRegistryReader,
     handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
     selection: aw_store::SigningProcessProof,
+    projection: aw_agent_core::VaultProjection,
 ) -> impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static
 where
     A: SandboxEffectAuthority + Send + 'static,
@@ -336,25 +337,48 @@ where
     move |mut spawn, authority, boundary| {
         // A refusal leaves the one-shot token unused. The same final
         // source/ToolBinding/Store fence also holds the live provider.
-        let _ = aw_store::SigningVaultProvider::with_process_proof(
+        let _ = aw_store::SigningVaultProvider::with_process_proof_for_projection(
             &registry,
             &handle,
             boundary,
             authority,
             selection,
+            projection,
             |proof| {
-                let mut hex = [0u8; 64];
+                // All reserved integration points belong to this provider,
+                // not only the selected transport. Reject ambiguous input.
+                for name in [
+                    aw_store::SIGNING_PROOF_ENV,
+                    aw_store::SIGNING_PROOF_FILE_ENV,
+                    aw_store::SIGNING_PROOF_SOCKET_ENV,
+                ] {
+                    spawn
+                        .require_reserved_env(name)
+                        .map_err(|_| Error::Denied("reserved Vault projection collision"))?;
+                }
+                let mut hex = [b'\n'; 65];
                 const DIGITS: &[u8; 16] = b"0123456789abcdef";
-                for (byte, pair) in proof.iter().zip(hex.chunks_exact_mut(2)) {
+                for (byte, pair) in proof.iter().zip(hex[..64].chunks_exact_mut(2)) {
                     pair[0] = DIGITS[(byte >> 4) as usize];
                     pair[1] = DIGITS[(byte & 15) as usize];
                 }
-                spawn
-                    .insert_reserved_env(
+                use aw_agent_core::VaultProjection;
+                match projection {
+                    VaultProjection::Env => spawn.insert_reserved_env(
                         aw_store::SIGNING_PROOF_ENV,
-                        std::str::from_utf8(&hex).expect("ASCII proof"),
-                    )
-                    .map_err(|_| Error::Denied("reserved Vault projection collision"))?;
+                        std::str::from_utf8(&hex[..64]).expect("ASCII proof"),
+                    ),
+                    VaultProjection::File => {
+                        spawn.insert_reserved_file(aw_store::SIGNING_PROOF_FILE_ENV, &hex)
+                    }
+                    VaultProjection::Socket => {
+                        spawn.insert_reserved_socket(aw_store::SIGNING_PROOF_SOCKET_ENV, &hex)
+                    }
+                    VaultProjection::Broker => {
+                        return Err(Error::Denied("broker is not a Process proof projection"))
+                    }
+                }
+                .map_err(|_| Error::Denied("Vault Process capability unavailable"))?;
                 spawn.spawn();
                 Ok(())
             },
@@ -428,7 +452,12 @@ where
         deadline,
         cancellation,
         None,
-        signing_projection(registry, handle, selection),
+        signing_projection(
+            registry,
+            handle,
+            selection,
+            aw_agent_core::VaultProjection::Env,
+        ),
         prove_quiescent,
     )
     .await
@@ -569,7 +598,12 @@ where
         prepared,
         deadline,
         cancellation,
-        signing_projection(registry, handle, selection),
+        signing_projection(
+            registry,
+            handle,
+            selection,
+            aw_agent_core::VaultProjection::Env,
+        ),
     )
     .await
 }

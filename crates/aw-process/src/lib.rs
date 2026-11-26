@@ -149,15 +149,13 @@ pub struct SpawnOnce<'a> {
 }
 
 impl SpawnOnce<'_> {
-    /// Insert a trusted provider-reserved environment value without
-    /// overwriting an existing command or ambient value. This does not
-    /// expose command, stdio, containment or a second spawn surface.
-    pub fn insert_reserved_env(&mut self, name: &str, value: &str) -> Result<()> {
+    /// Reserve only a trusted integration point; never overwrite command
+    /// or ambient environment. Also used before creating capabilities.
+    pub fn require_reserved_env(&self, name: &str) -> Result<()> {
         if name.is_empty()
             || !name
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-            || value.contains('\0')
             || std::env::var_os(name).is_some()
             || self
                 .command
@@ -167,8 +165,63 @@ impl SpawnOnce<'_> {
         {
             return Err(Error::DeniedBeforeSpawn);
         }
+        Ok(())
+    }
+
+    /// Insert a trusted provider-reserved environment value without
+    /// exposing command, stdio, containment or a second spawn surface.
+    pub fn insert_reserved_env(&mut self, name: &str, value: &str) -> Result<()> {
+        self.require_reserved_env(name)?;
+        if value.contains('\0') {
+            return Err(Error::DeniedBeforeSpawn);
+        }
         self.command.env(name, value);
         Ok(())
+    }
+
+    /// Anonymous sealed file, located via a child-local procfs descriptor
+    /// path in the reserved environment variable. No named file is created.
+    pub fn insert_reserved_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.require_reserved_env(name)?;
+        #[cfg(target_os = "linux")]
+        {
+            let locator = aw_platform::install_child_read_capability(
+                self.command.as_std_mut(),
+                aw_platform::ReadCapabilityKind::SealedFile,
+                bytes,
+            )
+            .map_err(|_| Error::DeniedBeforeSpawn)?;
+            self.command.env(name, locator);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = bytes;
+            Err(Error::DeniedBeforeSpawn)
+        }
+    }
+
+    /// Already-connected read-only socket capability, with a bounded
+    /// payload then EOF. No listening path or surviving producer.
+    /// The reserved variable names the inherited descriptor.
+    pub fn insert_reserved_socket(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.require_reserved_env(name)?;
+        #[cfg(target_os = "linux")]
+        {
+            let locator = aw_platform::install_child_read_capability(
+                self.command.as_std_mut(),
+                aw_platform::ReadCapabilityKind::OneShotSocket,
+                bytes,
+            )
+            .map_err(|_| Error::DeniedBeforeSpawn)?;
+            self.command.env(name, locator);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = bytes;
+            Err(Error::DeniedBeforeSpawn)
+        }
     }
 
     pub fn spawn(self) {
@@ -1414,6 +1467,126 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, Error::CancelledBeforeSpawn));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn anonymous_capabilities_follow_the_original_spawn_lifetime() {
+        use std::{
+            os::unix::fs::MetadataExt as _,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+        let bash = std::env::var_os("AW_BASH")
+            .or_else(|| option_env!("AW_DEFAULT_BASH").map(Into::into))
+            .or_else(|| {
+                ["/bin/bash", "/usr/bin/bash"]
+                    .into_iter()
+                    .find(|path| std::path::Path::new(path).is_file())
+                    .map(Into::into)
+            })
+            .expect("host-approved test Bash");
+        // Actual OS spawn, no named artifact; verify exact parent object is
+        // retired on success, refusal and late cancellation. Compare identity
+        // rather than FD number (other tests can reuse the number).
+        for file in [true, false] {
+            for (cancel, refuse) in [(false, false), (true, false), (false, true)] {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let probe = cancelled.clone();
+                let observed = Arc::new(Mutex::new(None));
+                let inspect = observed.clone();
+                let mut command = Command::new(&bash);
+                command.env_clear().args(["--noprofile", "--norc", "-c", if file {
+                    r#"IFS= read -r payload < "$AW_TEST_FILE" && [[ $payload == reviewed && ! -x "$AW_TEST_FILE" ]] || exit 40
+                    if { printf changed > "$AW_TEST_FILE"; } 2>/dev/null; then exit 41; fi
+                    printf ok"#
+                } else {
+                    r#"IFS= read -r -u "$AW_TEST_SOCKET" payload && [[ $payload == reviewed ]] || exit 40
+                    if IFS= read -r -u "$AW_TEST_SOCKET" extra; then exit 41; fi
+                    printf ok"#
+                }]);
+                let control = SpawnControl::new_fenced(
+                    Instant::now() + Duration::from_secs(5),
+                    move || probe.load(Ordering::Acquire),
+                    std::future::pending(),
+                    move |mut spawn| {
+                        let name = if file {
+                            "AW_TEST_FILE"
+                        } else {
+                            "AW_TEST_SOCKET"
+                        };
+                        let result = if file {
+                            spawn.insert_reserved_file(
+                                name,
+                                b"reviewed
+",
+                            )
+                        } else {
+                            spawn.insert_reserved_socket(
+                                name,
+                                b"reviewed
+",
+                            )
+                        };
+                        if result.is_err() {
+                            return;
+                        }
+                        let locator = spawn
+                            .command
+                            .as_std()
+                            .get_envs()
+                            .find_map(|(key, value)| (key == name).then_some(value).flatten())
+                            .and_then(|value| value.to_str())
+                            .unwrap();
+                        let fd: i32 = locator.rsplit('/').next().unwrap().parse().unwrap();
+                        let path = format!("/proc/self/fd/{fd}");
+                        let meta = std::fs::metadata(&path).unwrap();
+                        // SAFETY: this descriptor is owned by the current
+                        // spawn command; querying its flags does not mutate it.
+                        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                        *inspect.lock().unwrap() = Some((path, meta.dev(), meta.ino(), flags));
+                        if cancel {
+                            cancelled.store(true, Ordering::Release);
+                        }
+                        if !refuse {
+                            spawn.spawn();
+                        }
+                    },
+                );
+                let result = Process::spawn(
+                    command,
+                    SpawnOptions {
+                        control: Some(control),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let (path, device, inode, flags) = observed
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("real anonymous projection");
+                assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+                assert!(!std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.dev() == device && meta.ino() == inode));
+                if cancel {
+                    assert!(matches!(result, Err(Error::CancelledBeforeSpawn)));
+                } else if refuse {
+                    assert!(matches!(result, Err(Error::DeniedBeforeSpawn)));
+                } else {
+                    let result = result
+                        .unwrap()
+                        .wait(std::future::pending::<()>(), Duration::from_secs(3))
+                        .await;
+                    assert_eq!(
+                        result.terminal.exit,
+                        ProcessExit::Code(0),
+                        "{:?}",
+                        result.output.stderr
+                    );
+                    assert_eq!(result.output.stdout.head, b"ok");
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

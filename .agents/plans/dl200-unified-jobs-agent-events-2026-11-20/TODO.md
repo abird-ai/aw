@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: provider-selected signing proof in original Process/Graph runtime (this checkpoint; local parent `0f9807f41456f9a29817de4a18fbf304da6417a5`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: anonymous Vault file/socket proof capabilities (this checkpoint; local parent `34ebeb284e7587fd3f190e80b9d388504e135ea7`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1828,10 +1828,27 @@ Current implementation: provider-selected signing proof in original Process/Grap
       Host 2/2, Vault signing 2/2, Sandbox owner 4/4, adapter 259/259,
       native executable 1/1, strict affected Clippy, durable/minimal,
       actual version/help and scoped fmt/diff passed. 271 tests green.
-      **Next:** actual protected file/socket capability projection and
-      retirement through original Process owner, protected disclosure,
-      remaining provider-specific production dispatch, reviewed physical
-      containment/extension and host RPC/retention. No arbitrary shell CLI
+      **Derived signing File/Socket projection:** Linux sealed anonymous
+      non-executable memfd and already-connected one-shot socket with EOF,
+      child-only inherited capability through existing SpawnOnce/Process
+      owner. Parent CLOEXEC, exact descriptor retirement, no pathname
+      artifacts/listener/extra lifetime. Explicit exact projection kind,
+      driver opt-in, distinct HMAC domains, all reserved integration
+      collision checks inside original provider/source/Actor launch
+      fence. Existing Env unchanged. Real Process child consumption,
+      refusal/cancel cleanup and grouped Actor direct/Graph file/socket,
+      cross-kind/collision refusals, original no-start/releases/history/
+      queue/index. Actor lifecycle 3/3, shared Process 9/9,
+      Unix platform 14/14, Host 2/2, Vault signing 2/2, Sandbox 4/4,
+      adapter 259/259, native executable 1/1, strict affected Clippy,
+      durable/minimal and fmt/diff passed. 294 selected tests green.
+      Obsolete Socket advertisement assertion updated for Linux only;
+      actual cross-kind grant refusal separately qualified.
+      **Next:** protected raw Vault/Source disclosure propagation and
+      authorized Views, live broker/socket revocation and remaining
+      production dispatch, reviewed containment/extension and host
+      RPC/retention. Bounded one-shot proof socket is not live broker;
+      raw file/env and arbitrary secret exposure remain held. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant

@@ -1109,6 +1109,25 @@ mod tests {
         const VAULT_GRAPH_COMMAND: &str = "[[ ${#AW_VAULT_SIGNING_PROOF} == 64 && $AW_VAULT_SIGNING_PROOF != *[!0-9a-f]* ]] || exit 41; printf graph-vault > graph-vault-created; printf graph-stdout; printf graph-stderr >&2";
         const VAULT_DIRECT_COMMAND: &str = "[[ ${#AW_VAULT_SIGNING_PROOF} == 64 && $AW_VAULT_SIGNING_PROOF != *[!0-9a-f]* ]] || exit 41; printf vault-direct > graph-vault-direct; printf graph-direct-stdout";
 
+        // Read the actual sealed file or connected socket. Only approved
+        // constant results cross the output/source disclosure boundary.
+        const VAULT_FILE_GRAPH_COMMAND: &str = concat!(
+            r#"IFS= read -r proof < "$AW_VAULT_SIGNING_PROOF_FILE" && [[ ${#proof} == 64 && $proof != *[!0-9a-f]* && -z ${AW_VAULT_SIGNING_PROOF+x}${AW_VAULT_SIGNING_PROOF_SOCKET_FD+x} ]] || exit 41; "#,
+            "printf graph-vault > graph-vault-file-created; printf graph-stdout; printf graph-stderr >&2"
+        );
+        const VAULT_FILE_DIRECT_COMMAND: &str = concat!(
+            r#"IFS= read -r proof < "$AW_VAULT_SIGNING_PROOF_FILE" && [[ ${#proof} == 64 && $proof != *[!0-9a-f]* ]] || exit 41; "#,
+            "printf vault-direct > graph-vault-file-direct; printf graph-direct-stdout"
+        );
+        const VAULT_SOCKET_GRAPH_COMMAND: &str = concat!(
+            r#"IFS= read -r -u "$AW_VAULT_SIGNING_PROOF_SOCKET_FD" proof && [[ ${#proof} == 64 && $proof != *[!0-9a-f]* && -z ${AW_VAULT_SIGNING_PROOF+x}${AW_VAULT_SIGNING_PROOF_FILE+x} ]] || exit 41; if IFS= read -r -u "$AW_VAULT_SIGNING_PROOF_SOCKET_FD" extra; then exit 42; fi; "#,
+            "printf graph-vault > graph-vault-socket-created; printf graph-stdout; printf graph-stderr >&2"
+        );
+        const VAULT_SOCKET_DIRECT_COMMAND: &str = concat!(
+            r#"IFS= read -r -u "$AW_VAULT_SIGNING_PROOF_SOCKET_FD" proof && [[ ${#proof} == 64 && $proof != *[!0-9a-f]* ]] || exit 41; if IFS= read -r -u "$AW_VAULT_SIGNING_PROOF_SOCKET_FD" extra; then exit 42; fi; "#,
+            "printf vault-direct > graph-vault-socket-direct; printf graph-direct-stdout"
+        );
+
         // A reviewed fixed builtin-only fixture, NOT a general shell
         // containment driver. It never interprets arbitrary model text.
         struct FixedProcessDriver {
@@ -1196,11 +1215,12 @@ mod tests {
                 };
                 self.prepare_fixed(plan, command_text, false)
             }
-            fn prepare_with_signing_proof(
+            fn prepare_with_signing_capability(
                 &self,
                 plan: &aw_store::SandboxEffectPlan,
                 arguments: &serde_json::Value,
                 selection: &aw_store::SigningProcessProof,
+                projection: aw_agent_core::VaultProjection,
             ) -> Result<(
                 aw_tools_adapter::process::PreparedPipeLaunch<Self::Pins>,
                 Self::Witness,
@@ -1214,10 +1234,19 @@ mod tests {
                         "fixture signing consumer requires its fixed profile",
                     ));
                 }
-                let command = if arguments == &json!({"command":VAULT_GRAPH_COMMAND}) {
-                    VAULT_GRAPH_COMMAND
-                } else if arguments == &json!({"command":VAULT_DIRECT_COMMAND}) {
-                    VAULT_DIRECT_COMMAND
+                use aw_agent_core::VaultProjection;
+                let (graph, direct) = match projection {
+                    VaultProjection::Env => (VAULT_GRAPH_COMMAND, VAULT_DIRECT_COMMAND),
+                    VaultProjection::File => (VAULT_FILE_GRAPH_COMMAND, VAULT_FILE_DIRECT_COMMAND),
+                    VaultProjection::Socket => {
+                        (VAULT_SOCKET_GRAPH_COMMAND, VAULT_SOCKET_DIRECT_COMMAND)
+                    }
+                    VaultProjection::Broker => return Err(Error::Denied("not a proof consumer")),
+                };
+                let command = if arguments == &json!({"command":graph}) {
+                    graph
+                } else if arguments == &json!({"command":direct}) {
+                    direct
                 } else {
                     return Err(Error::Denied(
                         "fixture admits only reviewed proof consumers",
@@ -1362,23 +1391,34 @@ mod tests {
                     let call = match (prompt, results.len()) {
                         (
                             "interrupt-process-graph-success"
-                            | "interrupt-process-graph-vault-success",
+                            | "interrupt-process-graph-vault-success"
+                            | "interrupt-process-graph-vault-file-success"
+                            | "interrupt-process-graph-vault-socket-success",
                             0,
                         ) => Some(ToolCall {
                             id: "graph-direct-process".into(),
                             name: "bash".into(),
-                            arguments: json!({"command":if prompt.ends_with("vault-success") { VAULT_DIRECT_COMMAND } else { GRAPH_DIRECT_COMMAND }}),
+                            arguments: json!({"command": match prompt {
+                                "interrupt-process-graph-vault-success" => VAULT_DIRECT_COMMAND,
+                                "interrupt-process-graph-vault-file-success" => VAULT_FILE_DIRECT_COMMAND,
+                                "interrupt-process-graph-vault-socket-success" => VAULT_SOCKET_DIRECT_COMMAND,
+                                _ => GRAPH_DIRECT_COMMAND,
+                            }}),
                         }),
                         (
                             "interrupt-process-graph-success"
-                            | "interrupt-process-graph-vault-success",
+                            | "interrupt-process-graph-vault-success"
+                            | "interrupt-process-graph-vault-file-success"
+                            | "interrupt-process-graph-vault-socket-success",
                             1,
                         )
                         | (
                             "interrupt-process-graph-recovery"
                             | "interrupt-process-graph-strict"
                             | "interrupt-process-graph-vault-stale"
-                            | "interrupt-process-graph-vault-collision",
+                            | "interrupt-process-graph-vault-collision"
+                            | "interrupt-process-graph-vault-file-mismatch"
+                            | "interrupt-process-graph-vault-socket-collision",
                             0,
                         ) => {
                             if prompt.ends_with("success") {
@@ -1397,6 +1437,14 @@ mod tests {
                                 }
                                 "interrupt-process-graph-strict" => {
                                     (GRAPH_STRICT_COMMAND, "graph-process-strict")
+                                }
+                                "interrupt-process-graph-vault-file-success"
+                                | "interrupt-process-graph-vault-file-mismatch" => {
+                                    (VAULT_FILE_GRAPH_COMMAND, "graph-vault-file-created")
+                                }
+                                "interrupt-process-graph-vault-socket-success"
+                                | "interrupt-process-graph-vault-socket-collision" => {
+                                    (VAULT_SOCKET_GRAPH_COMMAND, "graph-vault-socket-created")
                                 }
                                 _ => (VAULT_GRAPH_COMMAND, "graph-vault-created"),
                             };
@@ -2945,12 +2993,42 @@ mod tests {
                 "interrupt-process-graph-vault-success",
                 "graph-vault-created",
             ),
+            #[cfg(target_os = "linux")]
+            (
+                20,
+                "interrupt-process-graph-vault-file-mismatch",
+                "graph-vault-file-created",
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                21,
+                "interrupt-process-graph-vault-file-success",
+                "graph-vault-file-created",
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                22,
+                "interrupt-process-graph-vault-socket-collision",
+                "graph-vault-socket-created",
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                23,
+                "interrupt-process-graph-vault-socket-success",
+                "graph-vault-socket-created",
+            ),
         ] {
             let strict = message_id == 15;
             let inspect = message_id == 16;
             let vault_case = message_id >= 17;
-            let refused = strict || matches!(message_id, 17 | 18);
-            let mixed = matches!(message_id, 14 | 19);
+            let refused = strict || matches!(message_id, 17 | 18 | 20 | 22);
+            let mixed = matches!(message_id, 14 | 19 | 21 | 23);
+            use aw_agent_core::VaultProjection;
+            let delivery = match message_id {
+                20 | 21 => VaultProjection::File,
+                22 | 23 => VaultProjection::Socket,
+                _ => VaultProjection::Env,
+            };
             let observed_terminal = Arc::new(AtomicBool::new(false));
             let bash = std::env::var_os("AW_BASH")
                 .map(PathBuf::from)
@@ -2981,7 +3059,11 @@ mod tests {
                         provider: provider_key,
                         entry: "fixture".into(),
                     },
-                    projection: aw_agent_core::VaultProjection::Env,
+                    projection: if message_id == 20 {
+                        VaultProjection::Socket
+                    } else {
+                        delivery
+                    },
                     scope: "fixture-graph-signing".into(),
                 };
                 provider
@@ -3036,7 +3118,7 @@ mod tests {
                         approval: approval.clone(),
                         bash: bash.clone(),
                         withheld_proof: inspect.then(|| observed_terminal.clone()),
-                        signing_collision: message_id == 18,
+                        signing_collision: matches!(message_id, 18 | 22),
                     },
                 )
                 .unwrap();
@@ -3062,11 +3144,13 @@ mod tests {
             };
             let build_graph = |options: &aw_tools_adapter::LocalToolOptions| {
                 if let Some((registry, handle, _, _, proof)) = &vault {
-                    let projection = aw_host::source_process::SigningProcessProjection::new(
-                        registry.clone(),
-                        handle.clone(),
-                        proof.clone(),
-                    )?;
+                    let projection =
+                        aw_host::source_process::SigningProcessProjection::for_projection(
+                            registry.clone(),
+                            handle.clone(),
+                            proof.clone(),
+                            delivery,
+                        )?;
                     return host.build_execution_with_signing_process(
                         &store,
                         owner.clone(),
@@ -3219,13 +3303,15 @@ mod tests {
             }
             assert!(!repo.join("process-graph-skipped").exists());
             if vault_case {
+                let direct = repo.join(match delivery {
+                    VaultProjection::File => "graph-vault-file-direct",
+                    VaultProjection::Socket => "graph-vault-socket-direct",
+                    _ => "graph-vault-direct",
+                });
                 if mixed {
-                    assert_eq!(
-                        fs::read(repo.join("graph-vault-direct")).unwrap(),
-                        b"vault-direct"
-                    );
+                    assert_eq!(fs::read(direct).unwrap(), b"vault-direct");
                 } else {
-                    assert!(!repo.join("graph-vault-direct").exists());
+                    assert!(!direct.exists());
                 }
             }
             drop(source);
@@ -3443,7 +3529,9 @@ mod tests {
             );
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 26);
+        let descriptor_calls = if cfg!(target_os = "linux") { 6 } else { 0 };
+        let descriptor_turns = if cfg!(target_os = "linux") { 4 } else { 0 };
+        assert_eq!(calls.load(Ordering::SeqCst), 26 + descriptor_calls);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -3465,8 +3553,9 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 19
-                            && v.history.turns[18].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 19 + descriptor_turns
+                            && v.history.turns[18 + descriptor_turns].outcome
+                                == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -3476,7 +3565,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 29);
+        assert_eq!(calls.load(Ordering::SeqCst), 29 + descriptor_calls);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

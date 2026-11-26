@@ -432,8 +432,28 @@ impl SandboxEffectLaunch {
         expected_grant_rev: u64,
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
+        self.with_vault_projection_kind(
+            source,
+            registry,
+            vault,
+            expected_grant_rev,
+            aw_agent_core::VaultProjection::Env,
+            operation,
+        )
+    }
+
+    pub(crate) fn with_vault_projection_kind<R>(
+        self,
+        source: &impl SandboxEffectAuthority,
+        registry: &aw_agent_core::VaultProviderRegistryReader,
+        vault: &impl crate::VaultGrantAuthority,
+        expected_grant_rev: u64,
+        projection: aw_agent_core::VaultProjection,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let target = &vault.policy().target;
-        if target.agent_ref != self.request.agent_ref
+        if projection == aw_agent_core::VaultProjection::Broker
+            || target.agent_ref != self.request.agent_ref
             || target.actor != self.request.actor
             || !source
                 .tool_binding()
@@ -449,7 +469,7 @@ impl SandboxEffectLaunch {
                 registry,
                 vault,
                 expected_grant_rev,
-                aw_agent_core::VaultProjection::Env,
+                projection,
             )?;
             operation()
         })

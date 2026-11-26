@@ -190,11 +190,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     }
 
     pub fn register(self, registry: &VaultProviderRegistry) -> Result<VaultProviderHandle<Self>> {
-        registry.register(
-            self.provider.clone(),
-            vec![VaultProjection::Broker, VaultProjection::Env],
-            self,
-        )
+        registry.register(self.provider.clone(), SIGNING_PROJECTIONS.to_vec(), self)
     }
 
     fn prepare_entry(
@@ -207,10 +203,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         key: &[u8],
     ) -> Result<Entry> {
         if target.entry.provider != self.provider
-            || !matches!(
-                target.projection,
-                VaultProjection::Broker | VaultProjection::Env
-            )
+            || !SIGNING_PROJECTIONS.contains(&target.projection)
             || !(32..=128).contains(&key.len())
         {
             return Err(Error::Denied(
@@ -351,9 +344,20 @@ impl SigningProcessProof {
     }
 }
 
-/// Provider-owned integration point. Neither the Agent nor the grant may
-/// select another environment name or obtain the actual signing key.
+const SIGNING_PROJECTIONS: &[VaultProjection] = &[
+    VaultProjection::Broker,
+    VaultProjection::Env,
+    #[cfg(target_os = "linux")]
+    VaultProjection::File,
+    #[cfg(target_os = "linux")]
+    VaultProjection::Socket,
+];
+
+/// Provider-owned integration points, never model-selected targets.
+/// File: sealed anonymous file path; Socket: connected one-shot input FD.
 pub const SIGNING_PROOF_ENV: &str = "AW_VAULT_SIGNING_PROOF";
+pub const SIGNING_PROOF_FILE_ENV: &str = "AW_VAULT_SIGNING_PROOF_FILE";
+pub const SIGNING_PROOF_SOCKET_ENV: &str = "AW_VAULT_SIGNING_PROOF_SOCKET_FD";
 
 impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     /// Materialize only a domain-separated, exact-Process-bound proof. The
@@ -368,41 +372,81 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         selection: SigningProcessProof,
         project: impl FnOnce(&[u8; 32]) -> Result<R>,
     ) -> Result<R> {
+        Self::with_process_proof_for_projection(
+            registry,
+            handle,
+            launch,
+            source,
+            selection,
+            VaultProjection::Env,
+            project,
+        )
+    }
+
+    /// Derive the exact original effect's proof for the selected transport.
+    /// Env retains its original encoding. File/Socket are separately
+    /// domain-separated and require their own explicitly attached grant.
+    pub fn with_process_proof_for_projection<R>(
+        registry: &VaultProviderRegistryReader,
+        handle: &VaultProviderHandle<Self>,
+        launch: SandboxEffectLaunch,
+        source: &impl SandboxEffectAuthority,
+        selection: SigningProcessProof,
+        projection: VaultProjection,
+        project: impl FnOnce(&[u8; 32]) -> Result<R>,
+    ) -> Result<R> {
         selection.validate()?;
+        let domain: &[u8] = match projection {
+            VaultProjection::Env => b"aw-vault-process-proof-v1\0",
+            VaultProjection::File if cfg!(target_os = "linux") => {
+                b"aw-vault-process-file-proof-v1\0"
+            }
+            VaultProjection::Socket if cfg!(target_os = "linux") => {
+                b"aw-vault-process-socket-proof-v1\0"
+            }
+            _ => return Err(Error::Denied("signing Process projection unavailable")),
+        };
         let provider = registry.get(handle)?;
         provider.with_entry(&selection.entry, |authority| {
             let target = &authority.policy().target;
             if target.name != selection.name
                 || target.scope != selection.scope
-                || target.projection != VaultProjection::Env
+                || target.projection != projection
             {
                 return Err(Error::Denied(
                     "Vault Process proof scope or projection changed",
                 ));
             }
             let effect = launch.effect_id().to_owned();
-            launch.with_vault_projection(source, registry, &authority, selection.grant_rev, || {
-                let signing_key = provider.signing_key(authority.entry)?;
-                let mut mac = hmac::Context::with_key(&signing_key);
-                mac.update(b"aw-vault-process-proof-v1\0");
-                for part in [
-                    authority.policy().store_id().as_bytes(),
-                    &authority.policy().restore_generation().to_be_bytes(),
-                    target.agent_ref.as_bytes(),
-                    target.actor.as_str().as_bytes(),
-                    target.name.as_str().as_bytes(),
-                    target.entry.entry.as_bytes(),
-                    target.scope.as_bytes(),
-                    effect.as_bytes(),
-                    &selection.grant_rev.to_be_bytes(),
-                    &selection.challenge,
-                ] {
-                    mac.update(&(part.len() as u64).to_be_bytes());
-                    mac.update(part);
-                }
-                let proof = mac.sign();
-                project(proof.as_ref().try_into().expect("HMAC-SHA256 tag length"))
-            })
+            launch.with_vault_projection_kind(
+                source,
+                registry,
+                &authority,
+                selection.grant_rev,
+                projection,
+                || {
+                    let signing_key = provider.signing_key(authority.entry)?;
+                    let mut mac = hmac::Context::with_key(&signing_key);
+                    mac.update(domain);
+                    for part in [
+                        authority.policy().store_id().as_bytes(),
+                        &authority.policy().restore_generation().to_be_bytes(),
+                        target.agent_ref.as_bytes(),
+                        target.actor.as_str().as_bytes(),
+                        target.name.as_str().as_bytes(),
+                        target.entry.entry.as_bytes(),
+                        target.scope.as_bytes(),
+                        effect.as_bytes(),
+                        &selection.grant_rev.to_be_bytes(),
+                        &selection.challenge,
+                    ] {
+                        mac.update(&(part.len() as u64).to_be_bytes());
+                        mac.update(part);
+                    }
+                    let proof = mac.sign();
+                    project(proof.as_ref().try_into().expect("HMAC-SHA256 tag length"))
+                },
+            )
         })
     }
 }
@@ -1099,9 +1143,15 @@ mod tests {
         );
         assert!(sign(&store, &owner, &other_ref, rev, &target.scope).is_err());
         assert!(sign(&store, &owner, &reference, rev, "wrong-scope").is_err());
-        assert!(reader
-            .require_projection(&target.entry, VaultProjection::Socket)
-            .is_err());
+        // Registry advertisement is not a grant. The concrete descriptor
+        // transports are supported only on Linux; actual use still needs
+        // its exact independently attached projection kind.
+        for kind in [VaultProjection::File, VaultProjection::Socket] {
+            assert_eq!(
+                reader.require_projection(&target.entry, kind).is_ok(),
+                cfg!(target_os = "linux")
+            );
+        }
         assert!(store
             .agent_vault_list::<()>(&owner, &reference, |_, _| Err(Error::Denied(
                 "no metadata authority"
