@@ -103,8 +103,9 @@ fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Resu
             ToolEffect::Read | ToolEffect::Write | ToolEffect::Process
         ) || (record.effect == ToolEffect::Control
             && record.call.name == "batch"
-            && source.claim_route
-                == Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)))
+            && source
+                .claim_route
+                .is_some_and(aw_agent_core::tool::ToolClaimRoute::is_source_graph)))
     {
         return Err(Error::Conflict("invalid original source effect intent"));
     }
@@ -245,8 +246,17 @@ pub(super) fn admit_in(
     }
     let (session, _) = agent_owner::key_for_ref(tx, &request.agent_ref)?;
     crate::workspace_writer::verify_writer_epoch_for_session(tx, &session, observed.writer_epoch)?;
+    require_launchable_intent(tx, &observed.intent, admitted)?;
+    Ok(observed.intent)
+}
+
+fn require_launchable_intent(
+    tx: &Transaction<'_>,
+    intent: &Intent,
+    admitted: Option<&Intent>,
+) -> Result<()> {
     if let Some(admitted) = admitted {
-        if admitted != &observed.intent {
+        if admitted != intent {
             return Err(Error::Conflict("original admitted tool intent changed"));
         }
         require_claim(tx, admitted)?;
@@ -257,12 +267,12 @@ pub(super) fn admit_in(
                 "original source effect is no longer launchable",
             ));
         }
-    } else if claim_in(tx, &observed.intent.effect_id())?.is_some() {
+    } else if claim_in(tx, &intent.effect_id())?.is_some() {
         return Err(Error::Conflict(
             "original source effect was already claimed; never relaunch",
         ));
     }
-    Ok(observed.intent)
+    Ok(())
 }
 
 /// One immutable custody link. Retain the named modes and digest of the
@@ -566,13 +576,19 @@ pub(super) fn release_in(
 #[derive(Clone, Debug)]
 pub struct SandboxGraphNodeRecovery {
     pub binding: aw_tools::filesystem::job_manager::NodeExecutionBinding,
-    pub tool: aw_tools::filesystem::schema::Tool,
+    pub tool: aw_tools::filesystem::batch::NodeTool,
     pub arguments: serde_json::Value,
 }
 
 impl SandboxGraphNodeRecovery {
     pub fn effect(&self) -> ToolEffect {
-        if self.tool.action() == aw_tools::filesystem::access::Action::Read {
+        if self.tool.is_shell() {
+            ToolEffect::Process
+        } else if self
+            .tool
+            .native()
+            .is_some_and(|tool| tool.action() == aw_tools::filesystem::access::Action::Read)
+        {
             ToolEffect::Read
         } else {
             ToolEffect::Write

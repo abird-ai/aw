@@ -48,17 +48,27 @@ pub(super) enum RecoveryScope {
 pub(super) enum IntentRoute {
     Native,
     Process(OperationId),
-    NativeGraph,
+    Graph {
+        marker: ToolClaimRoute,
+        process: Option<OperationId>,
+    },
 }
 
 impl IntentRoute {
     fn from_observed(observed: &Observation) -> Result<Self> {
         let record = &observed.record;
-        if record.call.name == "batch"
-            && record.effect == ToolEffect::Control
-            && observed.source.claim_route == Some(ToolClaimRoute::NativeGraphSourceV1)
-        {
-            return Ok(Self::NativeGraph);
+        if record.call.name == "batch" && record.effect == ToolEffect::Control {
+            if let Some(marker) = observed
+                .source
+                .claim_route
+                .filter(|marker| marker.is_source_graph())
+            {
+                let graph = super::node::original_graph(observed)?;
+                return Ok(Self::Graph {
+                    marker,
+                    process: super::node::graph_process(&graph)?,
+                });
+            }
         }
         if let Some(tool) = Tool::from_name(&record.call.name) {
             let effect = if tool.action() == Action::Read {
@@ -94,7 +104,7 @@ impl IntentRoute {
         match self {
             Self::Native => ToolClaimRoute::NativeSourceV1,
             Self::Process(_) => ToolClaimRoute::ProcessSourceV1,
-            Self::NativeGraph => ToolClaimRoute::NativeGraphSourceV1,
+            Self::Graph { marker, .. } => marker,
         }
     }
 }
@@ -104,7 +114,7 @@ pub(super) struct IntentSummary {
     pub possible_effect: bool,
     native: bool,
     legacy_native: bool,
-    graph: bool,
+    graph: Option<ToolClaimRoute>,
     process: Option<OperationId>,
 }
 
@@ -121,14 +131,21 @@ impl IntentSummary {
                 self.legacy_native |=
                     observed.source.claim_route != Some(ToolClaimRoute::NativeSourceV1);
             }
-            IntentRoute::NativeGraph => {
-                if scope == RecoveryScope::NativeOnly {
+            IntentRoute::Graph { marker, process } => {
+                if scope == RecoveryScope::NativeOnly
+                    || self.graph.is_some_and(|old| old != marker)
+                    || process.is_some_and(|new| self.process.is_some_and(|old| old != new))
+                {
                     return Err(Error::Denied(
-                        "native-only recovery excludes Graph constructors",
+                        "Run differs from its original fixed Graph route",
                     ));
                 }
+                // The qualified Graph host still uses its original Git layout.
                 self.native = true;
-                self.graph = true;
+                self.graph = Some(marker);
+                if process.is_some() {
+                    self.process = process;
+                }
             }
             IntentRoute::Process(operation) => {
                 if scope == RecoveryScope::NativeOnly
@@ -141,12 +158,12 @@ impl IntentSummary {
                 self.process = Some(operation);
             }
         }
-        if self.graph && self.process.is_some() {
+        if self.graph == Some(ToolClaimRoute::NativeGraphSourceV1) && self.process.is_some() {
             return Err(Error::Denied(
                 "original source route cannot mix native Graph and Process",
             ));
         }
-        if (self.graph || self.process.is_some()) && self.legacy_native {
+        if (self.graph.is_some() || self.process.is_some()) && self.legacy_native {
             return Err(Error::Denied(
                 "mixed source Run contains an unmarked native intent",
             ));
@@ -169,7 +186,7 @@ impl IntentSummary {
     }
 
     fn note(&self) -> &'static str {
-        if self.graph {
+        if self.graph.is_some() {
             return "Original Graph node source releases or claim-gated no-start verified; original Run retained, no replay";
         }
         match (self.native, self.process.is_some()) {
@@ -188,7 +205,7 @@ pub(super) fn require_unclaimed_no_start(
     observed: &Observation,
     route: IntentRoute,
 ) -> Result<()> {
-    if route == IntentRoute::NativeGraph {
+    if matches!(route, IntentRoute::Graph { .. }) {
         return super::node::require_unclaimed_graph(c, observed);
     }
     let effect_id = observed.intent.effect_id();
@@ -249,7 +266,7 @@ pub(super) fn inspect_source_intents(
         possible_effect: false,
         native: false,
         legacy_native: false,
-        graph: false,
+        graph: None,
         process: None,
     };
     let mut count = 0;
@@ -318,7 +335,7 @@ fn require_releases(
     let mut no_start = 0;
     let mut effects = 0;
     let summary = inspect_source_intents(c, run, agent, turn, actor, scope, |observed, route| {
-        if route == IntentRoute::NativeGraph {
+        if matches!(route, IntentRoute::Graph { .. }) {
             let (claimed, unclaimed) = super::node::require_graph_releases(c, observed, sandbox)?;
             effects += claimed;
             no_start += unclaimed;

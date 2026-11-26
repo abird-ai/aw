@@ -1072,6 +1072,7 @@ mod tests {
         use aw_store::{AgentAdmission, AgentHistoryForkAccess, CheckpointRestoreRequest};
         use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity};
         use serde_json::json;
+        use std::sync::atomic::AtomicBool;
         use std::{
             fs,
             io::Write,
@@ -1098,11 +1099,20 @@ mod tests {
         const MIXED_COMMAND: &str =
             "printf mixed-process > mixed-process-created; printf mixed-stdout";
 
+        const GRAPH_COMMAND: &str = "printf graph-process > graph-process-created; printf graph-stdout; printf graph-stderr >&2";
+        const GRAPH_RECOVERY_COMMAND: &str = "printf graph-recovered > graph-process-recovery; printf graph-stdout; printf graph-stderr >&2";
+        const GRAPH_DIRECT_COMMAND: &str =
+            "printf graph-direct > graph-direct-created; printf graph-direct-stdout";
+        const GRAPH_STRICT_COMMAND: &str = "printf must-not-start > graph-process-strict";
+
         // A reviewed fixed builtin-only fixture, NOT a general shell
         // containment driver. It never interprets arbitrary model text.
         struct FixedProcessDriver {
             approval: aw_host::source_approval::NativeSourceApproval,
             bash: PathBuf,
+            // Deliberately withhold proof AFTER actual reaping. The later
+            // offline fixture can inspect this exact known builtin-only run.
+            withheld_proof: Option<Arc<AtomicBool>>,
         }
         impl aw_host::source_process::SourceProcessDriver for FixedProcessDriver {
             type Pins = aw_platform::DirectoryIdentity;
@@ -1125,6 +1135,14 @@ mod tests {
                     RECOVERY_COMMAND
                 } else if arguments == &json!({"command":MIXED_COMMAND}) {
                     MIXED_COMMAND
+                } else if arguments == &json!({"command":GRAPH_COMMAND}) {
+                    GRAPH_COMMAND
+                } else if arguments == &json!({"command":GRAPH_RECOVERY_COMMAND}) {
+                    GRAPH_RECOVERY_COMMAND
+                } else if arguments == &json!({"command":GRAPH_DIRECT_COMMAND}) {
+                    GRAPH_DIRECT_COMMAND
+                } else if arguments == &json!({"command":GRAPH_STRICT_COMMAND}) {
+                    GRAPH_STRICT_COMMAND
                 } else {
                     return Err(Error::Denied(
                         "fixture driver admits only reviewed fixed commands",
@@ -1168,6 +1186,12 @@ mod tests {
                     terminal.exit,
                     aw_tools::filesystem::runner::ProcessExit::Code(0)
                 );
+                if let Some(observed) = &self.withheld_proof {
+                    observed.store(true, Ordering::SeqCst);
+                    return Err(Error::Denied(
+                        "fixture Process quiescence proof unavailable",
+                    ));
+                }
                 Ok(witness)
             }
         }
@@ -1254,6 +1278,16 @@ mod tests {
                         assert!(tools[0].parameters["properties"]
                             .get("background")
                             .is_none());
+                    } else if prompt.starts_with("interrupt-process-graph-") {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<std::collections::BTreeSet<_>>(),
+                            std::collections::BTreeSet::from(["batch", "bash", "read", "write"])
+                        );
+                        let batch = tools.iter().find(|tool| tool.name == "batch").unwrap();
+                        assert!(batch.parameters["properties"].get("background").is_none());
                     } else if prompt.starts_with("interrupt-graph-") {
                         assert_eq!(
                             tools
@@ -1276,6 +1310,43 @@ mod tests {
                         assert_eq!(tools.len(), 2);
                     }
                     let call = match (prompt, results.len()) {
+                        ("interrupt-process-graph-success", 0) => Some(ToolCall {
+                            id: "graph-direct-process".into(),
+                            name: "bash".into(),
+                            arguments: json!({"command":GRAPH_DIRECT_COMMAND}),
+                        }),
+                        ("interrupt-process-graph-success", 1)
+                        | (
+                            "interrupt-process-graph-recovery" | "interrupt-process-graph-strict",
+                            0,
+                        ) => {
+                            if prompt == "interrupt-process-graph-success" {
+                                assert!(
+                                    results[0].content.contains("graph-direct-stdout"),
+                                    "{:?}",
+                                    results[0]
+                                );
+                            }
+                            let (command, path) = match prompt {
+                                "interrupt-process-graph-success" => {
+                                    (GRAPH_COMMAND, "graph-process-created")
+                                }
+                                "interrupt-process-graph-recovery" => {
+                                    (GRAPH_RECOVERY_COMMAND, "graph-process-recovery")
+                                }
+                                _ => (GRAPH_STRICT_COMMAND, "graph-process-strict"),
+                            };
+                            Some(ToolCall {
+                                id: "source-process-graph".into(),
+                                name: "batch".into(),
+                                arguments: json!({"ops":[
+                                    ["read", {"path":"tracked"}],
+                                    ["bash", {"command":command}],
+                                    ["read", {"path":path}],
+                                    ["write", {"path":"process-graph-skipped","content":"must not exist"}, "1.fail"]
+                                ]}),
+                            })
+                        }
                         (
                             "interrupt-graph-before-claim"
                             | "interrupt-graph-after-settlement"
@@ -1871,6 +1942,7 @@ mod tests {
                     FixedProcessDriver {
                         approval: approval.clone(),
                         bash,
+                        withheld_proof: None,
                     },
                 )
                 .unwrap();
@@ -2781,6 +2853,406 @@ mod tests {
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 18);
+        for (message_id, prompt, path) in [
+            (
+                14,
+                "interrupt-process-graph-success",
+                "graph-process-created",
+            ),
+            (15, "interrupt-process-graph-strict", "graph-process-strict"),
+            (
+                16,
+                "interrupt-process-graph-recovery",
+                "graph-process-recovery",
+            ),
+        ] {
+            let strict = message_id == 15;
+            let inspect = message_id == 16;
+            let mixed = message_id == 14;
+            let observed_terminal = Arc::new(AtomicBool::new(false));
+            let bash = std::env::var_os("AW_BASH")
+                .map(PathBuf::from)
+                .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from))
+                .expect("trusted fixture Bash");
+            let store =
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap();
+            let before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            drop(refresh(&store));
+            let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
+            let approval = resolver
+                .provision_configured_approval(&manager, &approvals)
+                .unwrap();
+            drop(resolver);
+            let drivers = SandboxDriverRegistry::new();
+            let native = drivers
+                .register(
+                    DriverKey::builtin("native-filesystem").unwrap(),
+                    NativeFilesystemDriver,
+                )
+                .unwrap();
+            let driver_key = DriverKey::builtin("fixture-source-process").unwrap();
+            let driver = drivers
+                .register(
+                    driver_key.clone(),
+                    FixedProcessDriver {
+                        approval: approval.clone(),
+                        bash: bash.clone(),
+                        withheld_proof: inspect.then(|| observed_terminal.clone()),
+                    },
+                )
+                .unwrap();
+            let host =
+                GitNativeSourceHost::new(approval.clone(), handle.clone(), drivers.clone(), native)
+                    .unwrap();
+            let mut options = tools.clone();
+            options
+                .selected_tools
+                .extend(["batch".into(), "bash".into()]);
+            options.mode = aw_tools_adapter::ToolMode::Trusted;
+            options.bash = None;
+            options.local_process_containment = if strict {
+                aw_tools_adapter::process::ContainmentRequirement::ClosedDescendants
+            } else {
+                aw_tools_adapter::process::ContainmentRequirement::BestAvailable
+            };
+            let builder = || {
+                Agent::builder_from_selection(
+                    selection.clone(),
+                    AgentOptions::new("fixture", "model"),
+                )
+            };
+            let build_graph = |options: &aw_tools_adapter::LocalToolOptions| {
+                host.build_execution_with_process_graph(
+                    &store,
+                    owner.clone(),
+                    execution.clone(),
+                    builder(),
+                    options,
+                    driver.clone(),
+                )
+            };
+            assert!(build_graph(&options).is_err());
+            grant_rev = approval
+                .publish_grant(&manager, grant_rev)
+                .unwrap()
+                .revision;
+            let mut unsupported = options.clone();
+            unsupported.selected_tools.push("pwsh".into());
+            assert!(build_graph(&unsupported).is_err());
+            unsupported.selected_tools.pop();
+            unsupported.allow_wake = true;
+            assert!(build_graph(&unsupported).is_err());
+            let (mut agent, source, jobs) = build_graph(&options).unwrap();
+            let jobs_weak = Arc::downgrade(&jobs);
+            assert_eq!(
+                agent.registered_tool_names(),
+                ["bash", "batch", "read", "write"]
+            );
+            let (view, journal) = store.activate_with_source(&source).unwrap();
+            let turn_id = view.history.next_turn_id;
+            agent
+                .load_history(view.history, Some(Arc::new(journal)))
+                .unwrap();
+            let actor = actor_owner::Service::attach_for_agent_with_source(
+                store.clone(),
+                &agent,
+                source.clone(),
+            )
+            .unwrap();
+            let request_id = format!("fixture:process-graph-{message_id}");
+            actor
+                .enqueue_bound_text(
+                    &agent,
+                    &request_id,
+                    message_id,
+                    aw_store::QueueTarget::Auto,
+                    0,
+                    prompt,
+                )
+                .unwrap();
+            assert_eq!(
+                actor
+                    .admit_next_queued(&agent)
+                    .unwrap()
+                    .unwrap()
+                    .request
+                    .request_id,
+                request_id
+            );
+            let task = tokio::spawn(async move {
+                actor
+                    .run_once(&mut agent, |event| {
+                        if let aw_agent_core::AgentEvent::ToolFinished { record, .. } = event {
+                            if record.call.name == "batch" {
+                                assert_eq!(
+                                    record.status,
+                                    if inspect {
+                                        aw_agent_core::ToolStatus::Interrupted
+                                    } else if strict {
+                                        aw_agent_core::ToolStatus::Failed
+                                    } else {
+                                        aw_agent_core::ToolStatus::Succeeded
+                                    }
+                                );
+                                if mixed {
+                                    let output = record.output.as_ref().unwrap();
+                                    assert!(output.content.contains("graph-process"), "{output:?}");
+                                    assert!(output.content.contains("exit=0"), "{output:?}");
+                                    assert!(output.content.contains("stdout=12"), "{output:?}");
+                                    assert!(output.content.contains("stderr=12"), "{output:?}");
+                                }
+                                panic!("fixture lost original Process Graph Actor");
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await
+            });
+            let panic = task
+                .await
+                .expect_err("fixture must lose original Process Graph Actor")
+                .into_panic();
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"fixture lost original Process Graph Actor")
+            );
+            assert_eq!(observed_terminal.load(Ordering::SeqCst), inspect);
+            assert_eq!(
+                store
+                    .sandbox_get(&manager, &sandbox.canonical_ref)
+                    .unwrap()
+                    .rev,
+                before.rev + if mixed { 2 } else { 0 }
+            );
+            if strict {
+                assert!(!repo.join(path).exists());
+            } else {
+                assert_eq!(
+                    fs::read(repo.join(path)).unwrap(),
+                    if mixed {
+                        &b"graph-process"[..]
+                    } else {
+                        &b"graph-recovered"[..]
+                    }
+                );
+            }
+            assert!(!repo.join("process-graph-skipped").exists());
+            drop(source);
+            drop(jobs);
+            assert!(jobs_weak.upgrade().is_none());
+            drop(host);
+            drop(drivers);
+            drop(approval);
+            drop(store);
+            let store = if inspect {
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap()
+            } else {
+                SessionStore::open(&state).unwrap()
+            };
+            let original = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap()
+                .history
+                .turns
+                .last()
+                .unwrap()
+                .clone();
+            assert_eq!(original.id, turn_id);
+            assert_eq!(original.outcome, aw_agent_core::Outcome::Failed);
+            assert_eq!(original.tool_records.len(), if mixed { 2 } else { 1 });
+            let target = || aw_host::source_process::SourceToolRecoveryTarget {
+                agent_ref: &reference,
+                turn_id,
+                call_id: "source-process-graph",
+            };
+            let recover = |coordinate| {
+                store.sandbox_recover_recorded_graph_node(
+                    &manager,
+                    &reference,
+                    turn_id,
+                    "source-process-graph",
+                    coordinate,
+                )
+            };
+            assert!(store
+                .reconcile_native_turn(&manager, &reference, turn_id)
+                .is_err());
+            assert_eq!(recover(1).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+            assert!(recover(4).is_err());
+            let unavailable = SandboxDriverRegistry::new();
+            assert!(aw_host::source_process::recover_source_process_graph_node(
+                &store,
+                &manager,
+                aw_host::source_process::SourceGraphNodeRecoveryTarget {
+                    constructor: target(),
+                    coordinate: 1
+                },
+                &sandbox.canonical_ref,
+                &unavailable,
+                &driver,
+                |_, _| -> Result<()> { panic!("Process recovery cannot inspect native sibling") },
+            )
+            .is_err());
+            if inspect {
+                assert!(recover(2).is_err());
+                assert!(store
+                    .reconcile_source_turn(&manager, &reference, turn_id)
+                    .is_err());
+                assert!(aw_host::source_process::recover_source_process_graph_node(
+                    &store,
+                    &manager,
+                    aw_host::source_process::SourceGraphNodeRecoveryTarget {
+                        constructor: target(),
+                        coordinate: 2
+                    },
+                    &sandbox.canonical_ref,
+                    &unavailable,
+                    &driver,
+                    |_, _| -> Result<()> { panic!("missing registered driver") },
+                )
+                .is_err());
+                // Reopen independently approved physical checkout. The
+                // reviewed builtin-only fixture's original actual reaping
+                // was observed; no other writer/descendant exists here.
+                drop(refresh(&store));
+                let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
+                let approval = resolver
+                    .provision_configured_approval(&manager, &approvals)
+                    .unwrap();
+                let drivers = SandboxDriverRegistry::new();
+                let recovery_driver = drivers
+                    .register(
+                        driver_key,
+                        FixedProcessDriver {
+                            approval: approval.clone(),
+                            bash,
+                            withheld_proof: None,
+                        },
+                    )
+                    .unwrap();
+                let result = aw_host::source_process::recover_source_process_graph_node(
+                    &store,
+                    &manager,
+                    aw_host::source_process::SourceGraphNodeRecoveryTarget {
+                        constructor: target(),
+                        coordinate: 2,
+                    },
+                    &sandbox.canonical_ref,
+                    &drivers,
+                    &recovery_driver,
+                    |implementation, recovery| {
+                        assert!(observed_terminal.load(Ordering::SeqCst));
+                        let node = recovery.node.as_ref().unwrap();
+                        assert_eq!(node.binding.coordinate, 2);
+                        assert_eq!(node.tool.operation(), aw_tools::OperationId::Bash);
+                        assert_eq!(node.arguments, json!({"command":GRAPH_RECOVERY_COMMAND}));
+                        assert_eq!(recovery.original.call.name, "batch");
+                        assert_eq!(recovery.effect(), aw_agent_core::ToolEffect::Process);
+                        assert_eq!(
+                            recovery.terminal.status,
+                            aw_agent_core::ToolStatus::Interrupted
+                        );
+                        let guard = implementation.approval.read()?;
+                        assert_eq!(guard.roots().len(), 1);
+                        assert_eq!(recovery.sources[0], guard.roots()[0].source);
+                        let pin = aw_platform::DirectoryIdentity::open(guard.base())?;
+                        assert_eq!(
+                            pin.identity()?,
+                            (
+                                guard.roots()[0].physical.volume,
+                                guard.roots()[0].physical.object
+                            )
+                        );
+                        Ok((guard, pin))
+                    },
+                )
+                .unwrap();
+                assert_eq!(result, aw_store::SandboxEffectOutcome::Settled);
+                drop(drivers);
+                drop(approval);
+                drop(resolver);
+            }
+            let expected = if strict {
+                aw_store::SandboxEffectOutcome::NotStarted
+            } else {
+                aw_store::SandboxEffectOutcome::Settled
+            };
+            assert_eq!(
+                aw_host::source_process::recover_source_process_graph_node(
+                    &store,
+                    &manager,
+                    aw_host::source_process::SourceGraphNodeRecoveryTarget {
+                        constructor: target(),
+                        coordinate: 2
+                    },
+                    &sandbox.canonical_ref,
+                    &unavailable,
+                    &driver,
+                    |_, _| -> Result<()> { panic!("released Process node must not inspect") },
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(recover(2).unwrap(), expected);
+            if mixed {
+                assert_eq!(recover(3).unwrap(), aw_store::SandboxEffectOutcome::Settled);
+                assert_eq!(
+                    store
+                        .sandbox_recover_tool_source_effect(
+                            &manager,
+                            &reference,
+                            turn_id,
+                            "graph-direct-process",
+                            |_| panic!("released direct Process must not inspect")
+                        )
+                        .unwrap(),
+                    aw_store::SandboxEffectOutcome::Settled
+                );
+            } else {
+                assert!(recover(3).is_err());
+            }
+            let result = store
+                .reconcile_source_turn(&manager, &reference, turn_id)
+                .unwrap();
+            assert_eq!(result.source_effects, if mixed { 4 } else { 2 });
+            assert_eq!(result.unclaimed_no_start, if mixed { 1 } else { 2 });
+            assert!(result.hazard_cleared && result.changed);
+            assert_eq!(result.queue, Some(aw_store::QueueState::Inspected));
+            let replay = store
+                .reconcile_source_turn(&manager, &reference, turn_id)
+                .unwrap();
+            assert!(!replay.changed && !replay.hazard_cleared);
+            let after = store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap();
+            assert_eq!(json!(after.history.turns.last().unwrap()), json!(original));
+            assert!(!after.history.needs_reconciliation);
+            assert_eq!(
+                store
+                    .actor_queue_fact(&owner, &session, "fixture:next")
+                    .unwrap()
+                    .state,
+                aw_store::QueueState::Pending
+            );
+            assert_eq!(
+                store
+                    .sandbox_get(&manager, &sandbox.canonical_ref)
+                    .unwrap()
+                    .rev,
+                before.rev
+                    + if mixed {
+                        2
+                    } else if inspect {
+                        1
+                    } else {
+                        0
+                    }
+            );
+            assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 22);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -2802,8 +3274,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 13
-                            && v.history.turns[12].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 16
+                            && v.history.turns[15].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -2813,7 +3285,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 21);
+        assert_eq!(calls.load(Ordering::SeqCst), 25);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

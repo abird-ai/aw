@@ -26,7 +26,108 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: exact native Graph physical recovery and compact Job status
+## Latest local implementation delta — 2026-11-26: registered foreground Process Graph nodes
+
+Parent `148b127c1d18ac73805415d316c81882192b6c5d`; last verified
+published AW main `3eb2da22`, dotlink main `85ceccc1`, frozen release
+`576d0a1a`. L5 only, scoped clean at entry. Store v60, product 0.15.0
+and Git recovery v4 unchanged.
+
+- Add exact `ProcessGraphSourceV1` trusted-host constructor route,
+  distinct from original native-only `NativeGraphSourceV1` so saved
+  native-only intents can never be reinterpreted as Process. Shared
+  marker/peer predicates enforce exact native or Process binding.
+  `GitNativeSourceHost::build_execution_with_process_graph` requires
+  explicit batch selection, at least one eligible native peer and one
+  registered foreground shell constructor. Reuse the same independent
+  Git approval, typed driver, original Agent registry, source fence
+  and root-free JobRuntime. The source Graph executor extends the
+  original native operation route: one actual route object, not two
+  unrelated executors. No ambient shell/filesystem fallback, nested,
+  background, interactive, wake, dynamic router or additional controls.
+  Native-only Graph and direct native+Process builders stay narrow.
+- The existing JobHost seals constructor+peer authority in each Graph
+  plan, keeps direct Process task authority distinct in the same
+  runtime, and supplies the original RunningNode, exact constructor
+  and peer snapshots to the registered source Process executor.
+  `SourceProcessGraphNode` is a borrowed observation of the original
+  owner. Original streams, deadline, PipeProcess spawn/reap/terminal
+  facts and JobManager result retention stay authoritative. Source
+  worker defers positive physical proof against its actual original
+  node or direct intent. The original ShellNode terminal persist
+  callback consumes that exact proof/release before local terminal
+  projection; missing proof yields Unknown, not success. Keep full
+  receipt metadata and existing ordinary local behavior.
+- Use the existing atomic combined ToolBinding/Actor Envelope fence
+  for both claim and the final one-shot physical launch. Source Process
+  also watches the constructor grant as well as peer withdrawal.
+  Store checks the immutable constructor, actual sealed Graph/task/
+  coordinate/plan, exact source/driver, complete named binding set and
+  original writer. Reuse the exact admitted intent at final spawn
+  (not a second claim); native driver cannot own Process node and vice
+  versa. All Process nodes of one Graph use the same original shell
+  route and DriverKey. No schema/ledger addition. Keep serial Graph
+  width and direct source tool ceiling.
+- Generalize original Graph recovery view's tool to shared NodeTool
+  (native or Process), still actual outer ToolRecords; never synthesize
+  peer receipts. Original bounded Run scan accepts direct Process and
+  marked mixed Graph in the same Run only with one shell operation;
+  native-only marker rejects Process. Claim-gated no-start and exact
+  per-node release remain required. `recover_source_process_graph_node`
+  takes `SourceGraphNodeRecoveryTarget` (constructor+coordinate) and
+  exact original driver/Sandbox/Process selector; existing recorded
+  proof/release replays before registry lookup. Fresh inspection needs
+  actual registered typed driver with matching operation and
+  independent permanently quiescent scope; proof guard held through
+  existing atomic source release, no new node terminal/history.
+  Native physical inspector cannot consume a Process node. Whole
+  Run hazard/Input/queue reconciliation remains separate.
+- Extend real grouped Actor lifecycle fixture with three mixed Graph
+  cuts: actual direct Bash then native read, real registered Process,
+  native read and conditional skip in same original Turn (two
+  writable revision advances, exact two stream counts and retained
+  exit); strict closed-descendant refusal before spawn with exact
+  claimed no-start; actual reaped reviewed builtin-only Process
+  whose independent driver proof is deliberately withheld, restart
+  and typed independent recovery with original checkout pins.
+  Wrong native sibling/absent registry refused, positive release
+  replay requires no implementation. Whole Run held until missing
+  proof consumed, then only original Input/queue retired, unchanged
+  immutable Turn/Git index, later pending Input dispatched once.
+  Prior direct/native Graph/artifact fault cuts remain. First fixture
+  attempt used native Workspace mode, correctly denied shell; select
+  explicit Trusted fixture mode, no production permission change.
+
+Validation (L5, locked/offline final source): Actor lifecycle 3/3
+(33.52s; twelve deliberate caught Actor losses in the grouped fixture),
+adapter library 259/259 (1.39s), binding authority 6/6, Host native/
+Process 2/2 (6.29s), standalone Store Sandbox owner 4/4 (2.17s),
+shared Job 89/89, Process projection 4/4, native executable 1/1
+(34.47s, ordinary and linked layouts). Strict affected all-feature/
+all-target Clippy, durable/minimal checks (existing profile-specific
+dead-code warnings), actual version/help and scoped fmt/diff passed.
+368 distinct selected tests passed. Full workspace, pinned Nix and
+other native platforms not repeated.
+
+Scope: fixed serial foreground Graph on qualified Git embedding-host
+route. Actual reviewed builtin-only fixture proves receipt/custody
+composition, not arbitrary shell or kernel descendant containment.
+Strict Unix containment still refuses before spawn. The withheld-proof
+test retains actual observed reap in fixture memory, independent
+approval and fixed no-descendant semantics; not an arbitrary OS-crash
+proof. Combined authority revalidation and watch implemented; no
+separate arbitrary live-revocation/escape qualification. No public
+Graph activation CLI, dynamic extension, shared/forked/participant
+scope, pin change or frozen release modification.
+
+Next: provider-specific Vault projection through these original
+source-aware Process/Graph owners (actual independently held file/
+env/socket capability and protected disclosure), general reviewed
+physical containment and extension dispatch, then remaining
+production Sandbox/Vault host RPC and retention gates. Phase 3
+remains underway.
+
+## Previous local implementation delta — 2026-11-26: exact native Graph physical recovery and compact Job status
 
 Parent `d10ab7b5033f25524aca30961ca464c3f5f3d16d`. Published AW main
 `3eb2da22`; dotlink main `85ceccc1`; frozen release `576d0a1a`.

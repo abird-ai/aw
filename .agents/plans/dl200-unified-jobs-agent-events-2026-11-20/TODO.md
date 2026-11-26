@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact native Graph physical recovery and compact Job status (this checkpoint; local parent `d10ab7b5033f25524aca30961ca464c3f5f3d16d`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: registered foreground Process Graph nodes (this checkpoint; local parent `148b127c1d18ac73805415d316c81882192b6c5d`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1798,9 +1798,26 @@ Current implementation: exact native Graph physical recovery and compact Job sta
       strict affected Clippy, durable/minimal checks, version/help and
       scoped fmt/diff passed. 362 selected tests green. Private offline
       recovery settlement preserves original live node callback boundary.
-      **Next:** qualified Process-containing foreground Graph and extension
-      dispatch, reviewed actual containment driver, then Vault projection
-      and remaining host RPC/retention. No arbitrary shell CLI
+      **Registered foreground Process Graph:** distinct marked mixed
+      constructor, one fixed registered shell route with native peers,
+      same root-free original JobRuntime, direct Process still works.
+      Exact sealed RunningNode+constructor/peer authority at claim and
+      final launch, both grant watches, actual receipt/output owner,
+      deferred proof and original node terminal persist release. Reuse
+      same native route/approval and exact source driver, complete source
+      barrier. Shared exact node view/recovery typed Process inspector,
+      original no-start/positive release and one-shell Run reconciliation.
+      Grouped real Actor cuts: direct Process then mixed Graph, strict
+      containment refusal, actual reaped Process with missing independent
+      proof and exact physical recovery, immutable history and queue.
+      Actor lifecycle 3/3, adapter 259/259, binding authority 6/6,
+      Host 2/2, standalone Store 4/4, shared Job 89/89, runner 4/4,
+      actual native executable 1/1, strict affected Clippy,
+      durable/minimal, version/help and scoped fmt/diff passed.
+      368 selected tests green.
+      **Next:** provider-specific Vault projection through original
+      source-aware Process/Graph owners, general reviewed physical
+      containment and extension dispatch, remaining host RPC/retention. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant

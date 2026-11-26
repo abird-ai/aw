@@ -60,10 +60,13 @@ impl SandboxExecution {
             .filter(|binding| binding.effect == ToolEffect::Process)
             .count();
         let graph = bindings.iter().any(|binding| binding.name == "batch");
-        if graph && (process_count != 0 || bindings.len() < 2) {
-            return Err(Error::Denied(
-                "native Graph source selection requires fixed native nodes only",
-            ));
+        let graph_route = if process_count == 0 {
+            aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1
+        } else {
+            aw_agent_core::tool::ToolClaimRoute::ProcessGraphSourceV1
+        };
+        if graph && bindings.len() < 2 {
+            return Err(Error::Denied("source Graph requires fixed peer nodes"));
         }
 
         if bindings.is_empty()
@@ -85,8 +88,7 @@ impl SandboxExecution {
                 let constructor = graph
                     && binding.name == "batch"
                     && binding.effect == ToolEffect::Control
-                    && binding.claim_route
-                        == Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1);
+                    && binding.claim_route == Some(graph_route);
                 !(native || process || constructor)
                     || binding.source != ToolSource::trusted_host()
                     || binding.execution_site != bindings[0].execution_site

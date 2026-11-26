@@ -99,7 +99,7 @@ where
         execution: AgentExecutionBinding,
         builder: AgentBuilder,
         options: &LocalToolOptions,
-        native: Option<Arc<dyn aw_tools_adapter::operation_router::OperationRouter>>,
+        native: Option<Arc<dyn aw_tools_adapter::native_filesystem::SourceGraphExecutor>>,
     ) -> Result<(Agent, SandboxExecution, Arc<JobRuntime>)> {
         let driver = self.registry.reader()?.get(&self.driver)?;
         let route = Arc::new(SourceProcessRoute {
@@ -117,6 +117,16 @@ where
         // The Agent extension/source handle own the route; the shell
         // registry only retains a weak reference. Avoid a Store/registry cycle.
         let configured = match native {
+            Some(native) if options.selected_tools.iter().any(|name| name == "batch") => {
+                aw_tools_adapter::configure_source_graph_with_process(
+                    builder,
+                    actor.clone(),
+                    options,
+                    native,
+                    route.operation,
+                    route.clone(),
+                )?
+            }
             Some(native) => aw_tools_adapter::configure_source_tools(
                 builder,
                 actor.clone(),
@@ -180,7 +190,12 @@ where
         if request.operation != self.operation
             || ctx.actor != self.actor
             || ctx.identity.actor != ctx.actor
-            || ctx.effect != ToolEffect::Process
+            || ctx.effect
+                != if request.graph.is_some() {
+                    ToolEffect::Control
+                } else {
+                    ToolEffect::Process
+                }
             || ctx.source != ToolSource::trusted_host()
             || ctx.execution_site != "local"
             || ctx.execution_scope.is_some()
@@ -227,17 +242,34 @@ where
             &policy.sandbox_ref,
             &policy.sandbox_ref,
         )?;
-        let effect = SandboxEffectRequest {
-            actor: self.actor.clone(),
-            agent_ref: self.agent.canonical_ref().into(),
-            origin: SandboxEffectOrigin::Tool {
+        let origin = if let Some(graph) = &request.graph {
+            if graph.node.task().turn_id != ctx.turn_id
+                || graph.node.task().call_id != ctx.call_id
+                || graph.node.plan().tool().operation() != self.operation
+                || graph.node.plan().arguments() != request.arguments
+                || evidence.binding() != graph.binding
+                || graph.constructor.claim_route
+                    != Some(aw_agent_core::tool::ToolClaimRoute::ProcessGraphSourceV1)
+            {
+                return Err(Error::Denied(
+                    "source Process differs from sealed original Graph node",
+                ));
+            }
+            SandboxEffectOrigin::GraphNode(Box::new(graph.node.clone()))
+        } else {
+            SandboxEffectOrigin::Tool {
                 turn_id: ctx.turn_id,
                 call: aw_agent_core::ToolCall {
                     id: ctx.call_id.clone(),
                     name: self.operation.model_name().into(),
                     arguments: request.arguments.clone(),
                 },
-            },
+            }
+        };
+        let effect = SandboxEffectRequest {
+            actor: self.actor.clone(),
+            agent_ref: self.agent.canonical_ref().into(),
+            origin,
             sources: observation
                 .sources
                 .iter()
@@ -247,9 +279,12 @@ where
                 })
                 .collect(),
         };
-        let authority = ProcessToolAuthority::new(source, tools, evidence)?
-            .for_invocation(ctx.clone())?
-            .requiring_process_containment(self.containment);
+        let authority = ProcessToolAuthority::new(source, tools, evidence)?;
+        let authority = match &request.graph {
+            Some(graph) => authority.for_graph_node(ctx.clone(), graph.constructor.clone())?,
+            None => authority.for_invocation(ctx.clone())?,
+        }
+        .requiring_process_containment(self.containment);
         let reader = self.registry.reader()?;
         let implementation = reader.get(&self.driver)?;
         let mut witness = None;
@@ -321,6 +356,30 @@ where
         }
         Ok(())
     }
+    fn settle_node(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        node: &aw_tools::filesystem::job_manager::RunningNode,
+        transition: aw_tools::filesystem::job::Transition,
+    ) -> Result<()> {
+        if ctx.execution_owner.as_ref() != Some(&self.agent)
+            || ctx.actor != self.actor
+            || ctx.turn_id != node.task().turn_id
+            || ctx.call_id != node.task().call_id
+            || node.plan().tool().operation() != self.operation
+        {
+            return Err(Error::Denied(
+                "source Process settlement differs from original Graph node",
+            ));
+        }
+        self.store.sandbox_settle_recorded_graph_node(
+            &ctx.actor,
+            self.agent.canonical_ref(),
+            node,
+            transition,
+        )
+    }
+
     fn execute<'a>(&'a self, request: SourceJobProcessRequest<'a>) -> SourceJobProcessFuture<'a> {
         Box::pin(async move {
             match self.execute_job(request).await {

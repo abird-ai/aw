@@ -426,7 +426,10 @@ impl Tool for JobShell {
 #[derive(Clone)]
 enum BatchRuntime {
     Local(Arc<JobRuntime>),
-    Source(std::sync::Weak<JobRuntime>),
+    Source(
+        std::sync::Weak<JobRuntime>,
+        aw_agent_core::tool::ToolClaimRoute,
+    ),
 }
 
 #[derive(Clone)]
@@ -440,23 +443,31 @@ impl Batch {
         }
     }
 
-    pub(crate) fn source(runtime: Arc<JobRuntime>) -> Self {
+    pub(crate) fn source(runtime: Arc<JobRuntime>, process: bool) -> Self {
+        use aw_agent_core::tool::ToolClaimRoute;
         Self {
-            runtime: BatchRuntime::Source(Arc::downgrade(&runtime)),
+            runtime: BatchRuntime::Source(
+                Arc::downgrade(&runtime),
+                if process {
+                    ToolClaimRoute::ProcessGraphSourceV1
+                } else {
+                    ToolClaimRoute::NativeGraphSourceV1
+                },
+            ),
         }
     }
 
     fn runtime(&self) -> Result<Arc<JobRuntime>> {
         match &self.runtime {
             BatchRuntime::Local(runtime) => Ok(runtime.clone()),
-            BatchRuntime::Source(runtime) => runtime
+            BatchRuntime::Source(runtime, _) => runtime
                 .upgrade()
                 .ok_or(Error::Denied("original source Graph runtime is gone")),
         }
     }
 
     fn source_backed(&self) -> bool {
-        matches!(self.runtime, BatchRuntime::Source(_))
+        matches!(self.runtime, BatchRuntime::Source(..))
     }
 }
 impl Tool for Batch {
@@ -468,7 +479,7 @@ impl Tool for Batch {
         if self.source_backed() {
             return ToolSpec {
                 name: "batch".into(),
-                description: "Run one bounded foreground Graph of explicitly granted native source tools. Each node has its own durable source claim and settlement. Results are coordinate-keyed.".into(),
+                description: "Run one bounded foreground Graph of explicitly granted source tools. Each node has its own durable source claim and settlement. Results are coordinate-keyed.".into(),
                 parameters: aw_tools::filesystem::batch::parameters_for(tools),
                 effect: ToolEffect::Control,
             };
@@ -487,14 +498,16 @@ impl Tool for Batch {
     }
 
     fn claim_route(&self) -> Option<aw_agent_core::tool::ToolClaimRoute> {
-        self.source_backed()
-            .then_some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)
+        match &self.runtime {
+            BatchRuntime::Local(_) => None,
+            BatchRuntime::Source(_, route) => Some(*route),
+        }
     }
 
     fn is_available(&self) -> bool {
         match &self.runtime {
             BatchRuntime::Local(_) => true,
-            BatchRuntime::Source(runtime) => runtime.strong_count() != 0,
+            BatchRuntime::Source(runtime, _) => runtime.strong_count() != 0,
         }
     }
 

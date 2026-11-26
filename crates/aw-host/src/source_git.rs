@@ -976,8 +976,7 @@ impl GitNativeSourceHost {
         options: &LocalToolOptions,
     ) -> Result<
         Arc<
-            impl aw_tools_adapter::operation_router::OperationRouter
-                + aw_tools_adapter::native_filesystem::SourceGraphExecutor
+            impl aw_tools_adapter::native_filesystem::SourceGraphExecutor
                 + aw_agent_core::Extension
                 + 'static,
         >,
@@ -1045,6 +1044,50 @@ impl GitNativeSourceHost {
     /// driver with the same independent Git approval and exact Agent scope.
     /// No ambient shell, native root, or additional Graph grant.
     pub fn build_execution_with_process<D: crate::source_process::SourceProcessDriver>(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+        process: SandboxDriverHandle<D>,
+    ) -> Result<(
+        Agent,
+        SandboxExecution,
+        Arc<aw_tools_adapter::job_runtime::JobRuntime>,
+    )> {
+        if options.selected_tools.iter().any(|name| name == "batch") {
+            return Err(Error::Denied(
+                "select the explicit source Process Graph host",
+            ));
+        }
+        self.build_native_process(store, actor, execution, builder, options, process)
+    }
+
+    /// Explicit fixed foreground native/Process Graph. Both use the
+    /// original independent Git approval and registered Process driver.
+    pub fn build_execution_with_process_graph<D: crate::source_process::SourceProcessDriver>(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+        process: SandboxDriverHandle<D>,
+    ) -> Result<(
+        Agent,
+        SandboxExecution,
+        Arc<aw_tools_adapter::job_runtime::JobRuntime>,
+    )> {
+        if !options.selected_tools.iter().any(|name| name == "batch") {
+            return Err(Error::Denied(
+                "source Process Graph requires explicit batch selection",
+            ));
+        }
+        self.build_native_process(store, actor, execution, builder, options, process)
+    }
+
+    fn build_native_process<D: crate::source_process::SourceProcessDriver>(
         &self,
         store: &SessionStore,
         actor: PrincipalId,

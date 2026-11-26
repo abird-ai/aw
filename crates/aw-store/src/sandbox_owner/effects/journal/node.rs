@@ -6,30 +6,72 @@ use aw_agent_core::{tool::ToolClaimRoute, ToolSource};
 use aw_tools::{
     filesystem::{
         access::Action,
-        batch::Graph,
+        batch::{Graph, NodeTool},
         job::{Job, Transition},
         job_manager::{NodeExecutionBinding, RunningNode},
         schema::Tool,
         status::Primary,
     },
     task_fence::TaskIdentity,
+    OperationId,
 };
 
-fn original_graph(observed: &Observation) -> Result<Graph> {
+pub(super) fn original_graph(observed: &Observation) -> Result<Graph> {
+    let marker = observed
+        .source
+        .claim_route
+        .filter(|marker| marker.is_source_graph())
+        .ok_or(Error::Denied(
+            "original Graph source constructor unavailable",
+        ))?;
     if observed.record.call.name != "batch"
         || observed.record.effect != ToolEffect::Control
         || observed.record.execution_site != "local"
         || !observed.source.is_trusted_host()
-        || observed.source.claim_route != Some(ToolClaimRoute::NativeGraphSourceV1)
     {
         return Err(Error::Denied(
             "original Graph source constructor unavailable",
         ));
     }
-    Graph::compile(&observed.record.call.arguments, |tool, _| {
-        tool != Tool::Remove && tool.graph_eligible()
-    })
-    .map_err(|_| Error::Denied("original fixed native Graph is invalid"))
+    let graph = Graph::compile_with(
+        &observed.record.call.arguments,
+        |name| OperationId::from_model_name(name).and_then(NodeTool::from_operation),
+        |tool, _| {
+            tool.native()
+                .is_some_and(|tool| tool != Tool::Remove && tool.graph_eligible())
+                || (marker == ToolClaimRoute::ProcessGraphSourceV1 && tool.is_shell())
+        },
+    )
+    .map_err(|_| Error::Denied("original fixed source Graph is invalid"))?;
+    graph_process(&graph)?;
+    Ok(graph)
+}
+
+pub(super) fn graph_process(graph: &Graph) -> Result<Option<OperationId>> {
+    let mut process = None;
+    for step in graph.steps() {
+        if step.tool.is_shell() {
+            let operation = step.tool.operation();
+            if process.is_some_and(|old| old != operation) {
+                return Err(Error::Denied("original Graph has multiple shell routes"));
+            }
+            process = Some(operation);
+        }
+    }
+    Ok(process)
+}
+
+fn node_effect(tool: NodeTool) -> (ToolEffect, ToolClaimRoute) {
+    if tool.is_shell() {
+        (ToolEffect::Process, ToolClaimRoute::ProcessSourceV1)
+    } else if tool
+        .native()
+        .is_some_and(|tool| tool.action() == Action::Read)
+    {
+        (ToolEffect::Read, ToolClaimRoute::NativeSourceV1)
+    } else {
+        (ToolEffect::Write, ToolClaimRoute::NativeSourceV1)
+    }
 }
 
 fn original_task(c: &Connection, observed: &Observation) -> Result<TaskIdentity> {
@@ -122,6 +164,8 @@ pub(in crate::sandbox_owner::effects) fn admit_in(
     node: &RunningNode,
     binding: &ToolBindingSnapshot,
     constructor: &ToolBindingSnapshot,
+    driver: &DriverKey,
+    admitted: Option<&Intent>,
 ) -> Result<Intent> {
     let task = node.task();
     let observed = observe(tx, &request.agent_ref, task.turn_id, &task.call_id)?;
@@ -135,10 +179,13 @@ pub(in crate::sandbox_owner::effects) fn admit_in(
         || constructor.effect != ToolEffect::Control
         || constructor.source != ToolSource::trusted_host()
         || constructor.execution_site != "local"
-        || constructor.claim_route != Some(ToolClaimRoute::NativeGraphSourceV1)
+        || constructor.claim_route != observed.source.claim_route
+        || !constructor
+            .claim_route
+            .zip(binding.claim_route)
+            .is_some_and(|(constructor, peer)| constructor.permits_graph_peer(peer))
         || binding.source != ToolSource::trusted_host()
         || binding.execution_site != "local"
-        || binding.claim_route != Some(ToolClaimRoute::NativeSourceV1)
     {
         return Err(Error::Denied(
             "Graph node requires its original constructor and peer authority",
@@ -147,21 +194,23 @@ pub(in crate::sandbox_owner::effects) fn admit_in(
     require_binding(&graph, graph.fingerprint(), task, node.binding())?;
     let plan = node.plan();
     let step = &graph.steps()[node.binding().coordinate - 1];
-    let tool = step
-        .tool
-        .native()
-        .ok_or(Error::Denied("Graph node is not native"))?;
-    let effect = if tool.action() == Action::Read {
-        ToolEffect::Read
-    } else {
-        ToolEffect::Write
-    };
+    let (effect, marker) = node_effect(step.tool);
+    if (marker == ToolClaimRoute::NativeSourceV1
+        && driver != &DriverKey::builtin("native-filesystem")?)
+        || (marker == ToolClaimRoute::ProcessSourceV1
+            && driver == &DriverKey::builtin("native-filesystem")?)
+    {
+        return Err(Error::Denied(
+            "Graph node differs from registered source driver route",
+        ));
+    }
     if plan.coordinate() != node.binding().coordinate
         || plan.replay_identity() != node.binding().plan_identity
         || plan.tool() != step.tool
         || plan.arguments() != &step.arguments
-        || binding.name != tool.name()
+        || binding.name != step.tool.name()
         || binding.effect != effect
+        || binding.claim_route != Some(marker)
         || (effect == ToolEffect::Read
             && request
                 .sources
@@ -180,11 +229,21 @@ pub(in crate::sandbox_owner::effects) fn admit_in(
         ));
     }
     require_sibling_job(tx, &observed, node.binding())?;
+    if effect == ToolEffect::Process {
+        for (index, step) in graph.steps().iter().enumerate() {
+            if step.tool.is_shell() {
+                if let Some(claim) = claim_in(tx, &key(&observed, index + 1))? {
+                    if claim.driver != *driver {
+                        return Err(Error::Conflict("original Graph Process driver changed"));
+                    }
+                }
+            }
+        }
+    }
     let intent = intent_for(&observed, node.binding());
-    if claim_in(tx, &intent.effect_id())?.is_some() {
-        return Err(Error::Conflict(
-            "original Graph node was already claimed; never relaunch",
-        ));
+    require_launchable_intent(tx, &intent, admitted)?;
+    if admitted.is_some() && require_claim(tx, &intent)?.driver != *driver {
+        return Err(Error::Conflict("original Graph node driver changed"));
     }
     Ok(intent)
 }
@@ -209,12 +268,26 @@ fn node_claim(
     if node.coordinate != coordinate
         || claim.intent != intent_for(observed, node)
         || claim.store_generation != StoreScope::load(c)?.restore_generation()
-        || claim.driver != DriverKey::builtin("native-filesystem")?
     {
         return Err(Error::Conflict(
             "Graph source claim differs from original node",
         ));
     }
+    let (effect, marker) = node_effect(graph.steps()[coordinate - 1].tool);
+    let native_driver = DriverKey::builtin("native-filesystem")?;
+    if (marker == ToolClaimRoute::NativeSourceV1 && claim.driver != native_driver)
+        || (marker == ToolClaimRoute::ProcessSourceV1 && claim.driver == native_driver)
+        || (effect == ToolEffect::Read
+            && claim
+                .sources
+                .iter()
+                .any(|source| source.access == SourceAccess::ReadWrite))
+    {
+        return Err(Error::Conflict(
+            "Graph node claim differs from original effect/driver route",
+        ));
+    }
+    claim.driver.validate()?;
     Ok(Some(claim))
 }
 
@@ -234,24 +307,11 @@ pub(super) fn recovery_claim_in(
         .ok_or(Error::Conflict("original Graph node identity missing"))?;
     require_sibling_job(c, observed, binding)?;
     let step = &graph.steps()[coordinate - 1];
-    let tool = step.tool.native().ok_or(Error::Denied(
-        "Graph recovery requires original native node",
-    ))?;
     let node = SandboxGraphNodeRecovery {
         binding: binding.clone(),
-        tool,
+        tool: step.tool,
         arguments: step.arguments.clone(),
     };
-    if node.effect() == ToolEffect::Read
-        && claim
-            .sources
-            .iter()
-            .any(|source| source.access == SourceAccess::ReadWrite)
-    {
-        return Err(Error::Conflict(
-            "original Graph read has contradictory write custody",
-        ));
-    }
     Ok((claim, node))
 }
 
@@ -360,6 +420,7 @@ fn scan(
     }
     unclaimed(c, &base)?;
     let mut first: Option<NodeExecutionBinding> = None;
+    let mut process_driver = None;
     let mut claimed = 0;
     // Bound the entire namespace, rejecting out-of-graph claims.
     let prefix = format!("{base}:*");
@@ -379,6 +440,17 @@ fn scan(
             }
             if first.is_none() {
                 first = Some(node.clone());
+            }
+            if graph.steps()[coordinate - 1].tool.is_shell() {
+                if process_driver
+                    .as_ref()
+                    .is_some_and(|driver| driver != &claim.driver)
+                {
+                    return Err(Error::Conflict(
+                        "Graph contains multiple original Process drivers",
+                    ));
+                }
+                process_driver = Some(claim.driver.clone());
             }
             claimed += 1;
         } else {

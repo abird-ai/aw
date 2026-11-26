@@ -40,7 +40,7 @@ pub struct NativeNodeResult {
 pub type SourceGraphNodeFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<NativeNodeResult>> + Send + 'a>>;
 
-pub trait SourceGraphExecutor: Send + Sync {
+pub trait SourceGraphExecutor: crate::operation_router::OperationRouter {
     fn execute_node<'a>(&'a self, request: SourceGraphNodeRequest<'a>)
         -> SourceGraphNodeFuture<'a>;
     /// The original JobManager invokes this inside its exact terminal

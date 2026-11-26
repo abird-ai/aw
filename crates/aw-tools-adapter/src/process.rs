@@ -689,8 +689,15 @@ pub type JobProcessOutputs = (OutputWriter, OutputWriter);
 
 /// Exact foreground one-node Process Job dispatch selected by a trusted
 /// host. The original JobHost retains planning, status and result ownership.
+pub struct SourceProcessGraphNode<'a> {
+    pub node: &'a aw_tools::filesystem::job_manager::RunningNode,
+    pub constructor: &'a aw_agent_core::tool::ToolBindingSnapshot,
+    pub binding: &'a aw_agent_core::tool::ToolBindingSnapshot,
+}
+
 pub struct SourceJobProcessRequest<'a> {
     pub context: &'a aw_agent_core::ToolContext,
+    pub graph: Option<SourceProcessGraphNode<'a>>,
     pub operation: aw_tools::OperationId,
     pub arguments: &'a serde_json::Value,
     pub outputs: JobProcessOutputs,
@@ -715,6 +722,17 @@ pub trait SourceJobProcessExecutor: Send + Sync {
     fn runtime_binding(&self) -> [u8; 32];
     fn revalidate(&self) -> crate::Result<()>;
     fn execute<'a>(&'a self, request: SourceJobProcessRequest<'a>) -> SourceJobProcessFuture<'a>;
+    /// Original JobManager terminal persist callback, not a new owner.
+    fn settle_node(
+        &self,
+        _ctx: &aw_agent_core::ToolContext,
+        _node: &aw_tools::filesystem::job_manager::RunningNode,
+        _transition: aw_tools::filesystem::job::Transition,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Denied(
+            "source Process driver has no Graph settlement route",
+        ))
+    }
 }
 
 enum SpawnOutputTarget {

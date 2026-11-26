@@ -174,15 +174,16 @@ fn observe_in(
             let intent = journal::admit_in(tx, request, *turn_id, call, binding, admitted)?;
             (intent.effect_id(), Some(intent))
         }
-        (SandboxEffectOrigin::GraphNode(node), Some(binding), Some(constructor))
-            if admitted.is_none() =>
-        {
-            if driver.driver != aw_agent_core::DriverKey::builtin("native-filesystem")? {
-                return Err(Error::Denied(
-                    "source Graph requires the original native filesystem driver",
-                ));
-            }
-            let intent = journal::node::admit_in(tx, request, node, binding, constructor)?;
+        (SandboxEffectOrigin::GraphNode(node), Some(binding), Some(constructor)) => {
+            let intent = journal::node::admit_in(
+                tx,
+                request,
+                node,
+                binding,
+                constructor,
+                &driver.driver,
+                admitted,
+            )?;
             (intent.effect_id(), Some(intent))
         }
         _ => {
@@ -517,6 +518,12 @@ impl SandboxEffectLease {
                 "Graph node requires its original node settlement",
             ));
         }
+        self.defer_until_owner_settled(outcome)
+    }
+
+    /// Original finite worker proof, projected only by its owning receipt
+    /// callback. Select the exact admitted identity, never caller input.
+    pub fn defer_until_original_settled(self, outcome: SandboxEffectOutcome) -> Result<()> {
         self.defer_until_owner_settled(outcome)
     }
 

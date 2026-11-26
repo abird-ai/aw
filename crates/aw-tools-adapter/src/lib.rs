@@ -1120,6 +1120,26 @@ where
     )
 }
 
+/// Fixed native/Process foreground Graph using the same peer registry,
+/// source route and original finite Job runtime.
+pub fn configure_source_graph_with_process(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    route: Arc<dyn native_filesystem::SourceGraphExecutor>,
+    operation: aw_tools::OperationId,
+    executor: Arc<dyn process::SourceJobProcessExecutor>,
+) -> Result<ConfiguredLocalTools> {
+    configure_fixed_sources(
+        builder,
+        actor,
+        options,
+        Some(route.clone()),
+        Some((operation, executor)),
+        Some(route),
+    )
+}
+
 fn configure_fixed_sources(
     mut builder: AgentBuilder,
     actor: PrincipalId,
@@ -1179,8 +1199,7 @@ fn configure_fixed_sources(
     if native.is_some() == native_tools.is_empty()
         || graph_selected != selected.contains("batch")
         || (graph_selected
-            && (process_selected
-                || options.execution_site != "local"
+            && (options.execution_site != "local"
                 || options.bash.is_some()
                 || native_tools.iter().all(|tool| !tool.graph_eligible())))
         || process.is_some() != process_selected
@@ -1257,42 +1276,48 @@ fn configure_fixed_sources(
             builder = builder.shared_tool(Arc::new(fixed));
         }
     }
-    let job_runtime = if let Some((operation, executor)) = process {
-        let runtime = job_runtime::JobRuntime::new_source_process(
-            builder.tool_binding_authority(),
-            limits,
-            effective,
-        )?;
-        let shell = Arc::new(shell::NativeShell::source(
-            options.root.clone(),
-            operation,
-            limits.shell_stream_bytes,
-            executor,
-        )?);
-        runtime.register_shell(shell.clone())?;
-        policy.permit_host(actor, operation.model_name(), &ToolEffect::Process)?;
+    let job_runtime = if graph_selected || process_selected {
+        let runtime = if let Some(route) = graph {
+            let graph_tools = native_tools
+                .into_iter()
+                .filter(|tool| tool.graph_eligible())
+                .collect();
+            job_runtime::JobRuntime::new_source_graph(
+                builder.tool_binding_authority(),
+                limits,
+                effective,
+                graph_tools,
+                route,
+            )?
+        } else {
+            job_runtime::JobRuntime::new_source_process(
+                builder.tool_binding_authority(),
+                limits,
+                effective,
+            )?
+        };
+        if let Some((operation, executor)) = process {
+            let shell = Arc::new(shell::NativeShell::source(
+                options.root.clone(),
+                operation,
+                limits.shell_stream_bytes,
+                executor,
+            )?);
+            runtime.register_shell(shell.clone())?;
+            policy.permit_host(actor.clone(), operation.model_name(), &ToolEffect::Process)?;
+            builder =
+                builder.shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
+        }
+        if graph_selected {
+            policy.permit_host(actor, "batch", &ToolEffect::Control)?;
+            builder = builder.shared_tool(Arc::new(job_tools::Batch::source(
+                runtime.clone(),
+                process_selected,
+            )));
+        }
         builder = builder
             .scope_lifecycle(runtime.clone())
-            .tool_policy_lifecycle(runtime.clone())
-            .shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
-        Some(runtime)
-    } else if let Some(route) = graph {
-        let graph_tools = native_tools
-            .into_iter()
-            .filter(|tool| tool.graph_eligible())
-            .collect();
-        let runtime = job_runtime::JobRuntime::new_source_graph(
-            builder.tool_binding_authority(),
-            limits,
-            effective,
-            graph_tools,
-            route,
-        )?;
-        policy.permit_host(actor, "batch", &ToolEffect::Control)?;
-        builder = builder
-            .scope_lifecycle(runtime.clone())
-            .tool_policy_lifecycle(runtime.clone())
-            .shared_tool(Arc::new(job_tools::Batch::source(runtime.clone())));
+            .tool_policy_lifecycle(runtime.clone());
         Some(runtime)
     } else {
         None

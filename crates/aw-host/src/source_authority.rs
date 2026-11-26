@@ -11,6 +11,11 @@ pub struct SourceToolRecoveryTarget<'a> {
     pub call_id: &'a str,
 }
 
+pub struct SourceGraphNodeRecoveryTarget<'a> {
+    pub constructor: SourceToolRecoveryTarget<'a>,
+    pub coordinate: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveSourceTool {
     authority: ToolBindingAuthority,
@@ -29,9 +34,17 @@ impl LiveSourceTool {
     }
 
     pub(crate) async fn wait_until_not_live(&self) {
-        self.authority
-            .wait_until_not_live(&self.evidence.actor, self.evidence.binding())
-            .await
+        let peer = self
+            .authority
+            .wait_until_not_live(&self.evidence.actor, self.evidence.binding());
+        if let Some(constructor) = &self.constructor {
+            tokio::select! {
+                _ = peer => {},
+                _ = self.authority.wait_until_not_live(&self.evidence.actor, constructor) => {},
+            }
+        } else {
+            peer.await;
+        }
     }
 }
 
@@ -104,14 +117,13 @@ impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
         Ok(self)
     }
 
-    /// Peer native effect under the original fixed Graph constructor.
+    /// Peer effect under the original fixed Graph constructor.
     /// Both grants and both Actor capabilities are committed together.
     pub(crate) fn for_graph_node(
         mut self,
         ctx: aw_agent_core::ToolContext,
         constructor: aw_agent_core::tool::ToolBindingSnapshot,
     ) -> Result<Self> {
-        use aw_agent_core::tool::ToolClaimRoute;
         let binding = self.tool.evidence.binding();
         if self.tool.evidence.actor != ctx.actor
             || ctx.identity.actor != ctx.actor
@@ -120,13 +132,15 @@ impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
             || ctx.execution_site != constructor.execution_site
             || constructor.name != "batch"
             || constructor.effect != ToolEffect::Control
-            || constructor.claim_route != Some(ToolClaimRoute::NativeGraphSourceV1)
-            || binding.claim_route != Some(ToolClaimRoute::NativeSourceV1)
+            || !constructor
+                .claim_route
+                .zip(binding.claim_route)
+                .is_some_and(|(constructor, peer)| constructor.permits_graph_peer(peer))
             || binding.execution_site != ctx.execution_site
             || binding.source != ctx.source
         {
             return Err(Error::Denied(
-                "source Graph constructor or native peer differs from invocation",
+                "source Graph constructor or peer differs from invocation",
             ));
         }
         self.tool.authority.revalidate(&ctx.actor, &constructor)?;

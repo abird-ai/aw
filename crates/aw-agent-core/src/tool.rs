@@ -431,6 +431,23 @@ pub enum ToolClaimRoute {
     NativeSourceV1,
     ProcessSourceV1,
     NativeGraphSourceV1,
+    ProcessGraphSourceV1,
+}
+impl ToolClaimRoute {
+    pub fn is_source_graph(self) -> bool {
+        matches!(self, Self::NativeGraphSourceV1 | Self::ProcessGraphSourceV1)
+    }
+
+    /// A fixed Graph constructor can authorize only its marked peer route.
+    pub fn permits_graph_peer(self, peer: Self) -> bool {
+        match self {
+            Self::NativeGraphSourceV1 => peer == Self::NativeSourceV1,
+            Self::ProcessGraphSourceV1 => {
+                matches!(peer, Self::NativeSourceV1 | Self::ProcessSourceV1)
+            }
+            _ => false,
+        }
+    }
 }
 
 pub trait Tool: Send + Sync {
@@ -779,11 +796,14 @@ impl ToolRegistry {
                         ToolEffect::Read | ToolEffect::Write
                     ) | (Some(ToolClaimRoute::ProcessSourceV1), ToolEffect::Process)
                         | (
-                            Some(ToolClaimRoute::NativeGraphSourceV1),
+                            Some(
+                                ToolClaimRoute::NativeGraphSourceV1
+                                    | ToolClaimRoute::ProcessGraphSourceV1
+                            ),
                             ToolEffect::Control
                         )
                 )
-                || (claim_route == Some(ToolClaimRoute::NativeGraphSourceV1)
+                || (claim_route.is_some_and(ToolClaimRoute::is_source_graph)
                     && spec.name != "batch"))
         {
             return Err(Error::Denied(

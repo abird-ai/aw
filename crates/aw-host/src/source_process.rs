@@ -1,7 +1,7 @@
 //! SQLite-backed host composition of a prepared source effect and the
 //! original shared Process runtime. No second Process, Job or policy owner.
-pub use crate::source_authority::SourceToolRecoveryTarget;
 use crate::source_authority::{LiveSourceTool, SourceToolAuthority};
+pub use crate::source_authority::{SourceGraphNodeRecoveryTarget, SourceToolRecoveryTarget};
 use aw_agent_core::{
     CancellationToken, Error, PrincipalId, Result, SandboxDriverHandle, SandboxDriverRegistry,
     ToolEffect, ToolSource,
@@ -141,29 +141,102 @@ pub fn recover_source_process<D, F>(
 where
     D: Send + Sync + 'static,
 {
-    let mut held = None;
-    let result = store.sandbox_recover_tool_source_effect_exact(
+    recover_source_process_in(
+        store,
         manager,
-        target.agent_ref,
-        target.turn_id,
-        target.call_id,
-        SandboxToolRecoverySelection {
-            driver: &driver.descriptor().driver,
-            sandbox_ref: Some(sandbox),
-            effects: &[ToolEffect::Process],
-            source: &ToolSource::trusted_host(),
-            execution_site: Some("local"),
+        (target, None),
+        sandbox,
+        registry,
+        driver,
+        prove_quiescent,
+    )
+}
+
+/// Independently inspect one original Process Graph node, never the outer
+/// constructor or a sibling's receipt. Positive recorded proof replays
+/// without a current implementation or physical inspection.
+pub fn recover_source_process_graph_node<D, F>(
+    store: &SessionStore,
+    manager: &PrincipalId,
+    target: SourceGraphNodeRecoveryTarget<'_>,
+    sandbox: &str,
+    registry: &SandboxDriverRegistry,
+    driver: &SandboxDriverHandle<D>,
+    prove_quiescent: impl FnOnce(&D, &SandboxToolRecovery) -> Result<F>,
+) -> Result<SandboxEffectOutcome>
+where
+    D: SourceProcessDriver,
+{
+    recover_source_process_in(
+        store,
+        manager,
+        (target.constructor, Some(target.coordinate)),
+        sandbox,
+        registry,
+        driver,
+        |implementation, recovery| {
+            if recovery
+                .node
+                .as_ref()
+                .is_none_or(|node| node.tool.operation() != implementation.operation())
+            {
+                return Err(Error::Denied(
+                    "registered Process driver differs from original Graph operation",
+                ));
+            }
+            prove_quiescent(implementation, recovery)
         },
-        |recovery| {
-            let implementation = registry.reader()?.get(driver)?;
-            let fence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_quiescent(&implementation, recovery)
-            }))
-            .map_err(|_| Error::Protocol("source Process recovery proof panicked"))??;
-            held = Some((fence, implementation));
-            Ok(SandboxEffectOutcome::Settled)
-        },
-    );
+    )
+}
+
+fn recover_source_process_in<D, F>(
+    store: &SessionStore,
+    manager: &PrincipalId,
+    (target, coordinate): (SourceToolRecoveryTarget<'_>, Option<usize>),
+    sandbox: &str,
+    registry: &SandboxDriverRegistry,
+    driver: &SandboxDriverHandle<D>,
+    prove_quiescent: impl FnOnce(&D, &SandboxToolRecovery) -> Result<F>,
+) -> Result<SandboxEffectOutcome>
+where
+    D: Send + Sync + 'static,
+{
+    let mut held = None;
+    let selection = SandboxToolRecoverySelection {
+        driver: &driver.descriptor().driver,
+        sandbox_ref: Some(sandbox),
+        effects: &[ToolEffect::Process],
+        source: &ToolSource::trusted_host(),
+        execution_site: Some("local"),
+    };
+    let inspect = |recovery: &SandboxToolRecovery| {
+        let implementation = registry.reader()?.get(driver)?;
+        let fence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_quiescent(&implementation, recovery)
+        }))
+        .map_err(|_| Error::Protocol("source Process recovery proof panicked"))??;
+        held = Some((fence, implementation));
+        Ok(SandboxEffectOutcome::Settled)
+    };
+    let result = match coordinate {
+        Some(coordinate) => store.sandbox_recover_graph_node_exact(
+            manager,
+            target.agent_ref,
+            target.turn_id,
+            target.call_id,
+            coordinate,
+            selection,
+            inspect,
+        ),
+        None => store.sandbox_recover_tool_source_effect_exact(
+            manager,
+            target.agent_ref,
+            target.turn_id,
+            target.call_id,
+            selection,
+            inspect,
+        ),
+    };
     drop(held);
     result
 }
@@ -402,10 +475,10 @@ where
             .map_err(launch_outcome);
         let quiescence = tokio::task::spawn_blocking(move || match terminal {
             Ok(terminal) => settle_terminal(&terminal, prove_quiescent, |outcome| {
-                source.defer_until_tool_finished(outcome)
+                source.defer_until_original_settled(outcome)
             }),
             Err(outcome) => {
-                source.defer_until_tool_finished(outcome)?;
+                source.defer_until_original_settled(outcome)?;
                 Ok(outcome)
             }
         })

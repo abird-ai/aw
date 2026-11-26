@@ -52,6 +52,12 @@ use std::{
 const NODE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const SHELL_RESULT_BYTES: usize = 4 * 1024;
 
+struct ShellNodeResult {
+    content: String,
+    terminal: Option<aw_tools::filesystem::runner::ProcessTerminal>,
+    status: Status,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FiniteJobProvenance {
     pub canonical_job_ref: String,
@@ -1225,7 +1231,9 @@ impl JobHost {
         if binding.effect != aw_agent_core::ToolEffect::Control
             || binding.source != aw_agent_core::ToolSource::trusted_host()
             || binding.execution_site != "local"
-            || binding.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeGraphSourceV1)
+            || !binding
+                .claim_route
+                .is_some_and(aw_agent_core::tool::ToolClaimRoute::is_source_graph)
         {
             return Err(Error::Denied(
                 "source Graph requires exact original constructor",
@@ -1238,15 +1246,20 @@ impl JobHost {
         &self,
         actor: &PrincipalId,
         binding: &ToolBindingSnapshot,
+        source_graph: bool,
     ) -> Result<[u8; 32]> {
         let peer = binding_hash(actor, binding);
-        if self.source_graph.is_none() {
+        if !source_graph {
             return Ok(peer);
         }
-        if binding.claim_route != Some(aw_agent_core::tool::ToolClaimRoute::NativeSourceV1) {
-            return Err(Error::Denied("source Graph requires fixed native peer"));
-        }
         let constructor = self.graph_constructor(actor)?;
+        if !constructor
+            .claim_route
+            .zip(binding.claim_route)
+            .is_some_and(|(constructor, peer)| constructor.permits_graph_peer(peer))
+        {
+            return Err(Error::Denied("source Graph requires fixed peer"));
+        }
         Ok(source_graph_authority_hash(actor, &constructor, peer))
     }
 
@@ -1261,8 +1274,13 @@ impl JobHost {
         overrides: &BTreeMap<u32, aw_tools::filesystem::footprint::Footprint>,
     ) -> Result<Vec<NodePlan>> {
         let one = graph.steps().len() == 1;
+        let source_graph =
+            self.source_graph.is_some() && ctx.effect == aw_agent_core::ToolEffect::Control;
         if self.source_graph.is_some()
-            && (ctx.effect != aw_agent_core::ToolEffect::Control
+            && ((!source_graph
+                && (ctx.effect != aw_agent_core::ToolEffect::Process
+                    || !one
+                    || !graph.steps()[0].tool.is_shell()))
                 || ctx.source != aw_agent_core::ToolSource::trusted_host()
                 || ctx.execution_scope.is_some()
                 || ctx.execution_owner.is_none()
@@ -1309,9 +1327,9 @@ impl JobHost {
                 } else if step.tool.is_shell() {
                     let shell = self.shells.get(step.tool).ok_or(())?;
                     if shell.source_backed()
-                        && (!one
+                        && ((!source_graph
+                            && (!one || ctx.effect != aw_agent_core::ToolEffect::Process))
                             || ctx.execution_scope.is_some()
-                            || ctx.effect != aw_agent_core::ToolEffect::Process
                             || ctx.source != aw_agent_core::ToolSource::trusted_host()
                             || binding.claim_route
                                 != Some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1))
@@ -1357,7 +1375,7 @@ impl JobHost {
                 footprint,
                 registry_generation: binding.registry_revision,
                 authority_binding: self
-                    .node_authority_hash(&ctx.actor, &binding)
+                    .node_authority_hash(&ctx.actor, &binding, source_graph)
                     .map_err(|_| ())?,
                 runtime_binding,
                 task_result_eligible,
@@ -1871,7 +1889,14 @@ impl JobHost {
         }
     }
 
-    fn current_binding(&self, actor: &PrincipalId, plan: &NodePlan) -> Option<ToolBindingSnapshot> {
+    fn current_binding(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        plan: &NodePlan,
+    ) -> Option<ToolBindingSnapshot> {
+        let source_graph = self.source_graph.is_some()
+            && self.manager.task_binding(id).ok()?.effect == aw_tools::ToolEffect::Control;
         let binding = self
             .authority
             .permitted_binding(actor, plan.tool().name())
@@ -1903,7 +1928,7 @@ impl JobHost {
         };
         (binding.registry_revision == plan.registry_generation()
             && self
-                .node_authority_hash(actor, &binding)
+                .node_authority_hash(actor, &binding, source_graph)
                 .is_ok_and(|hash| hash == plan.authority_binding())
             && runtime_live)
             .then_some(binding)
@@ -1914,7 +1939,7 @@ impl JobHost {
             .plans(id)
             .ok()
             .and_then(|plans| plans.get(coordinate.saturating_sub(1)).cloned())
-            .and_then(|plan| self.current_binding(actor, &plan))
+            .and_then(|plan| self.current_binding(actor, id, &plan))
             .is_some()
     }
 
@@ -1929,7 +1954,7 @@ impl JobHost {
         claimed_sequence: u64,
         plan: &NodePlan,
     ) -> Result<ToolBindingSnapshot> {
-        if let Some(binding) = self.current_binding(actor, plan) {
+        if let Some(binding) = self.current_binding(actor, id, plan) {
             return Ok(binding);
         }
         self.settle_unlaunched(id, coordinate, claimed_sequence)?;
@@ -1947,7 +1972,7 @@ impl JobHost {
         };
         plans
             .iter()
-            .all(|plan| self.current_binding(actor, plan).is_some())
+            .all(|plan| self.current_binding(actor, id, plan).is_some())
     }
 
     fn transition_sequence(&self, id: &str) -> Result<u64> {
@@ -2151,20 +2176,25 @@ impl JobHost {
             .finish_output(id, coordinate, OutputStream::Stderr);
     }
 
-    fn settle_shell_status(
+    fn settle_shell_status_with(
         &self,
         id: &str,
         coordinate: usize,
         running_sequence: u64,
         terminal: Option<aw_tools::filesystem::runner::ProcessTerminal>,
         status: Status,
+        persist: impl FnOnce(
+            &str,
+            aw_tools::filesystem::job::Transition,
+        )
+            -> std::result::Result<(), aw_tools::filesystem::job::JournalError>,
     ) -> Result<Status> {
+        let _gate = self
+            .transition_gate
+            .lock()
+            .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
+        let sequence = self.transition_sequence(id)?;
         if let Some(terminal) = terminal {
-            let _gate = self
-                .transition_gate
-                .lock()
-                .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
-            let sequence = self.transition_sequence(id)?;
             self.manager
                 .settle_process_with_status(
                     id,
@@ -2177,18 +2207,22 @@ impl JobHost {
                         status,
                         sequence,
                     },
-                    |_, _| Ok(()),
+                    persist,
                 )
                 .map_err(|_| Error::Protocol("ShellNode terminal settlement failed"))
         } else {
-            self.settle(
-                id,
-                coordinate,
-                NodeState::Running {
-                    sequence: running_sequence,
-                },
-                status,
-            )?;
+            self.manager
+                .settle(
+                    id,
+                    coordinate,
+                    NodeState::Running {
+                        sequence: running_sequence,
+                    },
+                    status,
+                    sequence,
+                    persist,
+                )
+                .map_err(|_| Error::Protocol("ShellNode terminal settlement failed"))?;
             Ok(status)
         }
     }
@@ -2202,13 +2236,50 @@ impl JobHost {
         terminal: Option<aw_tools::filesystem::runner::ProcessTerminal>,
         status: Status,
     ) -> Result<Status> {
+        self.settle_shell_result_with(
+            id,
+            coordinate,
+            running_sequence,
+            ShellNodeResult {
+                content,
+                terminal,
+                status,
+            },
+            |_, _| Ok(()),
+        )
+    }
+
+    fn settle_shell_result_with(
+        &self,
+        id: &str,
+        coordinate: usize,
+        running_sequence: u64,
+        result: ShellNodeResult,
+        persist: impl FnOnce(
+            &str,
+            aw_tools::filesystem::job::Transition,
+        )
+            -> std::result::Result<(), aw_tools::filesystem::job::JournalError>,
+    ) -> Result<Status> {
+        let ShellNodeResult {
+            content,
+            terminal,
+            status,
+        } = result;
         if content.len() > SHELL_RESULT_BYTES {
             let unknown = Status {
                 primary: Primary::Unknown,
                 more: false,
                 incomplete: false,
             };
-            self.settle_shell_status(id, coordinate, running_sequence, terminal, unknown)?;
+            self.settle_shell_status_with(
+                id,
+                coordinate,
+                running_sequence,
+                terminal,
+                unknown,
+                persist,
+            )?;
             return Err(Error::Limit(
                 "ShellNode terminal metadata exceeds compact result ceiling",
             ));
@@ -2228,12 +2299,19 @@ impl JobHost {
                 more: false,
                 incomplete: false,
             };
-            self.settle_shell_status(id, coordinate, running_sequence, terminal, unknown)?;
+            self.settle_shell_status_with(
+                id,
+                coordinate,
+                running_sequence,
+                terminal,
+                unknown,
+                persist,
+            )?;
             return Err(Error::Protocol(
                 "ShellNode compact result could not be retained exactly",
             ));
         }
-        self.settle_shell_status(id, coordinate, running_sequence, terminal, status)
+        self.settle_shell_status_with(id, coordinate, running_sequence, terminal, status, persist)
     }
 
     fn retained_process_terminal(
@@ -2295,6 +2373,30 @@ impl JobHost {
             return Err(Error::Cancelled);
         }
         let binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
+        let constructor = if shell.source_backed()
+            && self.source_graph.is_some()
+            && ctx.effect == aw_agent_core::ToolEffect::Control
+        {
+            match self.graph_constructor(&ctx.actor) {
+                Ok(constructor)
+                    if source_graph_authority_hash(
+                        &ctx.actor,
+                        &constructor,
+                        binding_hash(&ctx.actor, &binding),
+                    ) == plan.authority_binding() =>
+                {
+                    Some(constructor)
+                }
+                _ => {
+                    self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                    return Err(Error::Denied(
+                        "original source Graph Process authority changed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // Finish every fallible, side-effect-free launch preparation while the
         // node is still only Claimed. `Start` is the final canonical checkpoint
         // immediately before handing the prepared spec to the OS process host.
@@ -2352,9 +2454,29 @@ impl JobHost {
                 // The original sealed node owns these streams and this
                 // deadline. The trusted source driver owns source custody,
                 // not Job identity, scheduling or terminal classification.
+                let node = if constructor.is_some() {
+                    Some(
+                        self.manager
+                            .running_node(id, coordinate, running_sequence)
+                            .map_err(|_| {
+                                Error::Protocol("original Running Process node unavailable")
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let graph = node
+                    .as_ref()
+                    .zip(constructor.as_ref())
+                    .map(|(node, constructor)| process::SourceProcessGraphNode {
+                        node,
+                        constructor,
+                        binding: &binding,
+                    });
                 let completion = executor
                     .execute(process::SourceJobProcessRequest {
                         context: ctx,
+                        graph,
                         operation: plan.tool().operation(),
                         arguments: plan.arguments(),
                         outputs: (stdout, stderr),
@@ -2367,6 +2489,12 @@ impl JobHost {
                     coordinate,
                     running_sequence,
                     completion,
+                    |_, transition| match &node {
+                        Some(node) => executor
+                            .settle_node(ctx, node, transition)
+                            .map_err(|_| aw_tools::filesystem::job::JournalError::OutcomeUnknown),
+                        None => Ok(()),
+                    },
                 );
             }
         };
@@ -2526,6 +2654,11 @@ impl JobHost {
         coordinate: usize,
         running_sequence: u64,
         completion: process::SourceJobProcessCompletion,
+        persist: impl FnOnce(
+            &str,
+            aw_tools::filesystem::job::Transition,
+        )
+            -> std::result::Result<(), aw_tools::filesystem::job::JournalError>,
     ) -> Result<Status> {
         let (terminal, mut status, mut content) = match completion.receipt {
             Ok(receipt) => {
@@ -2560,7 +2693,17 @@ impl JobHost {
             status.incomplete = true;
             content.push_str(" source=unresolved");
         }
-        self.settle_shell_result(id, coordinate, running_sequence, content, terminal, status)
+        self.settle_shell_result_with(
+            id,
+            coordinate,
+            running_sequence,
+            ShellNodeResult {
+                content,
+                terminal,
+                status,
+            },
+            persist,
+        )
     }
 
     pub(crate) fn graph_preseal_request(
