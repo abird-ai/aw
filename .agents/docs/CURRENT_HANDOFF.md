@@ -19,7 +19,76 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: authenticated Sandbox source setter
+## Latest local implementation delta — 2026-11-26: reconcile EventInput journal bridge and formatting
+
+Parent `b8564e3047e4cc180e6bc935dbbf046584236739` (authenticated
+Sandbox source setter) was independently verified published to main.
+User explicitly authorized reconciliation of the whole previously dirty
+worktree. L5 only.
+
+- Read-only audit identified 41 modified tracked files: 38 exact
+  rustfmt-only outputs from existing committed source, three actual
+  EventInput journal adapter changes. Comparison normalized both HEAD
+  and worktree versions with the same Rust 1.95.0 rustfmt (1.9.0);
+  output equality, not whitespace-diff heuristics. Earlier dirty-path
+  ownership inference was wrong: no separate unfinished UX, resource
+  CLI or networking implementation was present in those changes.
+- Phase 2 cutover `e0c6bb31` already calls
+  `Agent::bind_event_input/clear_event_input` from the original Actor
+  queue; `bd18dcd` already owns durable EventInput scope/one-time
+  binding in SessionHandle. The three forwarding edits were omitted
+  from signed history. Earlier full CLI checks consumed these working
+  copies, so clean published source lacked the required methods.
+  Reconcile them together: trusted-host Agent delegates to its existing
+  TurnJournal; default bind fails closed for unsupported backends,
+  matching clear is idempotent; SQLite SessionHandle delegates to
+  its original scope validation and pending hint consumed in begin.
+  No new Event, queue, journal, grant, schema or execution owner.
+- Complete stable child Agent's BudgetJournal adapter in
+  `src/subagents.rs`: forward both methods directly to the original
+  journal, without altering delegation reservation or settlement.
+  Extend the existing real stable-child lifecycle fixture, not a new
+  scheduler: use actual future-only Event subscription, source
+  publication and accepted EventInput, the existing trusted Actor
+  queue/wake bridge, original budgeted child Turn and result Event.
+  Same delivery enqueue replay deduplicates; original source Event ID
+  becomes descendant causal root, hop increments once, actual
+  delegation attempts account for the one extra Turn. Next ordinary
+  continuation has no stale causal root/hop. Existing legacy coalesced
+  wake, ordinary continuation and stable child close still exercised.
+  Generic Event scheduling beyond that trusted bridge remains out of
+  scope. First test observation incorrectly opened an active child
+  Session; use the original branch-settlement observation, and the
+  source Event's actual ID (fresh root is implicit until delivery).
+- Correct the known durable-only non-workspace binary compilation
+  failure in the same child adapter file: the workspace-only private
+  artifact state directory assignment now has its existing workspace
+  feature guard. Service::new still denies tool-enabled children
+  without workspace support. No runtime permission change.
+- Separate exact 38-file formatting commit from functional correction.
+  No additional formatter churn, reserved UX plan changes, reset,
+  stash, destructive cleanup, or unrelated feature changes.
+
+Validation: Agent core journal integration 14/14; Store Event causal/
+cutover 2/2; original Actor queue 1/1; Agent Jobs wake/disclosure 1/1;
+stable child lifecycle 2/2 (including actual accepted EventInput and
+ordinary subsequent Turn). Strict all-feature/all-target Core/Store/CLI
+Clippy, durable library, minimal all-target, full binary build and
+scoped rustfmt/diff passed. Reproduced durable-only missing workspace
+field compile error, restored feature guard, then durable-only
+all-target check passed (existing feature-specific dead-code warnings);
+final strict Clippy, child lifecycle 2/2 and full binary build passed.
+No whole-workspace full test suite, pinned Nix/native-platform
+qualification or unrelated inventory-test rework claimed.
+
+Next: the earlier journal/resource CLI dirty-path blocker is resolved
+by this reconciliation. Recheck current ownership at the next turn
+and prioritize original live source-aware Actor/Turn admission under
+independent current host authority. Do not infer active concurrent work
+from historical dirty-path lists. Phase 3 remains underway; Store v60,
+Git recovery v4 unchanged. No new physical containment proof.
+
+## Previous local implementation delta — 2026-11-26: authenticated Sandbox source setter
 
 Parent: `6cdfd88d9fc65792abc4f6216d0016ab34b7bc60` (source
 release), signature verified. Original Agent/Turn journal and resource

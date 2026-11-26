@@ -246,6 +246,12 @@ impl TurnJournal for BudgetJournal {
     fn invocation_scope(&self) -> Result<Option<aw_agent_core::InvocationScope>> {
         self.inner.invocation_scope()
     }
+    fn bind_event_input(&self, delivery_id: &str) -> Result<()> {
+        self.inner.bind_event_input(delivery_id)
+    }
+    fn clear_event_input(&self, delivery_id: &str) -> Result<()> {
+        self.inner.clear_event_input(delivery_id)
+    }
     fn begin<'a>(&'a self, start: TurnStart) -> JournalFuture<'a, ()> {
         self.inner.begin(start)
     }
@@ -2740,6 +2746,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 child_tools.execution_site = format!("subagent:{}", info.id);
                 child_tools.concurrency = inner.child_tool_concurrency;
                 child_tools.limits = inner.child_tool_limits;
+                #[cfg(feature = "workspace")]
                 if child_tool_mode != ToolMode::Off {
                     child_tools.private_state_dir = Some(inner.state_dir.clone());
                 }
@@ -6732,6 +6739,128 @@ mod tests {
         assert_eq!(after_event_root.model_attempts_started, 2);
         assert_eq!(after_event_root.model_attempts_finished, 2);
 
+        // A post-cutover accepted EventInput must reach the original
+        // child Turn through its BudgetJournal, preserving causality and
+        // the same delegation attempt budget.
+        let subject = aw_tools::event_subject::EventSubject::from_resource_ref(
+            parent_owner.canonical_ref(),
+            "#fixture_wake",
+        )
+        .unwrap()
+        .into_string();
+        let child_result =
+            aw_tools::event_subject::EventSubject::from_resource_ref(&canonical, "result")
+                .unwrap()
+                .into_string();
+        let aw_store::EventReadOutcome::Page(before) = store
+            .events_read_page(&actor, &child_result, aw_store::EventReadAfter::Now, 16)
+            .unwrap()
+        else {
+            panic!("expected current child Event cursor")
+        };
+        let aw_store::EventReadOutcome::Page(source_before) = store
+            .events_read_page(&actor, &subject, aw_store::EventReadAfter::Now, 16)
+            .unwrap()
+        else {
+            panic!("expected current source Event cursor")
+        };
+        store
+            .events_subscribe(&actor, &subject, &canonical, true)
+            .unwrap();
+        let aw_store::EventPublishOutcome::Published(published) = store
+            .events_publish(&actor, parent_owner.canonical_ref(), "#fixture_wake", None)
+            .unwrap()
+        else {
+            panic!("expected source Event")
+        };
+        let aw_store::EventReadOutcome::Page(source) = store
+            .events_read_page(
+                &actor,
+                &subject,
+                aw_store::EventReadAfter::Cursor(source_before.cursor),
+                16,
+            )
+            .unwrap()
+        else {
+            panic!("expected factual source Event")
+        };
+        let [source_event] = source.events.as_slice() else {
+            panic!("expected one source Event")
+        };
+        assert_eq!(source_event.event_rev, published.event_rev);
+        assert_eq!(source_event.causal_root, None);
+        let delivered = store
+            .event_subscription_deliver(&canonical, &subject, 16)
+            .unwrap();
+        assert_eq!(delivered.accepted, 1);
+        let [delivery_id] = delivered.ready_inputs.as_slice() else {
+            panic!("expected one accepted EventInput")
+        };
+        let wake = aw_store::LegacyEventInputWake {
+            delivery_id: delivery_id.clone(),
+            recipient_ref: canonical.clone(),
+            source_ref: parent_owner.canonical_ref().into(),
+            event_rev: published.event_rev,
+            mode: "queue".into(),
+        };
+        let live = router.host_live_owner(&canonical).unwrap();
+        assert!(live.admit_event_input(&wake).unwrap().1);
+        assert!(!live.admit_event_input(&wake).unwrap().1);
+        router.wake_live_if_supported(&canonical).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let settled = store
+                    .branches(&actor, &child_session)
+                    .unwrap()
+                    .into_iter()
+                    .find(|branch| branch.id == child_binding.branch_id)
+                    .is_some_and(|branch| branch.active_run.is_none());
+                if settled && calls.load(Ordering::SeqCst) == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let aw_store::EventReadOutcome::Page(after) = store
+            .events_read_page(
+                &actor,
+                &child_result,
+                aw_store::EventReadAfter::Cursor(before.cursor),
+                16,
+            )
+            .unwrap()
+        else {
+            panic!("expected child result Event")
+        };
+        assert_eq!(after.events.len(), 1);
+        let result = &after.events[0];
+        assert_eq!(result.turn, Some(3));
+        assert_eq!(result.causal_hop, published.causal_hop + 1);
+        // Fresh publication has its own root; read the factual source
+        // Event ID rather than deriving a different opaque identity.
+        assert_eq!(
+            result.causal_root.as_deref(),
+            Some(source_event.id.as_str())
+        );
+        assert_eq!(
+            store
+                .open(&actor, &child_session, &child_binding.branch_id)
+                .unwrap()
+                .view()
+                .unwrap()
+                .history
+                .turns
+                .len(),
+            3
+        );
+        let after_typed_event = store
+            .delegation_root(&actor, relations[0].delegation_root_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(after_typed_event.model_attempts_started, 3);
+        assert_eq!(after_typed_event.model_attempts_finished, 3);
+
         let send_ctx = ToolContext {
             actor: actor.clone(),
             turn_id: 1,
@@ -6773,7 +6902,7 @@ mod tests {
                     .into_iter()
                     .find(|branch| branch.id == child_binding.branch_id)
                     .is_some_and(|branch| branch.active_run.is_none());
-                if settled && calls.load(Ordering::SeqCst) == 3 {
+                if settled && calls.load(Ordering::SeqCst) == 4 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6781,7 +6910,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(
             store
                 .open(&actor, &child_session, &child_binding.branch_id)
@@ -6791,8 +6920,23 @@ mod tests {
                 .history
                 .turns
                 .len(),
-            3
+            4
         );
+        let aw_store::EventReadOutcome::Page(manual) = store
+            .events_read_page(
+                &actor,
+                &child_result,
+                aw_store::EventReadAfter::Cursor(after.cursor),
+                16,
+            )
+            .unwrap()
+        else {
+            panic!("expected manual child result Event")
+        };
+        assert_eq!(manual.events.len(), 1);
+        assert_eq!(manual.events[0].turn, Some(4));
+        assert_eq!(manual.events[0].causal_root, None);
+        assert_eq!(manual.events[0].causal_hop, 0);
         let relations_after = store.subagents_for_parent(&actor, &parent.id).unwrap();
         assert_eq!(relations_after.len(), 1);
         assert_eq!(relations_after[0].child_session_id, child_session);
@@ -6808,10 +6952,10 @@ mod tests {
             "idle long-lived Agent still owns one bounded active-child slot"
         );
         assert_eq!(
-            root.model_attempts_started, 3,
-            "initial Turn, one coalesced event wake, and one manual continuation consume exactly three paid-attempt slots"
+            root.model_attempts_started, 4,
+            "initial Turn, legacy wake, typed EventInput and manual continuation each consume one paid-attempt slot"
         );
-        assert_eq!(root.model_attempts_finished, 3);
+        assert_eq!(root.model_attempts_finished, 4);
         assert_eq!(
             root.calls_without_complete_usage, 0,
             "fixture provider reports complete usage for every child Turn"
@@ -6885,8 +7029,8 @@ mod tests {
             closed_root.active_children, 0,
             "whole-Agent close releases exactly the retained child slot"
         );
-        assert_eq!(closed_root.model_attempts_started, 3);
-        assert_eq!(closed_root.model_attempts_finished, 3);
+        assert_eq!(closed_root.model_attempts_started, 4);
+        assert_eq!(closed_root.model_attempts_finished, 4);
     }
 
     #[tokio::test]

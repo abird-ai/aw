@@ -1303,6 +1303,14 @@ impl SessionHandle {
     }
 }
 impl TurnJournal for SessionHandle {
+    fn bind_event_input(&self, delivery_id: &str) -> Result<()> {
+        SessionHandle::bind_event_input(self, delivery_id)
+    }
+
+    fn clear_event_input(&self, delivery_id: &str) -> Result<()> {
+        SessionHandle::clear_event_input(self, delivery_id)
+    }
+
     fn validate_context(&self) -> JournalFuture<'_, ()> {
         let this = self.clone();
         Box::pin(async move {

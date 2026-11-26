@@ -864,6 +864,22 @@ impl Agent {
             .as_ref()
             .map_or(Ok(None), |journal| journal.invocation_scope())
     }
+
+    /// Trusted-host causal binding; never model-callable and never a grant.
+    pub fn bind_event_input(&self, delivery_id: &str) -> Result<()> {
+        self.journal
+            .as_ref()
+            .ok_or(Error::Denied("EventInput binding requires a journal"))?
+            .bind_event_input(delivery_id)
+    }
+
+    pub fn clear_event_input(&self, delivery_id: &str) -> Result<()> {
+        self.journal
+            .as_ref()
+            .ok_or(Error::Denied("EventInput binding requires a journal"))?
+            .clear_event_input(delivery_id)
+    }
+
     /// A pending argument revision remains bound to the exact tool source,
     /// effect and independently approved host policy even after awaited
     /// hooks/journal steps. A recorded revision is not a reusable grant.

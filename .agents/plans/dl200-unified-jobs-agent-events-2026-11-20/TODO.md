@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: authenticated Sandbox source setter (this checkpoint; parent `6cdfd88d9fc65792abc4f6216d0016ab34b7bc60`, source release). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: EventInput journal bridge reconciliation (this checkpoint; parent `b8564e3047e4cc180e6bc935dbbf046584236739`, authenticated Sandbox source setter). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Prior published AW remote main independently verified at `b8564e3` before reconciliation. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -421,6 +421,19 @@ Current implementation: authenticated Sandbox source setter (this checkpoint; pa
       Input with no factual run binding. Focused cutover **1/1**, combined v44→...→v54 migration/lifecycle
       **1/1**, Agent Jobs group-authority **1/1**, affected all-target check and strict Clippy are green; generic
       zero-test name filters are not counted.
+      **EventInput adapter reconciliation:** the three uncommitted forwarding
+      edits required by original v54 Actor queue calls are retained in signed
+      history; BudgetJournal now forwards both trusted causal-binding methods
+      to the original SQLite owner. Real stable child accepted EventInput
+      reaches its original budgeted Turn and descendant result, with exact
+      causal root/hop, duplicate suppression and no next-Turn hint leakage.
+      No new schema/owner/scheduler. Journal 14/14, Store Event
+      2/2, Actor queue and wake/disclosure 1/1 each, stable child 2/2,
+      strict affected Clippy, durable-only and minimal all-target checks,
+      full CLI and scoped fmt/diff passed. Restore workspace-only child
+      private-state feature guard; the previous durable-only binary
+      compilation blocker is corrected without widening runtime authority.
+      Exact mechanical formatting follows in a separate commit.
       **Next:** begin sealed Phase 3 — one durable DriverKey plus shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery. Legacy cutover
       contraction remains Phase 7 after cross-version drain/restart proof.
@@ -1570,7 +1583,9 @@ Current implementation: authenticated Sandbox source setter (this checkpoint; pa
       required/recovery-only flag smoke, scoped fmt/diff passed. See handoff
       for corrected fixture ownership and boxed approval variants.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
-      context and queue owners (coordinate concurrent journal work first); otherwise
+      context and queue owners. Historical dirty-path blocker reconciled: 38
+      formatting-only paths and the omitted EventInput forwarding bridge.
+      Revalidate live ownership before editing; otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Native Actor activation of configured Git owners and independent physical authority,
       complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

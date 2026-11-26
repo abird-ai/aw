@@ -2,8 +2,8 @@
 //! A successful acknowledgement must mean the record has been committed before
 //! the next billable/model/tool action. Observational callbacks are NOT a journal.
 use crate::{
-    InvocationIdentity, InvocationRecord, Message, PrincipalId, Result, ToolCall, ToolEffect,
-    ToolRecord, ToolSource, ToolStatus, Turn,
+    Error, InvocationIdentity, InvocationRecord, Message, PrincipalId, Result, ToolCall,
+    ToolEffect, ToolRecord, ToolSource, ToolStatus, Turn,
 };
 use aw_agent_kernel::capability::{Source, SourceKind};
 use serde::{Deserialize, Serialize};
@@ -347,6 +347,17 @@ pub trait TurnJournal: Send + Sync {
     /// Current persisted branch identity; no credentials or mutable user defaults.
     fn invocation_scope(&self) -> Result<Option<crate::InvocationScope>> {
         Ok(None)
+    }
+
+    /// Trusted-host one-shot causal binding for the next Turn admission.
+    /// Backends without typed EventInput ownership fail closed.
+    fn bind_event_input(&self, _delivery_id: &str) -> Result<()> {
+        Err(Error::Denied("journal does not support EventInput binding"))
+    }
+
+    /// Drop only the matching ephemeral next-Turn EventInput hint.
+    fn clear_event_input(&self, _delivery_id: &str) -> Result<()> {
+        Ok(())
     }
 
     fn begin<'a>(&'a self, start: TurnStart) -> JournalFuture<'a, ()>;
