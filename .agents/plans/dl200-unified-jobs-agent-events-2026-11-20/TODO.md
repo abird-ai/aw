@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: quiescent SourceDriver and VaultProvider maintenance (this checkpoint; local parent `05e552380b56d457fbb2860e28769ad7f29064b4`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: quiescent held-Agent managed source replacement (this checkpoint; local parent `e56cd92bed01f75e0f7f4469a8bc2533a7eb6d47`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1922,8 +1922,27 @@ Current implementation: quiescent SourceDriver and VaultProvider maintenance (th
       116 distinct selected tests passed. Strict affected Clippy,
       durable/minimal and scoped fmt/diff passed; five prior historical
       full-Store failures not rerun.
+      **Held isolated Agent managed source replacement:** original
+      Project-owned source receipt/barrier/descriptor/CAS reused with
+      an exact nonempty managed layout, one bound Agent and held
+      admission. Reject other branches/Session aliases, shared
+      materialization, active Run/hazard, unresolved Input/Control and
+      Claimed/Accepted queue work; Pending remains untouched. Original
+      preparation/inspection/restart continuation and settlement
+      revalidate the bound Agent. Agent close cannot strand Prepared
+      custody while Sandbox close stays fenced. Exact replacement
+      advances the selected binding/Sandbox revision once, invalidates
+      old binding-revision grants, preserves unaffected source,
+      Agent/history/queue and requires explicit new authority.
+      No automatic opening, schema change or new owner.
+      Final locked/offline Store 9, Host Git 1, configured CLI Git 1,
+      Actor 3, native executable 1: 15 selected tests passed; strict
+      affected Clippy, durable/minimal all-target and scoped fmt/diff
+      checks passed. Prior five historical Store failures not rerun.
+      Bound attachment/partial/final release and shared/participant
+      source execution remain held.
       **Next:** production reviewed physical Process containment/dispatch,
-      bound-Agent structural mutation and remaining actual host gates.
+      remaining bound-Agent attachment/release and actual host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
@@ -1935,8 +1954,8 @@ Current implementation: quiescent SourceDriver and VaultProvider maintenance (th
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and
-      non-exact partial checkout cleanup, physical authority/production cleanup, bound-Agent mutation
-      and other structural removal cases remain. Configured signing and Git approval loaders, local
+      non-exact partial checkout cleanup, physical authority/production cleanup, remaining bound-Agent
+      attachment/release and other structural cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
       activation/local binding RPCs, provider-authorized Vault entry metadata,

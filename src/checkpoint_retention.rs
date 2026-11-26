@@ -2648,7 +2648,8 @@ mod tests {
             .is_err());
         fs::write(&old_file, b"replacement version").unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let source_free = release(&store).unwrap();
         assert_eq!(source_free.rev, replaced.rev + 1);
         assert!(source_free.sources.is_empty());
@@ -2723,6 +2724,200 @@ mod tests {
                 .checkpoint_list_metadata(&actor, agent_ref, None, 64)
                 .unwrap(),
             checkpoints_before
+        );
+        // The same configured replacement owner may now operate on the
+        // restored, exclusively bound held Agent. Keep the original Agent,
+        // its history, exact grant evidence and queue independent of the
+        // Sandbox mutation. Qualify an actual post-release interruption.
+        let bound_ref = &recovered.agent.canonical_ref;
+        let bound_agent = store.agent_get(&actor, bound_ref).unwrap();
+        let bound = store
+            .sandbox_get(&actor, bound_agent.sandbox_ref.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(bound_agent.admission, AgentAdmission::Held);
+        let bound_execution = store.agent_execution_binding(&actor, bound_ref).unwrap();
+        let queue_before = store
+            .actor_queue_list(&actor, bound_execution.session_id())
+            .unwrap();
+        let (_, selected) = store
+            .sandbox_grant_sources(
+                &actor,
+                &actor,
+                bound_ref,
+                bound.rev,
+                std::slice::from_ref(&location.name),
+            )
+            .unwrap();
+        let policy = aw_store::SandboxGrantPolicy {
+            agent_ref: bound_ref.clone(),
+            sandbox_ref: bound.canonical_ref.clone(),
+            evidence: aw_store::SandboxPolicyEvidence {
+                policy_ref: "host:bound-replacement".into(),
+                policy_digest: [71; 32],
+                authority_ref: "host:bound-replacement-approval".into(),
+                authority_generation: 1,
+            },
+            actor: actor.clone(),
+            actor_user_id: store.current_user(&actor).unwrap().user_id,
+            sources: vec![aw_store::SandboxSourceGrant::from_binding(
+                &selected[0],
+                SourceAccess::ReadWrite,
+            )],
+        };
+        let ceilings = [aw_agent_core::NamedSourceAccess {
+            name: location.name.clone(),
+            access: SourceAccess::ReadWrite,
+        }];
+        let grant = store
+            .sandbox_grant_set(&actor, bound_ref, 0, Some(&policy))
+            .unwrap();
+        assert!(store
+            .sandbox_grant_preflight(&actor, bound_ref, &policy, &ceilings)
+            .is_ok());
+        let bound_path = approvals.join("replace-held-agent.json");
+        let mut bound_config = config.clone();
+        bound_config["sandbox"] = json!(bound.canonical_ref);
+        bound_config["sandbox_rev"] = json!(bound.rev);
+        bound_config["destination_root"] = json!(bound.tool_root);
+        bound_config["destination_identity"] = json!(DirectoryIdentity::open(&bound.tool_root)
+            .unwrap()
+            .identity()
+            .unwrap());
+        bound_config["allow_continuation"] = json!(true);
+        aw_platform::open_private_new(&bound_path)
+            .unwrap()
+            .write_all(&serde_json::to_vec(&bound_config).unwrap())
+            .unwrap();
+        let bound_id = "fixture:replace-held-agent";
+        let bound_set = SourceMutationSet::from_bindings(&[selected[0].binding.clone()]).unwrap();
+        let active = store
+            .acquire_source_mutation_barrier(&bound_set, "fixture:bound-active-source")
+            .unwrap();
+        assert!(replace(&store, &bound_path, &bound.canonical_ref, bound_id, Fresh).is_err());
+        assert_eq!(
+            fs::read(bound.tool_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        active.settle(SourceMutationOutcome::Settled).unwrap();
+        assert!(matches!(
+            store.sandbox_prepare_attachment(
+                &actor,
+                &bound.canonical_ref,
+                bound.rev,
+                "fixture:bound-attach-still-held",
+                replacement_anchor.clone(),
+                |_, _| panic!("bound attachment reached planner"),
+            ),
+            Err(Error::Conflict(
+                "managed mutation requires an unused isolated Sandbox"
+            ))
+        ));
+        assert!(matches!(
+            store.sandbox_release_source(
+                &actor,
+                &bound.canonical_ref,
+                &location.name,
+                bound.rev,
+                |_| -> Result<()> { panic!("bound release reached approval") },
+                |_, _| panic!("bound release reached physical owner"),
+            ),
+            Err(Error::Conflict(
+                "managed mutation requires an unused isolated Sandbox"
+            ))
+        ));
+        interrupt_replacement(&store, &bound, bound_id, true);
+        assert!(!bound.tool_root.join("code").exists());
+        assert_eq!(
+            store.sandbox_get(&actor, &bound.canonical_ref).unwrap(),
+            bound
+        );
+        assert!(replace(&store, &bound_path, &bound.canonical_ref, bound_id, Fresh).is_err());
+        assert!(store
+            .acquire_source_mutation_barrier(&bound_set, "fixture:bound-gap")
+            .is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let bound_replaced = replace(
+            &store,
+            &bound_path,
+            &bound.canonical_ref,
+            bound_id,
+            Continue,
+        )
+        .unwrap();
+        assert_eq!(bound_replaced.rev, bound.rev + 1);
+        assert_eq!(bound_replaced.sources[0].binding_rev, bound_replaced.rev);
+        assert_eq!(bound_replaced.layout_digest, bound.layout_digest);
+        assert_eq!(
+            fs::read(bound.tool_root.join("code/tracked")).unwrap(),
+            b"replacement version"
+        );
+        assert_eq!(store.agent_get(&actor, bound_ref).unwrap(), bound_agent);
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, bound_execution.session_id())
+                .unwrap(),
+            queue_before
+        );
+        assert_eq!(
+            store.sandbox_grant_status(&actor, bound_ref).unwrap(),
+            grant
+        );
+        assert!(store
+            .sandbox_grant_preflight(&actor, bound_ref, &policy, &ceilings)
+            .is_err());
+        assert!(store
+            .sandbox_grant_set(&actor, bound_ref, grant.revision, Some(&policy))
+            .is_err());
+        assert!(store
+            .agent_admission(
+                &actor,
+                bound_ref,
+                AgentAdmission::Open,
+                Some(bound_agent.rev)
+            )
+            .is_err());
+        let (_, current) = store
+            .sandbox_grant_sources(
+                &actor,
+                &actor,
+                bound_ref,
+                bound_replaced.rev,
+                std::slice::from_ref(&location.name),
+            )
+            .unwrap();
+        let renewed = aw_store::SandboxGrantPolicy {
+            evidence: aw_store::SandboxPolicyEvidence {
+                authority_generation: 2,
+                ..policy.evidence.clone()
+            },
+            sources: vec![aw_store::SandboxSourceGrant::from_binding(
+                &current[0],
+                SourceAccess::ReadWrite,
+            )],
+            ..policy
+        };
+        assert_eq!(
+            store
+                .sandbox_grant_set(&actor, bound_ref, grant.revision, Some(&renewed))
+                .unwrap()
+                .revision,
+            grant.revision + 1
+        );
+        assert!(store
+            .sandbox_grant_preflight(&actor, bound_ref, &renewed, &ceilings)
+            .is_ok());
+        assert_eq!(store.agent_get(&actor, bound_ref).unwrap(), bound_agent);
+        assert_eq!(
+            replace(
+                &store,
+                &bound_path,
+                &bound.canonical_ref,
+                bound_id,
+                Continue
+            )
+            .unwrap(),
+            bound_replaced
         );
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.

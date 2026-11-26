@@ -109,6 +109,7 @@ pub(super) struct ManagedMutation {
     pub(super) bindings: Vec<VersionedSourceBinding>,
     pub(super) preparations: Vec<NamedPreparedSource>,
     pub(super) writer_epoch: u64,
+    bound_agent: Option<(String, String)>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -154,6 +155,7 @@ pub(super) fn observe_managed_in(
     actor: &PrincipalId,
     sandbox: &str,
     rev: u64,
+    replacement: bool,
 ) -> Result<ManagedMutation> {
     let key = sandbox_owner::parse_sandbox_ref(sandbox)?;
     sandbox_owner::authorize_project(tx, actor, &key.project, true)?;
@@ -174,10 +176,11 @@ pub(super) fn observe_managed_in(
     // Recovery must observe its own reserved first-source layout.
     // The caller separately claims or revalidates that exact barrier.
     sandbox_owner::require_no_closed_retained_layout_in(tx, root, cwd)?;
-    // Initial structural realization requires an unused isolated layout.
+    // First/last source transitions and attachment remain unused-only.
+    // Replacement can preserve an existing, exclusively bound Agent's
+    // source-bearing layout, but never reinterpret an ambient or shared one.
     let used: bool = db(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_state_current WHERE sandbox_id=?1)
-         OR EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id<>?1 AND lifecycle='open'
+        "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id<>?1 AND lifecycle='open'
                    AND (tool_root IN (?2,?3) OR working_directory IN (?2,?3)))
          OR (?4 AND EXISTS(SELECT 1 FROM sessions r
              WHERE json_extract(r.binding_json,'$.tool_root') IN (?2,?3)
@@ -190,6 +193,61 @@ pub(super) fn observe_managed_in(
             "managed mutation requires an unused isolated Sandbox",
         ));
     }
+    let bound_agent = {
+        let mut query = db(tx.prepare(
+            "SELECT session_id,branch_id FROM agent_state_current
+             WHERE sandbox_id=?1 LIMIT 2",
+        ))?;
+        let rows = db(query.query_map([sandbox], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }))?;
+        let agents = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        match agents.as_slice() {
+            [] => None,
+            [(session, branch)] if replacement && !bindings.is_empty() => {
+                let key = crate::agent_owner::AgentKey::new(session, branch);
+                let (lifecycle, admission) = crate::agent_owner::lifecycle(tx, key)?;
+                let (project, layout, current, _, _) =
+                    sandbox_owner::agent_project_and_layout(tx, session, branch)?;
+                // A close request never reopens admission. Do not strand an
+                // original Prepared replacement if that Agent closes while
+                // physical reconciliation is in flight.
+                if !matches!(lifecycle.as_str(), "open" | "closing" | "closed")
+                    || admission != "held"
+                    || current.as_deref() != Some(sandbox)
+                    || project.canonical() != snapshot.project_ref
+                    || layout.digest != snapshot.layout_digest
+                    || layout.tool_root != root
+                    || layout.working_directory != cwd
+                {
+                    return Err(Error::Conflict(
+                        "bound replacement requires an exact Agent with held admission",
+                    ));
+                }
+                let shared: bool = db(tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM branches
+                         WHERE session_id=?1 AND id<>?2)
+                     OR EXISTS(SELECT 1 FROM sessions r WHERE r.id<>?1
+                         AND (json_extract(r.binding_json,'$.tool_root') IN (?3,?4)
+                           OR json_extract(r.binding_json,'$.working_directory') IN (?3,?4)))",
+                    params![session, branch, root, cwd],
+                    |row| row.get(0),
+                ))?;
+                if shared {
+                    return Err(Error::Conflict(
+                        "bound replacement requires an isolated Agent Session",
+                    ));
+                }
+                crate::actor_queue::require_structural_quiescence_in(tx, session, branch)?;
+                Some((session.clone(), branch.clone()))
+            }
+            _ => {
+                return Err(Error::Conflict(
+                    "managed mutation requires an unused isolated Sandbox",
+                ));
+            }
+        }
+    };
     sandbox_owner::require_layout_quiescent_in(tx, sandbox, &tool_root_key(&snapshot.tool_root)?)?;
     if snapshot.working_directory != snapshot.tool_root {
         sandbox_owner::require_layout_quiescent_in(
@@ -210,6 +268,7 @@ pub(super) fn observe_managed_in(
         bindings,
         preparations: preparation,
         writer_epoch,
+        bound_agent,
     })
 }
 
@@ -221,7 +280,7 @@ fn observe_in(
     name: &SourceName,
     rev: u64,
 ) -> Result<SandboxSourceRelease> {
-    let layout = observe_managed_in(store, tx, actor, sandbox, rev)?;
+    let layout = observe_managed_in(store, tx, actor, sandbox, rev, false)?;
     let selected = layout
         .bindings
         .iter()

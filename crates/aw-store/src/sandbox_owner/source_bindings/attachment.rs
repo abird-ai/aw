@@ -434,8 +434,14 @@ impl<'a> PreparedSandboxAttachment<'a> {
         )?;
         let boundary = self.boundary();
         let sandbox = &self.observation.snapshot().canonical_ref;
-        let current =
-            observe_managed_in(self.store, tx, &self.actor, sandbox, boundary.expected_rev)?;
+        let current = observe_managed_in(
+            self.store,
+            tx,
+            &self.actor,
+            sandbox,
+            boundary.expected_rev,
+            boundary.replace,
+        )?;
         if current != self.observation.layout
             || (publication && current.writer_epoch != boundary.writer_epoch)
         {
@@ -706,8 +712,9 @@ impl SessionStore {
     }
 
     /// Replace the occupied name using the same original materialization
-    /// receipt. The trusted host must reconcile disposal of the old exact
-    /// descriptor and hold its proof together with the incoming proof.
+    /// receipt, in an unused layout or one exact held, quiescent Agent.
+    /// The trusted host must reconcile disposal of the old exact descriptor
+    /// and hold its proof together with the incoming proof.
     pub fn sandbox_prepare_replacement(
         &self,
         actor: &PrincipalId,
@@ -743,7 +750,7 @@ impl SessionStore {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let creator = new_request(&tx, actor, sandbox, request_id)?;
-            let layout = observe_managed_in(self, &tx, actor, sandbox, expected_rev)?;
+            let layout = observe_managed_in(self, &tx, actor, sandbox, expected_rev, replace)?;
             self.source_set_limit()
                 .admit(layout.bindings.len() + usize::from(!replace))?;
             if layout
@@ -817,7 +824,8 @@ impl SessionStore {
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if StoreScope::load(&tx)? != scope
             || new_request(&tx, actor, sandbox, request_id)? != receipt.creator
-            || observe_managed_in(self, &tx, actor, sandbox, expected_rev)? != observation.layout
+            || observe_managed_in(self, &tx, actor, sandbox, expected_rev, replace)?
+                != observation.layout
         {
             return Err(Error::Conflict("attachment changed during planning"));
         }
@@ -888,7 +896,14 @@ impl SessionStore {
             return Err(Error::Storage("attachment boundary unavailable"));
         };
         receipt.candidate.require_absent_in(&tx)?;
-        let layout = observe_managed_in(self, &tx, actor, sandbox, boundary.expected_rev)?;
+        let layout = observe_managed_in(
+            self,
+            &tx,
+            actor,
+            sandbox,
+            boundary.expected_rev,
+            boundary.replace,
+        )?;
         let registry = self.inner.source_drivers.reader()?;
         boundary.require_compatible(&registry)?;
         let sources = receipt

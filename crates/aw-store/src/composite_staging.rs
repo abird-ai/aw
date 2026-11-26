@@ -2349,12 +2349,28 @@ mod tests {
                 "ORIGINAL_CLAIMED_INPUT_DO_NOT_AUTO_REPLAY",
             )
             .unwrap();
+        crate::actor_queue::require_structural_quiescence_in(
+            &owner.connection().unwrap(),
+            &session.id,
+            &branch.id,
+        )
+        .unwrap();
         let claim = owner
             .actor_queue_claim_next(&actor, &session.id, &branch.id, "local", "r9g1a1g1", epoch)
             .unwrap()
             .expect("real original Pending was claimed");
         assert_eq!(claim.fact.state, crate::QueueState::Claimed);
         assert_eq!(claim.fact.payload_ref, original.payload_ref);
+        assert!(matches!(
+            crate::actor_queue::require_structural_quiescence_in(
+                &owner.connection().unwrap(),
+                &session.id,
+                &branch.id,
+            ),
+            Err(Error::Conflict(
+                "Actor queue still has unresolved execution custody"
+            ))
+        ));
         let original_claim = claim.fact.claim.as_ref().unwrap().clone();
         let published = capture_partial(&owner, &bundles, |_, _| Ok(()))
             .unwrap()

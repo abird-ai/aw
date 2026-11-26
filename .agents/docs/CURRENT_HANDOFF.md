@@ -35,7 +35,96 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: quiescent SourceDriver and VaultProvider maintenance
+## Latest local implementation delta — 2026-11-27: quiescent held-Agent managed source replacement
+
+Parent `e56cd92bed01f75e0f7f4469a8bc2533a7eb6d47` (documentation
+checkpoint over signed registry implementation `3c67319`). Revalidated
+both signatures, exact refs and non-reserved clean starting state.
+Last independently verified published AW main `0f9807f4` (local
+origin/main unchanged), dotlink `85ceccc1`, frozen `576d0a1a`.
+L5 only. Store v60, product 0.15.0, Git recovery v4 unchanged.
+
+- Priority review: the original Process owner does not yet provide a
+  production-qualified closed-descendant Linux backend for this route;
+  L5's execution environment has no delegated writable cgroup or
+  effective capabilities for that qualification. The strong frozen
+  Sandbox launcher is not a permitted implementation change. Select
+  the independent bound-Agent structural mutation slice instead of
+  weakening the Process proof or adding another fixed-command fixture.
+- Implement the conservative managed replacement subset of SPEC
+  §25.4. The existing Project-owned managed source observation
+  accepts an occupied, exact, nonempty managed layout with precisely
+  one Agent bound to it and admission held. Require its immutable
+  Session layout/digest, Project and Sandbox identity; refuse additional
+  branches, other exact-path Sessions, open Sandbox aliases and shared
+  materialization custody. Original unused-layout restrictions still
+  apply to attachment and release. No general rebind or live remount.
+- Reuse the original Actor queue claim quiescence check for unresolved
+  Input/Control, active Turns and hazards; additionally refuse Claimed
+  or Accepted queue facts (including the pre-Run/ACK gap). Pending
+  work has no execution custody and remains untouched. Retain the
+  original layout/run/hazard checks and old-plus-incoming complete
+  source mutation barrier. Carry the bound Agent identity in the
+  in-memory observation compared at claim/inspection/publication; no
+  new receipt, schema, authority or lifetime owner.
+- Every original replacement preparation, re-observation, inspection
+  and restart continuation uses the same gate and original recovery
+  descriptor. The existing source barrier fences source-aware opening
+  and dispatch. Hold admission throughout; no automatic grant or
+  activation. Agent closing/closed with held admission can still settle
+  an original Prepared replacement while the Sandbox remains open;
+  closure cannot strand physical custody. Sandbox close remains fenced
+  by unresolved source claims. Unknown effects are inspected, never
+  silently retried.
+- Publication changes only the selected binding and Sandbox revision
+  through the existing CAS/event owner. Unaffected binding, layout,
+  Agent identity/revision, history, queue and prior grant facts are
+  preserved. The old grant cannot authorize the new binding revision;
+  require explicitly reissued current authority. Existing offline
+  configured Git replacement route and CLI help use the original
+  owner. No new RPC or shared/participant activation claim.
+- Grouped regressions extend existing real owners, not new fixture
+  families. Store original queue claim/cold restoration verifies
+  Pending allows quiescence and Claimed refuses before Run. Configured
+  CLI Git lifecycle: held bound Agent, active source claim refusal,
+  bound attach/release refusal before planner, actual old checkout
+  removal then Unknown, unchanged logical binding and fenced retry,
+  restart and explicit continuation, exact one-revision publication,
+  old grant denial and explicit new pin, unchanged Agent and queue.
+  Host real Git lifecycle: two managed sources and Pending task;
+  physical replacement, original queue deletion and Agent close,
+  Sandbox close refused until settlement, unaffected source unchanged,
+  original replacement publication after Agent closure and subsequent
+  Sandbox closure.
+
+Validation: L5 locked/offline final source: Store Sandbox owner 4/4
+(2.24s), checkpoint owner 4/4 (2.53s), original claimed queue/cold
+restore 1/1 (1.97s); Host real Git lifecycle 1/1 (168.30s); CLI configured
+Git lifecycle 1/1 (88.78s); Actor lifecycle library 3/3 (57.38s);
+native executable integration 1/1 (35.08s). All 15 distinct selected
+tests passed. Initial binary-only Actor filter matched zero tests;
+corrected to the library target and counted only its actual three.
+Strict all-feature/all-target Clippy for aw-store/aw-host/aw-cli
+passed; durable/minimal all-target checks passed (existing feature-
+specific dead-code warnings). Scoped rustfmt and diff checks passed.
+Previous five historical full-Store failures not rerun; no full
+workspace, pinned Nix, or other-platform qualification claimed.
+
+Scope/next: this is an isolated, held, exact managed replacement
+subset, not general bound-Agent structural mutation. Bound attachment
+and partial/final release, shared/participant source execution,
+partial/scratch/non-exact physical cleanup, and actual maintenance
+stdio subprocess qualification remain pending. Prioritize actual
+production-reviewed Process containment/dispatch with original
+source/Actor/Tool/Vault authority and lifetime; if that boundary is
+unavailable, select the next substantive independent structural or
+host gate. Dependency-bearing registry replacement still needs
+explicit semantic compatibility; broader protected Views/manifest
+transfer, task/cross-Project restore and extension gates remain open.
+Phase 3 is not complete. No push, repin, frozen Sandbox changes or UX
+work.
+
+## Previous local implementation delta — 2026-11-27: quiescent SourceDriver and VaultProvider maintenance
 
 Parent `05e552380b56d457fbb2860e28769ad7f29064b4`; last independently
 verified published AW main `0f9807f4`, dotlink main `85ceccc1`, frozen

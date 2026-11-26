@@ -567,6 +567,27 @@ fn safe_to_claim(c: &rusqlite::Connection, session: &str, branch: &str) -> Resul
     Ok(current.next_turn)
 }
 
+/// Cold structural mutation shares the original Actor Input/Control
+/// quiescence check, but must also exclude a claimed or accepted queue
+/// item even before its Run exists (or after a missed ACK).
+/// Pending items have no execution custody and remain untouched.
+pub(crate) fn require_structural_quiescence_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+) -> Result<()> {
+    safe_to_claim(c, session, branch)?;
+    if latest(&events(c, session)?)
+        .values()
+        .any(|fact| matches!(fact.state, QueueState::Claimed | QueueState::Accepted))
+    {
+        return Err(Error::Conflict(
+            "Actor queue still has unresolved execution custody",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn publish_prepared_queue_in(
     connection: &rusqlite::Connection,
     owner: &PrincipalId,

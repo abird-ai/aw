@@ -1260,8 +1260,9 @@ impl<'a> GitCheckpointRestoreHost<'a> {
     }
 
     /// Replace an occupied named source using a single Prepared claim and
-    /// final publication. Independent authority must permit disposal of
-    /// the exact unchanged old materialization and the incoming version.
+    /// final publication. A bound layout requires one isolated held Agent.
+    /// Independent authority must exclude physical users and permit disposal
+    /// of the exact unchanged old materialization and the incoming version.
     pub fn replace_sandbox_source<F: GitRestoreFence>(
         &self,
         actor: &PrincipalId,
@@ -3875,10 +3876,55 @@ mod tests {
         let other_agent = store
             .agent_execution_binding(&actor, &versioned.agent.canonical_ref)
             .unwrap();
-        for input in store
+        // A close racing an already Prepared replacement must not strand
+        // the original physical custody. Pending initial work is not an
+        // active claim, and the original queue remains intact until close.
+        let other_before = store.sandbox_get(&actor, other_sandbox).unwrap();
+        let other_queue = store
             .actor_queue_list(&actor, other_agent.session_id())
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(other_queue.len(), 1);
+        let approved = ReplacementFence {
+            retained: fence(locations(&baseline_root), count_agents(&database)),
+            original: locations(&baseline_root).pop().unwrap(),
+        };
+        let incoming = baseline
+            .anchors
+            .iter()
+            .find(|anchor| anchor.name.as_str() == "data")
+            .unwrap();
+        let implementation = store.source_driver(&driver).unwrap();
+        let prepared = store
+            .sandbox_prepare_replacement(
+                &actor,
+                other_sandbox,
+                other_before.rev,
+                "fixture:close-during-bound-replacement",
+                incoming.clone(),
+                |attachment, prepare_id| {
+                    plan_attachment(&implementation, attachment, &approved, prepare_id)
+                },
+            )
+            .unwrap();
+        prepared.revalidate().unwrap();
+        let (old, descriptor) = prepared.observation().replaced().unwrap();
+        implementation
+            .verify_replacement_untouched(&descriptor.prepared, &old.binding, prepared.source())
+            .unwrap();
+        implementation
+            .release_restored_materialization(&descriptor.prepared, &old.binding)
+            .unwrap();
+        implementation
+            .require_restore_absent(prepared.source())
+            .unwrap();
+        implementation.execute_restore(prepared.source()).unwrap();
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, other_agent.session_id())
+                .unwrap(),
+            other_queue
+        );
+        for input in other_queue {
             store
                 .actor_queue_delete(
                     &actor,
@@ -3891,9 +3937,23 @@ mod tests {
         store
             .agent_request_close(&actor, &versioned.agent.canonical_ref, None)
             .unwrap();
-        store
+        let other_closed = store
             .agent_finish_close(&actor, &versioned.agent.canonical_ref)
             .unwrap();
+        assert!(store.sandbox_close(&actor, other_sandbox, None).is_err());
+        let other_replaced = host
+            .inspect_and_publish_attachment(prepared, &approved)
+            .unwrap();
+        assert_eq!(other_replaced.rev, other_before.rev + 1);
+        assert_eq!(other_replaced.sources[0], other_before.sources[0]);
+        assert_eq!(other_replaced.sources[1].binding_rev, other_replaced.rev);
+        assert_eq!(
+            store
+                .agent_get(&actor, &versioned.agent.canonical_ref)
+                .unwrap(),
+            other_closed
+        );
+        drop(approved);
         store.sandbox_close(&actor, other_sandbox, None).unwrap();
         let original_other = {
             let c = Connection::open(&database).unwrap();

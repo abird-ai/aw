@@ -172,7 +172,7 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_source_attach::Args,
     },
-    /// Replace an exact original managed source in an unused Sandbox.
+    /// Replace an exact managed source in an unused or isolated held-Agent Sandbox.
     #[cfg(feature = "workspace")]
     SandboxSourceReplace {
         #[command(flatten)]
