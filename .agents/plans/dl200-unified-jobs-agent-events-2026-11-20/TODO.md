@@ -1675,7 +1675,8 @@ Current implementation: exact whole-Run native recovery and Input/queue disposit
       Input admission 2/2, Store queue 8/8 and recovery 2/2, Host
       native/Process 2/2, Actor 46/46; strict affected Clippy,
       durable/minimal targets, full executable/version/help,
-      scoped fmt/diff passed.
+      scoped fmt/diff passed. Signed `a747e78`; independent locked/offline
+      all-feature executable native_source_rpc rerun 1/1 (19.82s).
       **Next:** unclaimed intent proof, linked-layout and independent
       Process recovery proof. Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
@@ -1698,9 +1699,9 @@ Current implementation: exact whole-Run native recovery and Input/queue disposit
       Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
-      See current comprehensive handoff §5 for next cuts, limitations and acceptance. Schema v60.
-      AW remote main last verified at 4ddeed8; subsequent implementation and documentation
-      checkpoints remain local. No new remote verification or publication.
+      See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.
+      Last independently verified published AW main `7b92686`; local signed implementation
+      through `a747e78`. No new remote verification or publication.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;

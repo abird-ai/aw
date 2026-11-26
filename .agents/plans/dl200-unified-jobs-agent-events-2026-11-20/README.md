@@ -196,11 +196,13 @@ Historical checks remain historical; the rename needs a fresh focused AW+dotlink
    internal roles/semantics. Detailed owner contracts remain in their existing sections.
 2. **`IMPLEMENTATION.md`** — seven phases, implementation boundaries and grouped acceptance.
 3. **`TODO.md`** — short current work/approval gates; its design-resolution checklist is history.
-4. **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md`** — current
-   comprehensive R6/Phase-1/2/3 context, exact chronology through 2b4fac3, owner map,
+4. **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md`** — current
+   comprehensive R6/Phase-1/2/3 context, exact chronology through `a747e78`, owner map,
    historical design appendix and next implementation boundary.
-5. **`../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md`** — copy-ready next-agent prompt.
-6. **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md`**,
+5. **`../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md`** — copy-ready next-agent prompt.
+6. **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md`**,
+   **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md`**,
+   **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md`**,
    **`../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md`**,
    **`../../docs/AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md`** and
    **`../../docs/AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md`** — historical implementation/design provenance.

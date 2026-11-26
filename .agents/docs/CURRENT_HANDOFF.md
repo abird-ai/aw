@@ -1,10 +1,10 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md).
 
 Previous Phase-3, Phase-1 and R6 comprehensive handoffs remain historical design/implementation provenance:
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md)
@@ -18,6 +18,13 @@ Normative R6 design:
 - [SPEC](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md)
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
+
+Documentation reconciliation: the previously interrupted source work landed
+at signed `a747e78` on exact parent `7b5dae5`. The November 26 comprehensive
+handoff preserves all 24 subsequent signed checkpoints and the prior historical
+appendix. Independent L5 rerun on that implementation: `cargo test --locked
+--offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
+(19.82s). No source change or broader phase qualification in this documentation cut.
 
 ## Latest local implementation delta — 2026-11-26: exact whole-Run native recovery and Input/queue disposition
 
