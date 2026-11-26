@@ -1071,6 +1071,26 @@ mod tests {
         drop(store);
 
         let store = SessionStore::open(&temp.0).unwrap();
+        let dependencies = store.source_driver_dependencies(&driver).unwrap();
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dep| dep.kind == crate::SourceDependencyKind::Binding)
+                .map(|dep| dep.count)
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dep| dep.kind == crate::SourceDependencyKind::UnresolvedConstruction)
+                .map(|dep| dep.count)
+                .sum::<u64>(),
+            4
+        );
+        assert!(dependencies
+            .iter()
+            .all(|dep| dep.compatibility == crate::SourceCompatibility::RecoveryRequired));
         assert!(store
             .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| {
                 panic!("unavailable recovery schema must refuse before inspection")

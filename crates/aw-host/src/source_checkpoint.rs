@@ -3852,6 +3852,20 @@ mod tests {
             .agent_finish_close(&actor, &restored.agent.canonical_ref)
             .unwrap();
         let closed = store.sandbox_close(&actor, sandbox, None).unwrap();
+        let retained_count = |store: &SessionStore| {
+            store
+                .source_driver_dependencies(&aw_agent_core::DriverKey::builtin("git").unwrap())
+                .unwrap()
+                .iter()
+                .filter(|dep| dep.kind == aw_store::SourceDependencyKind::RetainedMaterialization)
+                .map(|dep| dep.count)
+                .sum::<u64>()
+        };
+        let before_release = retained_count(&store);
+        assert!(
+            before_release >= 2,
+            "closed managed layout retains exact release schemas"
+        );
 
         // A second genuinely managed (not merely passive) closed layout
         // still owns its original release recipe. Simulate an ambiguous
@@ -4020,6 +4034,7 @@ mod tests {
             })
             .unwrap();
         assert!(released.sources.is_empty());
+        assert_eq!(retained_count(&store), before_release - 2);
         assert_eq!(released.rev, closed.rev + 1);
         assert!(fs::read_dir(&destination).unwrap().next().is_none());
         assert_eq!(

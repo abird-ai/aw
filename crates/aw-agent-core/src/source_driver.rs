@@ -885,6 +885,9 @@ pub struct SourceDriverRegistry {
 pub struct SourceDriverRegistryReader {
     reader: publication::Reader<SourceDriverSnapshot>,
     identity: Arc<()>,
+    // Readers can mint implementation users. Weak ownership excludes
+    // maintenance via Arc::get_mut without extending publisher lifetime.
+    _owner: std::sync::Weak<StagedRegistry<SourceDriverSnapshot>>,
 }
 
 impl Default for SourceDriverRegistry {
@@ -909,6 +912,7 @@ impl SourceDriverRegistry {
         Ok(SourceDriverRegistryReader {
             reader: self.owner.reader_factory().reader()?,
             identity: self.identity.clone(),
+            _owner: Arc::downgrade(&self.owner),
         })
     }
 
@@ -964,6 +968,104 @@ impl SourceDriverRegistry {
             validate_snapshot,
         )?;
         self.owner.publish(stage).map(|(_, handle)| handle)
+    }
+
+    fn require_exclusive(&mut self) -> Result<()> {
+        if Arc::get_mut(&mut self.owner).is_none() {
+            return Err(Error::Conflict(
+                "SourceDriver registry has live owners or readers",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Quiescent definition maintenance. A registry installed in a Store
+    /// must be mutated by that Store's dependency-checking owner, not an
+    /// external clone. Detached host configuration cannot confer custody.
+    pub fn remove<T: Send + Sync + 'static>(
+        &mut self,
+        handle: &SourceDriverHandle<T>,
+        expected_revision: Option<u64>,
+    ) -> Result<u64> {
+        self.require_exclusive()?;
+        let stage = self.owner.stage(
+            expected_revision,
+            |current, _| {
+                let entry = self.require_current(current, handle)?;
+                entry.implementation.require_idle()?;
+                let mut next = current.clone();
+                next.entries.remove(&handle.driver);
+                Ok((next, ()))
+            },
+            validate_snapshot,
+        )?;
+        self.owner.publish(stage).map(|(revision, ())| revision)
+    }
+
+    /// Atomic quiescent replacement, never remove/register piecemeal.
+    /// Durable dependency semantics are the attached Store's responsibility.
+    pub fn replace<T: Send + Sync + 'static, U: Send + Sync + 'static>(
+        &mut self,
+        handle: &SourceDriverHandle<T>,
+        schemas: SourceDriverSchemas,
+        implementation: U,
+        expected_revision: Option<u64>,
+    ) -> Result<SourceDriverHandle<U>> {
+        validate_schemas(schemas)?;
+        self.require_exclusive()?;
+        let stage = self.owner.stage(
+            expected_revision,
+            |current, revision| {
+                let entry = self.require_current(current, handle)?;
+                entry.implementation.require_idle()?;
+                let driver = handle.driver.clone();
+                let descriptor = SourceDriverDescriptor {
+                    driver: driver.clone(),
+                    schemas,
+                    registration_revision: revision,
+                };
+                let mut next = current.clone();
+                next.entries.insert(
+                    driver.clone(),
+                    SourceDriverEntry {
+                        descriptor,
+                        implementation: registry::NativeDefinition::new(implementation),
+                    },
+                );
+                Ok((
+                    next,
+                    SourceDriverHandle {
+                        driver,
+                        schemas,
+                        registration_revision: revision,
+                        owner: self.identity.clone(),
+                        implementation: std::marker::PhantomData,
+                    },
+                ))
+            },
+            validate_snapshot,
+        )?;
+        self.owner.publish(stage).map(|(_, handle)| handle)
+    }
+
+    fn require_current<'a, T: Send + Sync + 'static>(
+        &self,
+        current: &'a SourceDriverSnapshot,
+        handle: &SourceDriverHandle<T>,
+    ) -> Result<&'a SourceDriverEntry> {
+        if !Arc::ptr_eq(&self.identity, &handle.owner) {
+            return Err(Error::Denied(
+                "SourceDriver handle belongs to another registry",
+            ));
+        }
+        let entry = current
+            .entries
+            .get(&handle.driver)
+            .filter(|entry| entry.descriptor == handle.descriptor())
+            .ok_or(Error::Denied("SourceDriver handle is stale"))?;
+        // Check concrete type without retaining another implementation user.
+        drop(entry.implementation.get::<T>()?);
+        Ok(entry)
     }
 
     pub fn list(&self) -> Result<Vec<SourceDriverDescriptor>> {
@@ -1084,6 +1186,73 @@ mod tests {
             anchor: SchemaSupport::new(1, 1).unwrap(),
             recovery: SchemaSupport::new(1, 1).unwrap(),
         }
+    }
+
+    #[test]
+    fn source_driver_maintenance_preserves_live_users_and_exact_handles() {
+        let driver = DriverKey::builtin("git").unwrap();
+        let mut registry = SourceDriverRegistry::new();
+        let first = registry
+            .register(driver.clone(), v1_schemas(), GitV1("first"))
+            .unwrap();
+        let other = registry
+            .register(
+                DriverKey::builtin("other").unwrap(),
+                v1_schemas(),
+                GitV1("other"),
+            )
+            .unwrap();
+        let rev = registry.revision().unwrap();
+        let clone = registry.clone();
+        assert!(registry.remove(&first, Some(rev)).is_err());
+        drop(clone);
+        let reader = registry.reader().unwrap();
+        assert!(registry
+            .replace(&first, v1_schemas(), GitV2("new"), Some(rev))
+            .is_err());
+        let live = reader.get(&first).unwrap();
+        let weak = Arc::downgrade(&live);
+        drop(reader);
+        assert!(registry.remove(&first, Some(rev)).is_err());
+        drop(live);
+        assert!(
+            registry.remove(&first, Some(rev)).is_err(),
+            "Weak may resurrect an implementation user"
+        );
+        drop(weak);
+        assert!(registry.remove(&first, Some(rev - 1)).is_err());
+        let foreign = SourceDriverRegistry::new();
+        let foreign_handle = foreign
+            .register(driver.clone(), v1_schemas(), GitV1("foreign"))
+            .unwrap();
+        assert!(registry.remove(&foreign_handle, Some(rev)).is_err());
+        assert_eq!(registry.revision().unwrap(), rev);
+        let next = registry
+            .replace(&first, v1_schemas(), GitV2("new"), Some(rev))
+            .unwrap();
+        assert_eq!(registry.revision().unwrap(), rev + 1);
+        let reader = registry.reader().unwrap();
+        assert!(reader.get(&first).is_err());
+        assert_eq!(reader.get(&next).unwrap().as_ref(), &GitV2("new"));
+        assert_eq!(reader.get(&other).unwrap().as_ref(), &GitV1("other"));
+        drop(reader);
+        assert!(registry.remove(&first, None).is_err());
+        assert_eq!(registry.remove(&next, Some(rev + 1)).unwrap(), rev + 2);
+        assert!(registry.reader().unwrap().handle::<GitV2>(&driver).is_err());
+        let installed = registry
+            .register(driver, v1_schemas(), GitV2("reinstalled"))
+            .unwrap();
+        assert!(registry.reader().unwrap().get(&next).is_err());
+        assert_eq!(
+            registry.reader().unwrap().get(&installed).unwrap().as_ref(),
+            &GitV2("reinstalled")
+        );
+        let reader = registry.reader().unwrap();
+        drop(registry);
+        assert!(
+            reader.get(&installed).is_err(),
+            "reader must not keep publisher alive"
+        );
     }
 
     #[test]

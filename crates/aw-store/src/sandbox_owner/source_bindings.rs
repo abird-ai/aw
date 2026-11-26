@@ -987,6 +987,44 @@ impl SessionStore {
     }
 }
 
+/// Visit the exact retained binding and managed recovery-schema pins.
+/// Closed retained rows count too. Do not require a current implementation.
+pub(crate) fn visit_driver_pins(
+    connection: &Connection,
+    driver: &DriverKey,
+    mut visit: impl FnMut(crate::SourceDependencyKind, aw_agent_core::DriverSchemaPin) -> Result<()>,
+) -> Result<()> {
+    use crate::SourceDependencyKind;
+    let driver_key = crate::json(driver)?;
+    let mut query = db(connection.prepare(
+        "SELECT DISTINCT sandbox_id FROM sandbox_source_bindings_current WHERE driver_key=?1 ORDER BY sandbox_id",
+    ))?;
+    let mut rows = db(query.query([&driver_key]))?;
+    while let Some(row) = db(rows.next())? {
+        let sandbox: String = db(row.get(0))?;
+        let bindings = versioned_bindings_in(connection, &sandbox)?;
+        for binding in &bindings {
+            if &binding.binding.driver == driver {
+                visit(SourceDependencyKind::Binding, binding.binding.pin()?)?;
+            }
+        }
+        // Only genuinely managed layouts have release recipes. Ambiguous
+        // or inconsistent managed custody is an error, never no dependency.
+        if crate::construction_receipt::original_materializations_in(connection, &sandbox)?
+            .is_some()
+            || attachment::has_attachment_in(connection, &sandbox)?
+        {
+            for source in release::retained_preparations_in(connection, &sandbox, &bindings)? {
+                let pin = source.prepared.descriptor.pin()?;
+                if &pin.driver == driver {
+                    visit(SourceDependencyKind::RetainedMaterialization, pin)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile compatibility, not source state. No driver effect is executed.
 /// A compatible registration is not authority to materialize or execute.
 pub(crate) fn revalidate_in(

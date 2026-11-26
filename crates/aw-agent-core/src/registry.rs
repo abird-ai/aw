@@ -5,23 +5,43 @@
 //! EventTypeRegistry; later leaf registries reuse this exact owner.
 
 use crate::{publication, Error, Result};
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+};
 
 /// Shared native implementation custody for typed definition leaves.
 /// Type erasure is confined to registration/lookup; callers get Arc<T>.
 #[derive(Clone)]
-pub(crate) struct NativeDefinition(Arc<dyn Any + Send + Sync>);
+pub(crate) struct NativeDefinition(Arc<Mutex<Arc<dyn Any + Send + Sync>>>);
 
 impl NativeDefinition {
     pub(crate) fn new<T: Send + Sync + 'static>(value: T) -> Self {
-        Self(Arc::new(value))
+        Self(Arc::new(Mutex::new(Arc::new(value))))
     }
 
     pub(crate) fn get<T: Send + Sync + 'static>(&self) -> Result<Arc<T>> {
         self.0
+            .lock()
+            .map_err(|_| Error::Storage("native definition poisoned"))?
             .clone()
             .downcast::<T>()
             .map_err(|_| Error::Denied("native definition implementation type changed"))
+    }
+
+    /// Immutable published snapshots share a single implementation owner.
+    /// Exact Arc uniqueness also excludes outstanding Weak references,
+    /// which could otherwise resurrect a user during retirement. No lock
+    /// is held during the actual driver/provider invocation.
+    pub(crate) fn require_idle(&self) -> Result<()> {
+        let mut implementation = self
+            .0
+            .lock()
+            .map_err(|_| Error::Storage("native definition poisoned"))?;
+        if Arc::get_mut(&mut *implementation).is_none() {
+            return Err(Error::Conflict("native definition still has live users"));
+        }
+        Ok(())
     }
 }
 

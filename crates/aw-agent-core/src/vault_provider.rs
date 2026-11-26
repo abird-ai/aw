@@ -87,6 +87,7 @@ pub struct VaultProviderRegistry {
 pub struct VaultProviderRegistryReader {
     reader: publication::Reader<Snapshot>,
     identity: Arc<()>,
+    _owner: std::sync::Weak<StagedRegistry<Snapshot>>,
 }
 
 impl Default for VaultProviderRegistry {
@@ -111,6 +112,7 @@ impl VaultProviderRegistry {
         Ok(VaultProviderRegistryReader {
             reader: self.owner.reader_factory().reader()?,
             identity: self.identity.clone(),
+            _owner: Arc::downgrade(&self.owner),
         })
     }
 
@@ -174,6 +176,40 @@ impl VaultProviderRegistry {
             },
         )?;
         self.owner.publish(stage).map(|(_, handle)| handle)
+    }
+
+    /// Quiescent definition withdrawal only. No grant, provider entry or
+    /// SecretStore mutation. Old handles fail closed; current durable
+    /// grants may be unavailable until the original provider returns.
+    pub fn remove<T: Send + Sync + 'static>(
+        &mut self,
+        handle: &VaultProviderHandle<T>,
+        expected_revision: Option<u64>,
+    ) -> Result<u64> {
+        if Arc::get_mut(&mut self.owner).is_none() {
+            return Err(Error::Conflict(
+                "VaultProvider registry has live owners or readers",
+            ));
+        }
+        if !Arc::ptr_eq(&self.identity, &handle.owner) {
+            return Err(Error::Denied("VaultProvider belongs to another registry"));
+        }
+        let stage = self.owner.stage(
+            expected_revision,
+            |current, _| {
+                let entry = current
+                    .get(&handle.descriptor.provider)
+                    .filter(|entry| entry.descriptor == handle.descriptor)
+                    .ok_or(Error::Denied("VaultProvider registration unavailable"))?;
+                drop(entry.implementation.get::<T>()?);
+                entry.implementation.require_idle()?;
+                let mut next = current.clone();
+                next.remove(&handle.descriptor.provider);
+                Ok((next, ()))
+            },
+            |_| Ok(()),
+        )?;
+        self.owner.publish(stage).map(|(revision, ())| revision)
     }
 }
 

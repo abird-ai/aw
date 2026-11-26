@@ -26,7 +26,111 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: explicit physical retention reconciliation RPC
+## Latest local implementation delta — 2026-11-27: quiescent SourceDriver and VaultProvider maintenance
+
+Parent `05e552380b56d457fbb2860e28769ad7f29064b4`; last independently
+verified published AW main `0f9807f4`, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only. Recovered the interrupted eight-file unstaged
+registry/Store slice on its exact parent; no unrelated staged work,
+no other source-authoring host. Store v60, product 0.15.0, Git recovery
+v4 and frozen release unchanged.
+
+- Reuse the original typed leaf and private StagedRegistry CAS
+  publication. SourceDriver remove/replace and VaultProvider withdrawal
+  require exclusive registry ownership, including absence of readers.
+  Reader weak owner pins preserve existing publisher-drop semantics;
+  registration handles pin identity, not active implementation custody.
+  NativeDefinition shares the existing implementation Arc through a
+  small ownership cell: check exact Arc uniqueness (including escaped
+  Weak users) at maintenance; no guard during actual native invocation.
+  A lookup acquires only that short implementation-cell lock, not a new
+  global runtime owner. Stale/foreign/type-mismatched handles and stale
+  expected revisions refuse; unrelated registration handles remain
+  valid after a successful publication.
+- SourceDriverDependency reports bounded nonsecret schema groups and
+  exact counts for retained Sandbox bindings, live and retired retained
+  checkpoint anchors, managed materialization recovery schemas and
+  unresolved construction descriptors/input pins. Reuse original
+  binding/anchor/receipt/release decoders, including absent or
+  incompatible registered definitions. Closed managed rows still pin
+  their actual original recovery schema. Historical terminal receipts
+  without retained materialization are not an independent dependency.
+  No source locator, recovery payload or permission inferred from a
+  schema support range. Malformed or over-bound dependencies fail closed.
+- Store remove_source_driver/replace_source_driver use the exclusive
+  persistent Store owner (no clones/live barriers), current process
+  and ordinary maintenance validation, one immediate SQL fence across
+  dependency inspection and staged publication. External registry
+  clones cannot bypass the Store. Any retained dependency blocks both
+  removal and replacement in this conservative first cut; a declared
+  version range alone cannot establish semantic takeover. Unattributed
+  active/hazard source-mutation scopes block maintenance globally, even
+  if their binding rows are absent. No automatic recovery or mutation
+  of source state, grant, receipt, provider data or Store schema.
+- VaultProviderDependency reports current attached grant counts by
+  projection and whether the installed descriptor advertises it;
+  this is a trusted host diagnostic, not an Agent View or actual
+  provider authorization. Quiescent registry withdrawal keeps all
+  durable grants and encrypted SecretStore custody untouched. An
+  unavailable registration denies typed lookup/use; same stable key
+  reinstallation does not itself revive original authority. The
+  configured signing provider still needs exact current authority/key
+  and explicit grant reattachment where its generation changes.
+  Existing independent live provider/grant revocation remains the
+  running-Process withdrawal mechanism; registry maintenance never
+  forcibly drops a live broker or implementation.
+- Grouped regression: original typed source registry rejects live
+  owners/readers/Arc/Weak, stale and foreign handles; successful
+  dependency-free replacement/removal/reinstall advances only the
+  intended registration/revision. Reader does not keep a dropped
+  publisher alive. Exclusive Store fixture rejects clone bypass,
+  live implementation and unattributed Unknown mutation custody;
+  exact original recovery permits subsequent maintenance. Actual
+  checkpoint capture/restart fixture enumerates unresolved recovery
+  and binding pins even with absent driver. Retained anchor fixture
+  counts retired roots, refuses replacement with actual remaining
+  durable dependencies, and checks successful cleanup changes counts.
+  Actual Git managed release fixture verifies closed-layout recovery
+  schema counts before and after physical retirement. Configured
+  signing fixture rejects live readers/Arc/Weak, withdraws definition
+  without key or grant mutation, reports unavailable projection and
+  requires explicit authority reattachment after reinstall. Initial
+  regression compile error used a nonexistent public recovery API;
+  corrected to the existing private receipt-owner transaction.
+
+Validation: L5 locked/offline core library 102 passed / 1 existing
+ignored; Store exclusive maintenance 1/1, checkpoint owner 4/4,
+Vault signing 2/2 (final rerun 1.17s); Host actual Git lifecycle 1/1
+(160.78s) and source Process 2/2 (6.48s); Actor lifecycle 3/3
+(57.36s); actual native executable 1/1 (35.74s). 116 distinct tests
+passed, no outstanding failing selected test. Strict all-feature/
+all-target core/Store/Host/CLI Clippy (after boolean test assertion
+cleanup), all-feature build and durable/minimal all-target checks
+(existing feature-specific warnings), scoped fmt/diff passed.
+The earlier test-only compile issue and lint were corrected and
+relevant tests rerun. Prior five historical Store failures, full
+workspace, pinned Nix and other platforms not rerun.
+
+Scope: trusted quiescent local host maintenance only; not dynamic
+ExtensionRegistry generation replacement or live reload. Source
+dependency-bearing replacement remains refused until explicit
+semantic compatibility validation is qualified; old missing-schema
+startup remains fail-closed. Vault withdrawal is not a key purge,
+grant revocation, proof erasure or generic provider migration.
+No registry mutation RPC, automatic cleanup, shared participant
+execution, new containment backend or frozen release changes.
+
+Next: actual production-reviewed Process containment and dispatch
+with original driver, source and Vault authority; select a coherent
+bound-Agent structural mutation or remaining original host gate
+if that owner is occupied. Continue explicit compatibility validation
+for dependency-bearing replacement only with real provider semantics,
+not a schema-range shortcut. Keep task-bearing/cross-Project restore,
+partial/scratch layout and shared/participant source execution, wider
+protected Views/manifest-preserving exports, dynamic Extensions and
+final Phase 3 acceptance open. No push or repin.
+
+## Previous local implementation delta — 2026-11-27: explicit physical retention reconciliation RPC
 
 Parent `435bd7d44430168c96f1216bdb79ede36e052569`; published AW main
 `0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen

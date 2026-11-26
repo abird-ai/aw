@@ -954,7 +954,7 @@ mod tests {
             serde_json::to_vec(&config(vec![entry_config.clone()])).unwrap(),
         )
         .unwrap();
-        let registry = VaultProviderRegistry::new();
+        let mut registry = VaultProviderRegistry::new();
         let handle = SigningVaultProvider::open_configured(&store, &root)
             .unwrap()
             .register(&registry)
@@ -1013,6 +1013,69 @@ mod tests {
         assert!(provider
             .provision(&store, &actor, target, &[99; 32])
             .is_err());
+
+        // Quiescent withdrawal affects definitions only. Both a live
+        // reader and an escaped implementation/Weak can still mint work.
+        let revision = registry.revision().unwrap();
+        assert!(registry.remove(&handle, Some(revision)).is_err());
+        let weak = std::sync::Arc::downgrade(&provider);
+        drop(reader);
+        assert!(registry.remove(&handle, Some(revision)).is_err());
+        drop(provider);
+        assert!(registry.remove(&handle, Some(revision)).is_err());
+        drop(weak);
+        assert!(registry.remove(&handle, Some(revision - 1)).is_err());
+        let report = |registry: &VaultProviderRegistry| {
+            store
+                .vault_provider_dependencies(&provider_key, &registry.reader().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            report(&registry),
+            vec![crate::VaultProviderDependency {
+                projection: VaultProjection::Broker,
+                count: 1,
+                projection_registered: true,
+            }]
+        );
+        let original_summary = store
+            .agent_vault_list(&actor, &reference, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            registry.remove(&handle, Some(revision)).unwrap(),
+            revision + 1
+        );
+        assert_eq!(keys.get(&key_ref).unwrap().as_slice(), &original_key);
+        assert_eq!(
+            report(&registry),
+            vec![crate::VaultProviderDependency {
+                projection: VaultProjection::Broker,
+                count: 1,
+                projection_registered: false,
+            }]
+        );
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev);
+        assert_eq!(
+            store
+                .agent_vault_list(&actor, &reference, |_, _| Ok(()))
+                .unwrap(),
+            original_summary
+        );
+        assert!(sign(&store, &registry.reader().unwrap(), &handle, rev).is_err());
+        let old_handle = handle;
+        let handle = SigningVaultProvider::open_configured(&store, &root)
+            .unwrap()
+            .register(&registry)
+            .unwrap();
+        let reader = registry.reader().unwrap();
+        assert!(reader.get(&old_handle).is_err());
+        assert!(
+            sign(&store, &reader, &handle, rev).is_err(),
+            "new provider authority cannot revive an old grant"
+        );
+        assert!(report(&registry)[0].projection_registered);
+        let rev = attach(&store, &reader, &handle, rev).unwrap();
+        let provider = reader.get(&handle).unwrap();
 
         // The original version cannot be silently replaced under a live grant.
         keys.delete(&key_ref).unwrap();

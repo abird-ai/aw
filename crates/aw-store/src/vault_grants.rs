@@ -174,6 +174,16 @@ pub struct VaultGrantSummary {
     pub status: VaultGrantStatus,
 }
 
+/// Trusted host dependency report, not a grant or a public Agent View.
+/// Count current durable references including stale or closed owners;
+/// provider entry identity and secret custody are not exposed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VaultProviderDependency {
+    pub projection: VaultProjection,
+    pub count: u64,
+    pub projection_registered: bool,
+}
+
 /// Metadata-only view: the redacted binding summary is always present;
 /// an entry reference requires a separate, live provider disclosure decision.
 /// Scope, authority locator, backend/key locator and credential bytes are
@@ -664,6 +674,39 @@ impl SessionStore {
     /// its live guard. Acquire external authority before the Store transaction
     /// (no protected disclosure or effects in that callback). Even then, this
     /// lower view redacts provider identities.
+    /// Read exact attached Vault grant dependencies, even for an absent
+    /// provider. Definition withdrawal is not grant or key retirement.
+    pub fn vault_provider_dependencies(
+        &self,
+        provider: &aw_agent_core::DriverKey,
+        registry: &VaultProviderRegistryReader,
+    ) -> Result<Vec<VaultProviderDependency>> {
+        provider.validate()?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let descriptor = registry
+            .list()?
+            .into_iter()
+            .find(|entry| &entry.provider == provider);
+        let mut query = db(tx.prepare_cached(
+            "SELECT projection,count(*) FROM agent_vault_grants_current
+             WHERE provider_id=?1 GROUP BY projection ORDER BY projection",
+        ))?;
+        let mut rows = db(query.query([crate::json(provider)?]))?;
+        let mut result = Vec::new();
+        while let Some(row) = db(rows.next())? {
+            let kind = projection(&db(row.get::<_, String>(0))?)?;
+            result.push(VaultProviderDependency {
+                projection: kind,
+                count: db(row.get(1))?,
+                projection_registered: descriptor
+                    .as_ref()
+                    .is_some_and(|entry| entry.projections.contains(&kind)),
+            });
+        }
+        Ok(result)
+    }
+
     pub fn agent_vault_list<F>(
         &self,
         manager: &PrincipalId,

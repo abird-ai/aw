@@ -664,6 +664,33 @@ impl SessionStore {
     }
 }
 
+/// Include live and retired-but-retained checkpoint anchors, not only
+/// those visible through the public live checkpoint list.
+pub(crate) fn visit_driver_pins(
+    connection: &Connection,
+    driver: &aw_agent_core::DriverKey,
+    mut visit: impl FnMut(aw_agent_core::DriverSchemaPin) -> Result<()>,
+) -> Result<()> {
+    let driver_key = crate::json(driver)?;
+    let mut query = db(connection.prepare(
+        "SELECT DISTINCT c.checkpoint_id,c.source_coverage FROM checkpoints c
+         JOIN checkpoint_sources s ON s.checkpoint_id=c.checkpoint_id
+         WHERE s.driver_key=?1 ORDER BY c.checkpoint_id",
+    ))?;
+    let mut rows = db(query.query([&driver_key]))?;
+    while let Some(row) = db(rows.next())? {
+        let checkpoint: String = db(row.get(0))?;
+        let coverage = parse_coverage(&db(row.get::<_, String>(1))?)?;
+        let (set, _) = sources_in(connection, &checkpoint, coverage)?;
+        for anchor in set.anchors {
+            if &anchor.driver == driver {
+                visit(anchor.pin()?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve retained anchors against the same registry snapshot as bindings.
 /// Retired rows still awaiting retention cleanup keep their driver dependency.
 /// Missing/incompatible definitions are diagnostics, not source mutations.
@@ -1104,6 +1131,13 @@ mod tests {
             .register(git.clone(), schemas(1, 1), ())
             .unwrap();
         let store = SessionStore::open_with_sources(&temp.0, incompatible, limit).unwrap();
+        for driver in [&git, &dataset] {
+            let dependencies = store.source_driver_dependencies(driver).unwrap();
+            assert!(dependencies.iter().any(|dependency| dependency.kind
+                == crate::SourceDependencyKind::CheckpointAnchor
+                && dependency.compatibility == SourceCompatibility::RecoveryRequired
+                && dependency.count == 1));
+        }
         let mut degraded = expected.clone();
         for source in &mut degraded.sources {
             source.compatibility = SourceCompatibility::RecoveryRequired;
@@ -1123,8 +1157,12 @@ mod tests {
         drop(store);
 
         let reinstalled = SourceDriverRegistry::new();
-        reinstalled.register(dataset, schemas(1, 1), ()).unwrap();
-        reinstalled.register(git, schemas(1, 2), ()).unwrap();
+        let dataset_handle = reinstalled
+            .register(dataset.clone(), schemas(1, 1), ())
+            .unwrap();
+        let git_handle = reinstalled
+            .register(git.clone(), schemas(1, 2), ())
+            .unwrap();
         let store = SessionStore::open_with_sources(
             &temp.0,
             reinstalled.clone(),
@@ -1322,6 +1360,17 @@ mod tests {
                 panic!("released retention must not replay inspection")
             })
             .unwrap();
+        assert_eq!(
+            store
+                .source_driver_dependencies(&git)
+                .unwrap()
+                .iter()
+                .filter(|dep| dep.kind == crate::SourceDependencyKind::CheckpointAnchor)
+                .map(|dep| dep.count)
+                .sum::<u64>(),
+            2,
+            "retired-but-retained anchor remains a dependency"
+        );
         // Shared retired anchor can now observe absence; a lowered source
         // limit does not make old cleanup dependencies impossible to release.
         store
@@ -1343,6 +1392,35 @@ mod tests {
             expected
         );
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
+        // Reopen with sole registry/Store ownership: the original live
+        // anchor, not an outstanding clone, must block retirement.
+        drop(store);
+        let mut store = SessionStore::open_with_sources(&temp.0, reinstalled, limit).unwrap();
+        for driver in [&git, &dataset] {
+            let deps = store.source_driver_dependencies(driver).unwrap();
+            assert_eq!(
+                deps.iter()
+                    .filter(|dep| dep.kind == crate::SourceDependencyKind::CheckpointAnchor)
+                    .map(|dep| dep.count)
+                    .sum::<u64>(),
+                1
+            );
+            assert!(deps
+                .iter()
+                .all(|dep| dep.compatibility == SourceCompatibility::Compatible));
+        }
+        assert!(matches!(
+            store.remove_source_driver(&dataset_handle, None),
+            Err(Error::Conflict(
+                "SourceDriver has retained durable dependencies"
+            ))
+        ));
+        assert!(matches!(
+            store.replace_source_driver(&git_handle, schemas(1, 2), (), None),
+            Err(Error::Conflict(
+                "SourceDriver has retained durable dependencies"
+            ))
+        ));
         {
             let conn = store.connection().unwrap();
             assert_eq!(
@@ -1371,7 +1449,7 @@ mod tests {
         }
         drop(store);
         assert!(matches!(
-            SessionStore::open_with_sources(&temp.0, reinstalled, limit),
+            SessionStore::open_with_sources(&temp.0, SourceDriverRegistry::new(), limit),
             Err(Error::Limit(_))
         ));
     }

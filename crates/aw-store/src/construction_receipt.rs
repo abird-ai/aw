@@ -1405,6 +1405,27 @@ pub(crate) fn visit_unresolved_sources(
         SourceCompatibility,
     ) -> Result<()>,
 ) -> Result<()> {
+    visit_unresolved_source_pins(connection, |receipt, source, pins| {
+        let mut status = SourceCompatibility::Compatible;
+        for pin in pins {
+            if compatibility(registry, pin)? == SourceCompatibility::RecoveryRequired {
+                status = SourceCompatibility::RecoveryRequired;
+            }
+        }
+        visit(receipt, source, status)
+    })
+}
+
+/// Exact descriptor and input schema dependencies from the original
+/// unresolved receipt, independent of what is currently installed.
+pub(crate) fn visit_unresolved_source_pins(
+    connection: &Connection,
+    mut visit: impl FnMut(
+        &ConstructionPreparation,
+        &NamedPreparedSource,
+        &[aw_agent_core::DriverSchemaPin],
+    ) -> Result<()>,
+) -> Result<()> {
     // The initial Prepared claim owns the dependency, even if a later
     // current receipt is malformed. The unique preparation index bounds
     // this scan to source-bearing claims, not the Session audit history.
@@ -1431,13 +1452,9 @@ pub(crate) fn visit_unresolved_sources(
             .map(|boundary| boundary.materialization_sources_in(connection, &receipt))
             .transpose()?;
         for (index, source) in sources.sources.iter().enumerate() {
-            let mut status = compatibility(registry, &source.prepared.descriptor.pin()?)?;
+            let mut pins = vec![source.prepared.descriptor.pin()?];
             if let Some(boundary) = &receipt.capture_boundary {
-                if compatibility(registry, &boundary.bindings[index].binding.pin()?)?
-                    == SourceCompatibility::RecoveryRequired
-                {
-                    status = SourceCompatibility::RecoveryRequired;
-                }
+                pins.push(boundary.bindings[index].binding.pin()?);
             }
             let input_pin = if let Some(set) = &restore_set {
                 Some(set.anchors[index].pin()?)
@@ -1451,11 +1468,9 @@ pub(crate) fn visit_unresolved_sources(
                 None
             };
             if let Some(pin) = input_pin {
-                if compatibility(registry, &pin)? == SourceCompatibility::RecoveryRequired {
-                    status = SourceCompatibility::RecoveryRequired;
-                }
+                pins.push(pin);
             }
-            visit(&receipt, source, status)?;
+            visit(&receipt, source, &pins)?;
         }
     }
     Ok(())

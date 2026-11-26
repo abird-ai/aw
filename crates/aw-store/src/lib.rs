@@ -232,7 +232,7 @@ pub use session_participation::{
 };
 use sha2::{Digest, Sha256};
 pub use source_barrier::{SourceMutationBarrier, SourceMutationOutcome, SourceMutationSet};
-pub use source_compatibility::SourceCompatibility;
+pub use source_compatibility::{SourceCompatibility, SourceDependencyKind, SourceDriverDependency};
 pub use source_metadata::{
     SourceMetadataApproval, SourceMetadataRef, SourceMetadataSelection, SourceMetadataSpec,
     SourceMetadataView,
@@ -253,7 +253,7 @@ pub use types::*;
 pub use vault_grants::{
     VaultBindingSelection, VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus,
     VaultGrantSummary, VaultGrantTarget, VaultGrantView, VaultProcessProjectionClaim,
-    VaultSetOutcome, VaultSetRequest,
+    VaultProviderDependency, VaultSetOutcome, VaultSetRequest,
 };
 pub use vault_signing::{
     SigningBroker, SigningProcessBroker, SigningProcessProof, SigningVaultProvider,

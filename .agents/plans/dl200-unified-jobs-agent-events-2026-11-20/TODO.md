@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: explicit physical retention reconciliation RPC (this checkpoint; local parent `435bd7d44430168c96f1216bdb79ede36e052569`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: quiescent SourceDriver and VaultProvider maintenance (this checkpoint; local parent `05e552380b56d457fbb2860e28769ad7f29064b4`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1906,11 +1906,27 @@ Current implementation: explicit physical retention reconciliation RPC (this che
       conflicts, scoped formatting/diff passed. Separate flattened
       retention approval group and fixture lifetime corrections verified.
       Real maintenance stdio subprocess qualification remains pending.
-      **Next:** registry compatibility and live/durable dependency
-      enumeration for exact provider/driver retirement/replacement,
-      reviewed containment/extension and bound-Agent structural mutation,
-      protected broader metadata/Views, manifest-preserving legacy
-      transfer/export and independent source/provider share policy. Raw file/env and arbitrary secret exposure
+      **Quiescent registry maintenance:** existing staged typed leaves
+      and exact registration handles, exclusive registry/Store owner,
+      reader and native Arc/Weak user fences. Aggregate exact retained
+      binding, checkpoint, managed recovery and unresolved construction
+      schema pins; absent/incompatible definitions remain diagnostic/
+      recovery-required. Current owner/process/SQL fence and unresolved
+      source mutation custody exclude removal/replacement. First cut
+      blocks any dependency-bearing SourceDriver replacement; no generic
+      semantic compatibility declaration. Vault withdrawal preserves
+      attached grants and actual encrypted key custody, with aggregate
+      projection diagnostics and exact current authority revalidation.
+      Core 102 passed/1 ignored; Store maintenance 1, checkpoint 4,
+      Vault 2; Host Git 1, Process 2; Actor 3, native executable 1:
+      116 distinct selected tests passed. Strict affected Clippy,
+      durable/minimal and scoped fmt/diff passed; five prior historical
+      full-Store failures not rerun.
+      **Next:** production reviewed physical Process containment/dispatch,
+      bound-Agent structural mutation and remaining actual host gates.
+      Explicit dependency-bearing replacement compatibility, final atomic
+      ExtensionRegistry and protected broader metadata/Views, manifest-
+      preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
       remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
