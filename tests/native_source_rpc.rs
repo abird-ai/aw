@@ -1143,6 +1143,9 @@ fn exercise_native_root_stdio(linked: bool) {
             aw_store::SandboxToolRecoverySelection {
                 driver: &aw_agent_core::DriverKey::builtin("other-driver").unwrap(),
                 sandbox_ref: Some(&sandbox.canonical_ref),
+                effects: &[aw_agent_core::ToolEffect::Write],
+                source: &aw_agent_core::ToolSource::trusted_host(),
+                execution_site: Some("local"),
             },
             |_| panic!("foreign driver cannot consume original release"),
         )

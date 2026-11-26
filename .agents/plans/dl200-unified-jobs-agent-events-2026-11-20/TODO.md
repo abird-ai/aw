@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact linked Git native artifact recovery (this checkpoint; local parent `15f4f1678be1ba1b51edb79f12bc0e965e908215`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: exact Process receipt custody and independent recovery fence (this checkpoint; local parent `a101dc572aff6c36cbc9cc97ebed0be456109524`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1708,9 +1708,24 @@ Current implementation: exact linked Git native artifact recovery (this checkpoi
       Executable 1/1 (both layouts), Host native/Process 2/2, strict
       affected Clippy, durable/minimal all-target checks, version/help
       and scoped fmt/diff passed.
-      **Next:** independent Process quiescence and recovery proof;
-      nonstandard/overlapping linked layouts and unmarked legacy native/
-      Process no-start remain held. Separately qualify legacy participant
+      **Exact Process receipt custody and independent recovery fence:**
+      source lease binds to actual PipeProcess receipt or captured launch
+      failure; no foreign terminal or failure-kind proof. Original
+      driver-supplied RAII proof held through release/deferred quiescence,
+      factual Process terminal remains independent. Trusted registered
+      local Process recovery uses exact original effect/source/site/driver/
+      Sandbox selector before any replay or inspection, no new owner or
+      ledger. Refusal preserves Unknown, no broad Run clearance. Grouped
+      real fixed-child regression covers wrong receipt, actual no-spawn,
+      missing driver, proof refusal/held release, lost awaiter and replay.
+      Host native/Process 2/2, adapter Process 29/29, aw-process 8/8,
+      actual executable recovery 1/1, strict affected Clippy, durable/minimal
+      checks, version/help and scoped fmt/diff passed.
+      **Next:** reviewed production source-aware Process driver and dispatch
+      with actual independent containment/quiescence proof, broader original
+      Run/Input/queue disposition. No strong Unix backend promoted; arbitrary
+      Process effects, nonstandard/overlapping linked layouts and unmarked
+      legacy native/Process no-start remain held. Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

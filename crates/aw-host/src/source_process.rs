@@ -1,17 +1,22 @@
 //! SQLite-backed host composition of a prepared source effect and the
 //! original shared Process runtime. No second Process, Job or policy owner.
+pub use crate::source_authority::SourceToolRecoveryTarget;
 use crate::source_authority::{LiveSourceTool, SourceToolAuthority};
-use aw_agent_core::{CancellationToken, Error, Result};
+use aw_agent_core::{
+    CancellationToken, Error, PrincipalId, Result, SandboxDriverHandle, SandboxDriverRegistry,
+    ToolEffect, ToolSource,
+};
 use aw_store::{
     PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease,
-    SandboxEffectOutcome,
+    SandboxEffectOutcome, SandboxToolRecovery, SandboxToolRecoverySelection, SessionStore,
 };
 use aw_tools::{
     execution_stop::StopEvidence,
     filesystem::runner::{ProcessExit, ProcessTerminal},
 };
 use aw_tools_adapter::process::{
-    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt, SpawnOnce,
+    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt, ProcessReceiptBinding,
+    SpawnOnce,
 };
 use tokio::time::Instant;
 
@@ -19,8 +24,8 @@ use tokio::time::Instant;
 pub type ProcessToolAuthority<A> = SourceToolAuthority<A>;
 
 /// The original Process or its factual launch failure, with common source
-/// custody. Keep the actual result by value; no allocation or second
-/// Process lifecycle. Record the result before settling its source lease.
+/// custody. Keep the actual result by value; no second Process lifecycle.
+/// Record the result before settling its source lease.
 #[must_use = "retain source custody until the original effect is recorded and settled"]
 pub struct SourceProcessStart {
     pub launch: std::result::Result<PipeProcess, PipeLaunchFailure>,
@@ -33,6 +38,12 @@ pub struct SourceProcessStart {
 pub struct SourceProcessLease {
     source: SandboxEffectLease,
     tool: LiveSourceTool,
+    launch: LaunchEvidence,
+}
+
+enum LaunchEvidence {
+    Spawned(ProcessReceiptBinding),
+    Failed(SandboxEffectOutcome),
 }
 
 impl SourceProcessLease {
@@ -43,33 +54,31 @@ impl SourceProcessLease {
 
     /// Call after the original effect owner records the actual launch
     /// failure. Definite no-spawn is neutral; uncertainty stays fenced.
-    pub fn settle_after_recorded_failure(
-        self,
-        failure: &PipeLaunchFailure,
-    ) -> Result<SandboxEffectOutcome> {
-        let outcome = launch_outcome(failure);
+    pub fn settle_after_recorded_failure(self) -> Result<SandboxEffectOutcome> {
+        let LaunchEvidence::Failed(outcome) = self.launch else {
+            self.source.settle(SandboxEffectOutcome::Unknown)?;
+            return Err(Error::Conflict("source Process actually spawned"));
+        };
         self.source.settle(outcome)?;
         Ok(outcome)
     }
 
-    /// The original effect owner supplies its exact recorded ProcessTerminal
-    /// and the reviewed driver's proof that no work can still access the
-    /// sources. A signal reaching a target, or a direct Unix group scan,
-    /// is not by itself proof of source quiescence. Output completeness is
-    /// separate from physical mutation settlement.
-    pub fn settle_after_recorded_terminal(
+    /// The original effect owner supplies the receipt from this exact
+    /// PipeProcess and an independently proved, permanently quiescent
+    /// source scope. Hold the returned driver fence through settlement.
+    /// Output completeness and a stop signal are not source proof.
+    pub fn settle_after_recorded_terminal<F>(
         self,
-        terminal: &ProcessTerminal,
-        prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()>,
+        receipt: &ProcessReceipt,
+        prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F>,
     ) -> Result<SandboxEffectOutcome> {
-        let outcome = terminal_outcome(terminal, prove_quiescent);
-        self.source.settle(
-            outcome
-                .as_ref()
-                .copied()
-                .unwrap_or(SandboxEffectOutcome::Unknown),
-        )?;
-        outcome
+        if !matches!(&self.launch, LaunchEvidence::Spawned(binding) if binding.matches(receipt)) {
+            self.source.settle(SandboxEffectOutcome::Unknown)?;
+            return Err(Error::Conflict("receipt belongs to another source Process"));
+        }
+        settle_terminal(&receipt.terminal, prove_quiescent, |outcome| {
+            self.source.settle(outcome)
+        })
     }
 }
 
@@ -80,20 +89,80 @@ fn launch_outcome(failure: &PipeLaunchFailure) -> SandboxEffectOutcome {
     }
 }
 
-fn terminal_outcome(
+/// Factual receipt and independent physical proof are separate. Keep a
+/// successful proof's guard alive until the original source owner commits.
+fn settle_terminal<F>(
     terminal: &ProcessTerminal,
-    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()>,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F>,
+    settle: impl FnOnce(SandboxEffectOutcome) -> Result<()>,
 ) -> Result<SandboxEffectOutcome> {
     if terminal.exit == ProcessExit::Unknown
         || !terminal
             .stop
             .is_some_and(|stop| stop.evidence != StopEvidence::Unknown)
     {
+        settle(SandboxEffectOutcome::Unknown)?;
         return Ok(SandboxEffectOutcome::Unknown);
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_quiescent(terminal)))
-        .map_err(|_| Error::Protocol("source quiescence proof panicked; inspect before retry"))??;
-    Ok(SandboxEffectOutcome::Settled)
+    let proof =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_quiescent(terminal)))
+            .map_err(|_| Error::Protocol("source quiescence proof panicked; inspect before retry"))
+            .and_then(|proof| proof);
+    let outcome = if proof.is_ok() {
+        SandboxEffectOutcome::Settled
+    } else {
+        SandboxEffectOutcome::Unknown
+    };
+    settle(outcome)?;
+    proof.map(|_held| outcome)
+}
+
+/// Recover an exact local trusted-host Process effect via its registered
+/// original driver and independently authorized physical quiescence fence.
+/// The driver must establish permanent quiescence of the original execution
+/// scope (including descendants and external handoffs); an absent PID, stop
+/// result, or journal terminal alone is never sufficient. This may prove
+/// quiescence even when the original command exit remains unknown. It never
+/// infers no-start or rewrites history, and cannot launch or replay a Process.
+/// A recorded positive fact/terminal release is replayed before acquiring
+/// a driver or physical fence, with the same exact original route selection.
+pub fn recover_source_process<D, F>(
+    store: &SessionStore,
+    manager: &PrincipalId,
+    target: SourceToolRecoveryTarget<'_>,
+    sandbox: &str,
+    registry: &SandboxDriverRegistry,
+    driver: &SandboxDriverHandle<D>,
+    prove_quiescent: impl FnOnce(&D, &SandboxToolRecovery) -> Result<F>,
+) -> Result<SandboxEffectOutcome>
+where
+    D: Send + Sync + 'static,
+{
+    let mut held = None;
+    let result = store.sandbox_recover_tool_source_effect_exact(
+        manager,
+        target.agent_ref,
+        target.turn_id,
+        target.call_id,
+        SandboxToolRecoverySelection {
+            driver: &driver.descriptor().driver,
+            sandbox_ref: Some(sandbox),
+            effects: &[ToolEffect::Process],
+            source: &ToolSource::trusted_host(),
+            execution_site: Some("local"),
+        },
+        |recovery| {
+            let implementation = registry.reader()?.get(driver)?;
+            let fence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prove_quiescent(&implementation, recovery)
+            }))
+            .map_err(|_| Error::Protocol("source Process recovery proof panicked"))??;
+            held = Some((fence, implementation));
+            Ok(SandboxEffectOutcome::Settled)
+        },
+    );
+    drop(held);
+    result
 }
 
 #[derive(Clone)]
@@ -228,11 +297,11 @@ impl Drop for CancelAwaiter {
 /// and does not abort its settlement task. The reviewed driver must prove
 /// permanent source quiescence; a negative Unix group scan is insufficient.
 /// No new Job, replay or source-bearing admission is introduced.
-pub async fn run_source_process<P, A>(
+pub async fn run_source_process<P, A, F>(
     prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
-    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F> + Send + 'static,
 ) -> Result<SourceProcessCompletion>
 where
     P: Send + 'static,
@@ -252,14 +321,14 @@ where
 /// actual worker owns the original lease through wait/stop/reap and
 /// deferred settlement even if the result awaiter disappears. Provider
 /// withdrawal governs future projections, not already-materialized proof.
-pub async fn run_source_process_with_vault<P, A, S>(
+pub async fn run_source_process_with_vault<P, A, S, F>(
     prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
     registry: aw_agent_core::VaultProviderRegistryReader,
     handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
     selection: aw_store::SigningProcessProof,
-    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F> + Send + 'static,
 ) -> Result<SourceProcessCompletion>
 where
     P: Send + 'static,
@@ -276,12 +345,12 @@ where
     .await
 }
 
-async fn run_fenced_source_process<P, A>(
+async fn run_fenced_source_process<P, A, F>(
     prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
     project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
-    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F> + Send + 'static,
 ) -> Result<SourceProcessCompletion>
 where
     P: Send + 'static,
@@ -315,18 +384,14 @@ where
             .as_ref()
             .map(|receipt| receipt.terminal)
             .map_err(launch_outcome);
-        let quiescence = tokio::task::spawn_blocking(move || {
-            let outcome = match terminal {
-                Ok(terminal) => terminal_outcome(&terminal, prove_quiescent),
-                Err(outcome) => Ok(outcome),
-            };
-            source.defer_until_tool_finished(
-                outcome
-                    .as_ref()
-                    .copied()
-                    .unwrap_or(SandboxEffectOutcome::Unknown),
-            )?;
-            outcome
+        let quiescence = tokio::task::spawn_blocking(move || match terminal {
+            Ok(terminal) => settle_terminal(&terminal, prove_quiescent, |outcome| {
+                source.defer_until_tool_finished(outcome)
+            }),
+            Err(outcome) => {
+                source.defer_until_tool_finished(outcome)?;
+                Ok(outcome)
+            }
         })
         .await
         .unwrap_or(Err(Error::Protocol(
@@ -375,11 +440,19 @@ where
         abandoned: None,
     };
     let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
-    let launch =
+    let mut launch =
         spawn_source_process(launch, authority, boundary, deadline, &control, project).await;
+    let evidence = match &mut launch {
+        Ok(process) => LaunchEvidence::Spawned(process.receipt_binding()),
+        Err(failure) => LaunchEvidence::Failed(launch_outcome(failure)),
+    };
     Ok(SourceProcessStart {
         launch,
-        source: SourceProcessLease { source, tool },
+        source: SourceProcessLease {
+            source,
+            tool,
+            launch: evidence,
+        },
     })
 }
 
@@ -476,6 +549,29 @@ mod tests {
             assert!(
                 self.0.try_write().is_err(),
                 "host guard must outlive launch pins"
+            );
+        }
+    }
+
+    // A successful independent proof must remain held until the original
+    // owner's commit. This fixture's fixed child has no descendants; its
+    // actual reaped terminal plus host exclusion is sufficient for it only.
+    struct HeldProof {
+        _guard: OwnedRwLockReadGuard<()>,
+        database: PathBuf,
+        effect_id: String,
+        fact: &'static str,
+    }
+
+    impl Drop for HeldProof {
+        fn drop(&mut self) {
+            let committed: bool = Connection::open(&self.database).unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM commit_log WHERE entity_type='source_effect' AND entity_id=?1 AND kind=?2)",
+                params![self.effect_id, self.fact], |row| row.get(0),
+            ).unwrap();
+            assert!(
+                committed,
+                "physical proof guard dropped before original fact committed"
             );
         }
     }
@@ -886,27 +982,40 @@ mod tests {
             ("host:closed-scope", false, CancellationToken::new()),
         ] {
             let prepared = prepare(id, capture(), missing).unwrap();
-            let completion = run_source_process(prepared, deadline(), cancellation, |_| {
-                panic!("no-spawn must not inspect a terminal")
-            })
-            .await
-            .unwrap();
+            let (failure, direct) = if missing {
+                let SourceProcessStart { launch, source } =
+                    start_source_process(prepared, deadline(), cancellation)
+                        .await
+                        .unwrap();
+                let Err(failure) = launch else {
+                    panic!("missing program spawned")
+                };
+                (failure, Some(source))
+            } else {
+                let completion =
+                    run_source_process(prepared, deadline(), cancellation, |_| -> Result<()> {
+                        panic!("no-spawn must not inspect a terminal")
+                    })
+                    .await
+                    .unwrap();
+                let Err(failure) = completion.receipt else {
+                    panic!("denied Process spawned")
+                };
+                assert_eq!(
+                    completion.quiescence.unwrap(),
+                    SandboxEffectOutcome::NotStarted
+                );
+                (failure, None)
+            };
             if id == "host:closed-scope" {
                 assert!(matches!(
-                    &completion.receipt,
-                    Err(PipeLaunchFailure::NotStarted(Error::Denied(
+                    &failure,
+                    PipeLaunchFailure::NotStarted(Error::Denied(
                         "required closed descendant containment is unavailable"
-                    )))
+                    ))
                 ));
             }
-            assert!(matches!(
-                completion.receipt,
-                Err(PipeLaunchFailure::NotStarted(_))
-            ));
-            assert_eq!(
-                completion.quiescence.unwrap(),
-                SandboxEffectOutcome::NotStarted
-            );
+            assert!(matches!(failure, PipeLaunchFailure::NotStarted(_)));
             final_records.push(
                 finish_tool(
                     &journal,
@@ -916,12 +1025,14 @@ mod tests {
                 )
                 .await,
             );
-            assert_eq!(
-                store
+            let outcome = match direct {
+                Some(source) => source.settle_after_recorded_failure().unwrap(),
+                None => store
                     .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, id)
+                    .unwrap()
                     .unwrap(),
-                Some(SandboxEffectOutcome::NotStarted)
-            );
+            };
+            assert_eq!(outcome, SandboxEffectOutcome::NotStarted);
         }
         assert_eq!(
             store
@@ -998,7 +1109,9 @@ mod tests {
                 vault_registry.reader().unwrap(),
                 vault_handle.clone(),
                 selection(rev),
-                |_| panic!("refused Vault projection must not inspect a terminal"),
+                |_| -> Result<()> {
+                    panic!("refused Vault projection must not inspect a terminal")
+                },
             )
             .await
             .unwrap();
@@ -1031,6 +1144,7 @@ mod tests {
             );
         }
         let valid = prepare("host:vault-valid", capture(), false).unwrap();
+        let valid_id = valid.plan().effect_id.clone();
         let SourceProcessStart { launch, source } = start_source_process_with_vault(
             valid,
             deadline(),
@@ -1059,10 +1173,16 @@ mod tests {
         );
         assert_eq!(
             source
-                .settle_after_recorded_terminal(&receipt.terminal, |_| Ok(()))
+                .settle_after_recorded_terminal(&receipt, |_| Ok(HeldProof {
+                    _guard: policy_lock.clone().try_read_owned().unwrap(),
+                    database: temp.0.join("sessions.sqlite3"),
+                    effect_id: valid_id,
+                    fact: "source.effect.released",
+                }))
                 .unwrap(),
             SandboxEffectOutcome::Settled
         );
+        let foreign_receipt = receipt;
         let prepared = prepare("host:write", capture(), false).unwrap();
         let effect_id = prepared.plan().effect_id.clone();
         assert!(store
@@ -1106,13 +1226,69 @@ mod tests {
             .await,
         );
         let agent_before = store.agent_get(&actor, &reference).unwrap();
-        // The fixture's fixed command contains only shell builtins and
-        // cannot create descendants. This is not a containment proof for
-        // arbitrary shell commands.
+        // Even a successful receipt from a prior real Process cannot be
+        // attached to this lease; keep original source custody unknown.
+        assert!(source
+            .settle_after_recorded_terminal(&foreign_receipt, |_| -> Result<()> {
+                panic!("foreign Process receipt must not enter proof")
+            })
+            .is_err());
         assert_eq!(
-            source
-                .settle_after_recorded_terminal(&receipt.terminal, |_| Ok(()))
-                .unwrap(),
+            store
+                .sandbox_get(&actor, &sandbox.canonical_ref)
+                .unwrap()
+                .rev,
+            sandbox.rev + 1
+        );
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:foreign-receipt")
+            .is_err());
+        let recovery_target = |call_id| SourceToolRecoveryTarget {
+            agent_ref: &reference,
+            turn_id: 1,
+            call_id,
+        };
+        let unavailable = SandboxDriverRegistry::new();
+        assert!(recover_source_process(
+            &store,
+            &actor,
+            recovery_target("host:write"),
+            &sandbox.canonical_ref,
+            &unavailable,
+            &handle,
+            |_, _| -> Result<()> {
+                panic!("unregistered recovery implementation must not inspect")
+            }
+        )
+        .is_err());
+        // Original actual fixed child contains only shell builtins. Its
+        // real terminal and independent driver fence (not a group scan)
+        // prove permanent fixture quiescence.
+        assert_eq!(
+            recover_source_process(
+                &store,
+                &actor,
+                recovery_target("host:write"),
+                &sandbox.canonical_ref,
+                &sandbox_drivers,
+                &handle,
+                |driver, recovery| {
+                    assert_eq!(driver.bash, bash());
+                    assert_eq!(recovery.effect_id, effect_id);
+                    assert_eq!(
+                        recovery.original.call,
+                        record("host:write", ToolStatus::Running, None).call
+                    );
+                    assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
+                    Ok(HeldProof {
+                        _guard: policy_lock.clone().try_read_owned().unwrap(),
+                        database: temp.0.join("sessions.sqlite3"),
+                        effect_id: recovery.effect_id.clone(),
+                        fact: "source.effect.released",
+                    })
+                }
+            )
+            .unwrap(),
             SandboxEffectOutcome::Settled
         );
         assert_eq!(
@@ -1124,17 +1300,38 @@ mod tests {
         );
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), agent_before);
         assert_eq!(
-            store
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "host:write",
-                    |_| panic!("released custody must not inspect or execute")
-                )
-                .unwrap(),
+            recover_source_process(
+                &store,
+                &actor,
+                recovery_target("host:write"),
+                &sandbox.canonical_ref,
+                &unavailable,
+                &handle,
+                |_, _| -> Result<()> {
+                    panic!("released custody must not acquire a driver or inspect")
+                }
+            )
+            .unwrap(),
             SandboxEffectOutcome::Settled
         );
+        // The exact selector is applied before replay, even for the same
+        // original driver and Sandbox. Do not disclose a different effect.
+        assert!(store
+            .sandbox_recover_tool_source_effect_exact(
+                &actor,
+                &reference,
+                1,
+                "host:write",
+                SandboxToolRecoverySelection {
+                    driver: &handle.descriptor().driver,
+                    sandbox_ref: Some(&sandbox.canonical_ref),
+                    effects: &[ToolEffect::Write],
+                    source: &ToolSource::trusted_host(),
+                    execution_site: Some("local"),
+                },
+                |_| panic!("wrong effect kind cannot replay Process release")
+            )
+            .is_err());
         assert!(store.activate(&actor, &session.id, &branch.id).is_err());
 
         agent
@@ -1142,11 +1339,16 @@ mod tests {
             .unwrap();
         let prepared = prepare("host:unproven", capture(), false).unwrap();
         let unresolved_id = prepared.plan().effect_id.clone();
-        let completion = run_source_process(prepared, deadline(), CancellationToken::new(), |_| {
-            Err(Error::Conflict(
-                "fixture cannot prove source quiescence yet",
-            ))
-        })
+        let completion = run_source_process(
+            prepared,
+            deadline(),
+            CancellationToken::new(),
+            |_| -> Result<()> {
+                Err(Error::Conflict(
+                    "fixture cannot prove source quiescence yet",
+                ))
+            },
+        )
         .await
         .unwrap();
         // Physical process truth survives failure to prove source quiescence.
@@ -1173,43 +1375,58 @@ mod tests {
             .await,
         );
 
-        // A durable logical receipt alone still cannot prove quiescence.
+        // A durable logical receipt and a real direct Unix terminal alone
+        // still cannot prove descendant quiescence.
+        assert_eq!(
+            receipt.terminal.occupancy,
+            aw_tools::filesystem::runner::Occupancy::Unknown
+        );
+        assert!(recover_source_process(
+            &store,
+            &actor,
+            recovery_target("host:unproven"),
+            &sandbox.canonical_ref,
+            &sandbox_drivers,
+            &handle,
+            |_, recovery| -> Result<()> {
+                assert_eq!(recovery.effect_id, unresolved_id);
+                assert_eq!(recovery.original.call, recovery.terminal.call);
+                Err(Error::Conflict(
+                    "fixture cannot prove source quiescence yet",
+                ))
+            }
+        )
+        .is_err());
         assert!(store
-            .sandbox_recover_tool_source_effect(
-                &actor,
-                &reference,
-                1,
-                "host:unproven",
-                |recovery| {
-                    assert_eq!(recovery.effect_id, unresolved_id);
-                    assert_eq!(recovery.original.call, recovery.terminal.call);
-                    Err(Error::Conflict(
-                        "fixture cannot prove source quiescence yet",
-                    ))
-                }
-            )
+            .acquire_source_mutation_barrier(&set, "host:still-unproven")
             .is_err());
         // Existing ToolFinished recovery still works and retains its
         // original numeric release receipt. This exact fixed child has
         // no descendants; its known terminal proves fixture quiescence.
         assert_eq!(
-            store
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "host:unproven",
-                    |recovery| {
-                        assert_eq!(recovery.effect_id, unresolved_id);
-                        assert!(matches!(
-                            recovery.terminal_ref,
-                            aw_store::SandboxToolTerminalRef::ToolFinished(_)
-                        ));
-                        assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
-                        Ok(SandboxEffectOutcome::Settled)
-                    }
-                )
-                .unwrap(),
+            recover_source_process(
+                &store,
+                &actor,
+                recovery_target("host:unproven"),
+                &sandbox.canonical_ref,
+                &sandbox_drivers,
+                &handle,
+                |_, recovery| {
+                    assert_eq!(recovery.effect_id, unresolved_id);
+                    assert!(matches!(
+                        recovery.terminal_ref,
+                        aw_store::SandboxToolTerminalRef::ToolFinished(_)
+                    ));
+                    assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
+                    Ok(HeldProof {
+                        _guard: policy_lock.clone().try_read_owned().unwrap(),
+                        database: temp.0.join("sessions.sqlite3"),
+                        effect_id: recovery.effect_id.clone(),
+                        fact: "source.effect.released",
+                    })
+                }
+            )
+            .unwrap(),
             SandboxEffectOutcome::Settled
         );
 
@@ -1227,13 +1444,23 @@ mod tests {
             vault_registry.reader().unwrap(),
             vault_handle.clone(),
             selection(current_rev),
-            |terminal| {
-                // The trusted fixture command contains no child creation.
-                assert_eq!(
-                    terminal.stop_reason(),
-                    Some(aw_tools::execution_stop::StopReason::Cancelled)
-                );
-                Ok(())
+            {
+                let policy_lock = policy_lock.clone();
+                let database = temp.0.join("sessions.sqlite3");
+                let effect_id = interrupted_id.clone();
+                move |terminal| {
+                    // The trusted fixture command contains no child creation.
+                    assert_eq!(
+                        terminal.stop_reason(),
+                        Some(aw_tools::execution_stop::StopReason::Cancelled)
+                    );
+                    Ok(HeldProof {
+                        _guard: policy_lock.try_read_owned().unwrap(),
+                        database,
+                        effect_id,
+                        fact: "source.effect.quiescent",
+                    })
+                }
             },
         ));
         let entered = source_root.join("entered");
@@ -1333,27 +1560,31 @@ mod tests {
             serde_json::to_value(&final_records).unwrap()
         );
         assert_eq!(
-            reopened
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "host:interrupted",
-                    |_| panic!("recorded Process quiescence needs no external reinspection")
-                )
-                .unwrap(),
+            recover_source_process(
+                &reopened,
+                &actor,
+                recovery_target("host:interrupted"),
+                &sandbox.canonical_ref,
+                &unavailable,
+                &handle,
+                |_, _| -> Result<()> {
+                    panic!("recorded Process quiescence needs no driver or reinspection")
+                }
+            )
+            .unwrap(),
             SandboxEffectOutcome::Settled
         );
         assert_eq!(
-            reopened
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "host:interrupted",
-                    |_| panic!("released custody cannot replay inspection")
-                )
-                .unwrap(),
+            recover_source_process(
+                &reopened,
+                &actor,
+                recovery_target("host:interrupted"),
+                &sandbox.canonical_ref,
+                &unavailable,
+                &handle,
+                |_, _| -> Result<()> { panic!("released custody cannot replay inspection") }
+            )
+            .unwrap(),
             SandboxEffectOutcome::Settled
         );
         assert_eq!(

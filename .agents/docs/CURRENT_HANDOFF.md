@@ -26,7 +26,79 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: exact linked Git native artifact recovery
+## Latest local implementation delta — 2026-11-26: exact Process receipt custody and independent recovery fence
+
+Parent `a101dc572aff6c36cbc9cc97ebed0be456109524` (linked Git native
+artifact recovery). Published AW main remains `7b92686`. L5, clean at
+entry; Store v60, Git recovery v4 and product 0.15.0 unchanged.
+
+- Close a live source-Process custody gap: `SourceProcessLease` now
+  retains the actual original launch result (definite no-spawn/unknown)
+  or the original PipeProcess receipt binding. Settlement consumes this
+  lease after original journal recording; it cannot take a caller-supplied
+  failure or another Process's terminal. The original adapter projects
+  one opaque in-memory binding into its actual wait/terminate/interactive
+  receipts, allocated only on opt-in; ordinary Process execution keeps
+  no binding allocation. This is not another durable execution identity,
+  semantic terminal/stop/occupancy fact, or Process lifetime owner.
+  Foreign receipt/failure-kind refusal retains Unknown source custody.
+- Independent driver quiescence callbacks return their held proof guard
+  (generic RAII, no mandatory allocation). Retain it through the actual
+  original source release or deferred positive quiescence transaction;
+  then drop it. Finite, interactive and Vault-backed paths reuse one
+  settlement helper. Known exit and non-Unknown stop evidence remain a
+  necessary live-path check, never sufficient descendant/source proof.
+  Proof refusal/panic leaves Unknown; the original physical Process
+  result and output are not overwritten by source proof failure.
+- `recover_source_process` is the trusted host consumer of the original
+  `sandbox_recover_tool_source_effect_exact` owner, selecting exact
+  canonical Agent/Turn/call/Sandbox, registered original logical DriverKey,
+  local execution site, trusted host source and Process effect. The Store's
+  exact recovery selector now checks allowed effect/source/site before
+  recorded-proof or terminal replay, not just driver and Sandbox. Native
+  Git recovery uses the same selector for Read/Write, with its existing
+  physical proof unchanged; share original journal target coordinates.
+  The registered implementation is acquired only when independent proof
+  is needed, with the physical guard retained through settlement. Recorded
+  proof/released replay uses the original immutable facts before requiring
+  a driver lookup or inspection. Independent recovery may prove permanent
+  quiescence without reconstructing a lost Process exit; never infer
+  NotStarted from quiescence or replay the tool. No history, provider,
+  broader Run hazard, admission or grant changes. No new schema/ledger.
+- Extend the existing grouped Host source-Process test: actual missing
+  executable settles only the captured no-spawn outcome; actual different
+  successful Process receipt is rejected even after ToolFinished, leaving
+  its original barrier and Sandbox revision unchanged. Registered recovery
+  requires independent proof; missing registered implementation refuses
+  without inspection; proof refusal on weak direct Unix terminal preserves
+  custody; exact original fixed shell builtin terminal and independent
+  host fence permit physical release. Held guard checks the actual original
+  release/quiescence commit before Drop, including lost finite Vault
+  awaiter. Exact wrong effect kind refuses even terminal replay; existing
+  interrupted Turn and degraded-reopen replay preserve history/hazard.
+
+Validation (L5 Rust 1.95.0, locked/offline, final source): Host
+native/Process 2/2 (6.46s), adapter Process 29/29 (1.31s), shared
+aw-process 8/8 (0.35s), actual native_source_rpc 1/1 (34.62s, ordinary
+and linked layouts). Strict affected all-feature/all-target Clippy
+(adapter, Host, Store, CLI), durable/minimal all-target checks (existing
+feature-specific dead-code warnings), actual CLI version/help and scoped
+fmt/diff passed. Full workspace, pinned Nix, native Windows and other
+cross-platform qualification not repeated.
+
+Scope: the trusted fixed-command fixture proves its own child quiescence
+only, not arbitrary shell containment. No new strong Linux backend, no
+Windows-native qualification, no physical proof manufactured from group
+absence, cancellation or missing PID. General source-aware Process driver,
+actual production dispatch and independently verified closed containment
+remain held. The frozen PID namespace/Bubblewrap path is unchanged.
+
+Next: compose an actual reviewed source-aware Process driver and production
+dispatch through original Process/Job/Graph owners with independent physical
+authority and minimum containment, failing closed where unavailable; then
+exact broader Run/Input/queue reconciliation. Phase 3 remains underway.
+
+## Previous local implementation delta — 2026-11-26: exact linked Git native artifact recovery
 
 Parent `15f4f1678be1ba1b51edb79f12bc0e965e908215` (original claim-gated
 native no-start recovery). Published AW main remains `7b92686`. L5, clean

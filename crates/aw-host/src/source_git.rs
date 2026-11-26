@@ -591,6 +591,9 @@ impl GitNativeSourceResolver {
             SandboxToolRecoverySelection {
                 driver: &native.descriptor().driver,
                 sandbox_ref: None,
+                effects: &[ToolEffect::Read, ToolEffect::Write],
+                source: &aw_agent_core::ToolSource::trusted_host(),
+                execution_site: None,
             },
             || {
                 registry.reader()?.get(native)?;
@@ -618,6 +621,9 @@ impl GitNativeSourceResolver {
             SandboxToolRecoverySelection {
                 driver: &key,
                 sandbox_ref: Some(sandbox),
+                effects: &[ToolEffect::Read, ToolEffect::Write],
+                source: &aw_agent_core::ToolSource::trusted_host(),
+                execution_site: None,
             },
             || {
                 let registry = SandboxDriverRegistry::new();
@@ -750,12 +756,7 @@ impl GitNativeSourceResolver {
     }
 }
 
-/// Original journal identity, not a new recovery operation ID.
-pub struct NativeSourceRecoveryTarget<'a> {
-    pub agent_ref: &'a str,
-    pub turn_id: u64,
-    pub call_id: &'a str,
-}
+pub use crate::source_authority::SourceToolRecoveryTarget as NativeSourceRecoveryTarget;
 
 /// Explicit native-only host composition for independently approved named
 /// Git sources. All runtime instances use the same live approval, not a copy of

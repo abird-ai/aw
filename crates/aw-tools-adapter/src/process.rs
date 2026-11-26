@@ -586,7 +586,23 @@ pub enum Outcome {
     DeadlineExceeded,
     Unknown,
 }
+/// Optional in-memory binding to the original PipeProcess owner. Only
+/// actual receipts from that owner carry this token; it is not a PID,
+/// durable identity, grant or terminal fact. Ordinary callers allocate none.
+#[derive(Clone)]
+pub struct ProcessReceiptBinding(Arc<()>);
+
+impl ProcessReceiptBinding {
+    pub fn matches(&self, receipt: &ProcessReceipt) -> bool {
+        receipt
+            .binding
+            .as_ref()
+            .is_some_and(|binding| Arc::ptr_eq(&self.0, &binding.0))
+    }
+}
+
 pub struct ProcessReceipt {
+    binding: Option<ProcessReceiptBinding>,
     /// One factual Process terminal truth. Outcome/status are projections.
     pub terminal: ProcessTerminal,
     pub output: ProcessSnapshot,
@@ -595,8 +611,13 @@ pub struct ProcessReceipt {
     pub spools: Option<ProcessSpoolAccess>,
 }
 impl ProcessReceipt {
-    fn from_runtime(result: aw_process::ProcessResult, spools: Option<ProcessSpoolAccess>) -> Self {
+    fn from_runtime(
+        result: aw_process::ProcessResult,
+        spools: Option<ProcessSpoolAccess>,
+        binding: Option<ProcessReceiptBinding>,
+    ) -> Self {
         Self {
+            binding,
             terminal: result.terminal,
             output: result.output,
             spools,
@@ -776,6 +797,7 @@ impl PipeLaunchFailure {
 pub struct PipeProcess {
     process: aw_process::Process,
     spools: Option<ProcessSpoolAccess>,
+    binding: Option<ProcessReceiptBinding>,
 }
 
 impl PipeProcess {
@@ -1015,6 +1037,7 @@ impl PipeProcess {
         Ok(Self {
             process,
             spools: output.spools,
+            binding: None,
         })
     }
 
@@ -1084,6 +1107,14 @@ impl PipeProcess {
         })
     }
 
+    /// Bind later terminal receipts to this exact Process lifetime for
+    /// independent host custody. A second call returns the same binding.
+    pub fn receipt_binding(&mut self) -> ProcessReceiptBinding {
+        self.binding
+            .get_or_insert_with(|| ProcessReceiptBinding(Arc::new(())))
+            .clone()
+    }
+
     pub fn mode(&self) -> ProcessMode {
         ProcessMode::Pipes
     }
@@ -1112,7 +1143,11 @@ impl PipeProcess {
 
     pub async fn terminate(&mut self) -> crate::Result<ProcessReceipt> {
         let result = self.process.terminate().await.map_err(map_process_error)?;
-        Ok(ProcessReceipt::from_runtime(result, self.spools.clone()))
+        Ok(ProcessReceipt::from_runtime(
+            result,
+            self.spools.clone(),
+            self.binding.clone(),
+        ))
     }
 
     pub async fn wait<C: core::future::Future<Output = ()>>(
@@ -1120,8 +1155,12 @@ impl PipeProcess {
         cancellation: C,
         deadline: Duration,
     ) -> ProcessReceipt {
-        let Self { process, spools } = self;
-        ProcessReceipt::from_runtime(process.wait(cancellation, deadline).await, spools)
+        let Self {
+            process,
+            spools,
+            binding,
+        } = self;
+        ProcessReceipt::from_runtime(process.wait(cancellation, deadline).await, spools, binding)
     }
 
     pub(crate) async fn wait_interactive<C: core::future::Future<Output = ()>>(
@@ -1130,12 +1169,17 @@ impl PipeProcess {
         deadline: Duration,
         input: aw_process::ProcessInputReceiver,
     ) -> ProcessReceipt {
-        let Self { process, spools } = self;
+        let Self {
+            process,
+            spools,
+            binding,
+        } = self;
         ProcessReceipt::from_runtime(
             process
                 .wait_interactive(cancellation, deadline, input)
                 .await,
             spools,
+            binding,
         )
     }
 }

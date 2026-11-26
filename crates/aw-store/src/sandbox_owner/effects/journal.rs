@@ -556,6 +556,9 @@ pub struct SandboxToolRecovery {
 pub struct SandboxToolRecoverySelection<'a> {
     pub driver: &'a DriverKey,
     pub sandbox_ref: Option<&'a str>,
+    pub effects: &'a [ToolEffect],
+    pub source: &'a aw_agent_core::ToolSource,
+    pub execution_site: Option<&'a str>,
 }
 
 fn authorize_recovery_in(
@@ -1039,9 +1042,14 @@ impl SessionStore {
                     || selection
                         .sandbox_ref
                         .is_some_and(|reference| reference != claim.sandbox_ref)
+                    || !selection.effects.contains(&observed.record.effect)
+                    || !observed.source.matches_source(selection.source)
+                    || selection
+                        .execution_site
+                        .is_some_and(|site| site != observed.record.execution_site)
             }) {
                 return Err(Error::Denied(
-                    "source effect recovery differs from original driver or Sandbox",
+                    "source effect recovery differs from original driver, Sandbox or tool route",
                 ));
             }
             let (terminal_ref, terminal) = terminal_in(&tx, &observed)?;

@@ -4,6 +4,13 @@ use aw_agent_core::{tool::ToolBindingAuthority, Error, NamedSourceAccess, Result
 use aw_store::{SandboxEffectAuthority, SandboxGrantPolicy};
 use aw_tools_adapter::process::ContainmentRequirement;
 
+/// Exact original journal coordinates, never a new operation identity.
+pub struct SourceToolRecoveryTarget<'a> {
+    pub agent_ref: &'a str,
+    pub turn_id: u64,
+    pub call_id: &'a str,
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveSourceTool {
     authority: ToolBindingAuthority,
