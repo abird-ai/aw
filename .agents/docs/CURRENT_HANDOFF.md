@@ -26,7 +26,102 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: live provider-owned signing broker in original Process
+## Latest local implementation delta — 2026-11-27: explicit source construction RPC dispatch
+
+Parent `92aefcbe47f71535ceaf14480665560447759116`; published AW main
+`0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen
+`576d0a1a`. L5 only, scoped clean at entry. Store v60, product 0.15.0,
+Git recovery v4 and frozen release unchanged.
+
+- Source construction RPC uses a new small host composition module,
+  `src/source_construction_rpc.rs`. Explicit local Actor-owner stdio
+  configuration only: `--agent-sandbox-create-approval` (exact retained
+  Project baseline), `--agent-sandbox-derive-approval` (exact parent and
+  revision), `--agent-checkpoint-capture-root` (private git-native.json
+  directory and complete required Git capture authority),
+  `--agent-checkpoint-restore-approval` (exact checkpoint/destination).
+  Paths selected exclusively by trusted host, never request params.
+  Native-source execution mode excludes these constructor flags; captured
+  restore conflicts with existing empty-baseline restore-root flag.
+- `sandbox_create(project?, from?)` uses serialized existing request-ID
+  gate, current Actor/Project and exact parent selector. Select baseline
+  vs derive only via explicit configured approval, no fallback. Reuses
+  original `sandbox_create::create` / `sandbox_derive::derive` and the
+  actual Store/SourceDriver preparation receipts, physical fences and
+  redacted snapshot. Both variants use the same semantic constructor
+  namespace; switching parent/baseline on same request cannot create
+  another Sandbox.
+- Checkpoint create can select the original captured-source Git port
+  (`sources=auto` or bounded named array); canonicalize Agent ref in
+  exact current Project. A changed contextual Agent on reconnect cannot
+  retarget the same request. Explicit `none` delegates to existing
+  history-only port only if independently enabled; without capture root,
+  original history/empty-Auto capability unchanged. Configured capture
+  path requires nonempty required sources for Auto, never silently
+  falls back to history-only after a failed capture. Complete configured
+  Git approval requirements remain; selected names cannot broaden it.
+- Captured-source restore uses existing request parser and exact
+  `checkpoint_restore::restore` owner. Default same Project, private
+  access, taskless only; explicit project/task/other access refused.
+  Checkpoint metadata determines same-Project scope before fresh work,
+  exact result scope checked on replay; no activation or task enqueue.
+  Existing empty restore port remains separate. Responses reuse bounded
+  metadata and never return raw materialization/anchor/approval details.
+- Replay follows original durable owner before current approval/path
+  inspection, not a new request cache. Unknown or Prepared refuses
+  ordinary retry. Existing offline `sandbox-create`, `sandbox-derive`,
+  `checkpoint-capture`, `checkpoint-restore` accept
+  `--agent-rpc-request` only with `--agent-recover` or
+  `--agent-abandon`, retaining the raw original stdio envelope ID
+  and exact original semantic selectors. Shared operation namespace
+  helper preserves ordinary CLI prefixes and same RPC IDs:
+  rpc:stdio:sandbox-create, rpc:stdio:checkpoint,
+  rpc:stdio:checkpoint-restore. Recovery does not require the original
+  RPC connection; exact independently approved inspector still
+  required for unresolved physical effects. No generic recovery RPC
+  or new destructive permission.
+- Extend existing actual Git lifecycle fixture: new baseline, derivation,
+  dirty capture and exact captured restore through the actual RPC ports;
+  original index/tree/HEAD, no activated Agent, redacted metadata,
+  exact replay with missing approval, conflicting semantic request,
+  wrong mode/Project/access/task refusal. Existing prepared interruption
+  and abandonment regression retained; actual interrupted restore and
+  derive use RPC IDs and explicit offline selector; ordinary RPC retry
+  refuses before rematerialization. Full transport test verifies
+  advertisement, one serialized Sandbox construction, duplicate
+  request and arbitrary path rejection. Existing concurrent metadata
+  read order retained. Initial lint needless borrows and fixture
+  dispatch order corrected; no runtime policy weakening.
+
+Validation: L5 locked/offline headless protocol 8/8, original native
+executable 1/1 (37.68s), recovery namespace 1/1 and final actual Git
+checkpoint lifecycle 1/1 (84.58s; includes all four constructor ports
+and interrupted RPC restore/derive recovery). Strict affected all-target
+Clippy, durable/minimal all-target checks, scoped rustfmt/diff passed.
+Actual CLI help verified all four public --agent-* flags and recovery
+selector; missing Actor owner and conflicting restore-mode parse rejected.
+11 distinct selected tests passed. Prior full Store 272/277 (five known
+legacy failures) not rerun; no full-workspace or other platform claim.
+
+Scope: existing retained-version fresh/complete required Git parent
+derivation, exact configured captured-source capture and taskless
+private same-Project restore only. No generic source-free Auto on the
+configured capture port, broader source policy, task-bearing restore,
+cross-Project restore, mutable baseline auto-selection, arbitrary
+external retention cleanup or source-aware execution promotion.
+Physical retention and bound-Agent structural mutation remain
+independent authority gates. New constructors are qualified via real
+port fixture plus transport dispatcher tests, not a full actual stdio
+subprocess invocation of all four. No new Store schema or owner.
+
+Next: physical retention authority and explicit host dispatch for exact
+retired checkpoint / closed Sandbox cleanup (not automatic GC), then
+remaining Phase 3 provider/extension and containment, bound-Agent
+structural mutations, protected wider Views and disclosure contracts.
+Retain held task-bearing/cross-Project restore and legacy participant
+paths until qualified. No push.
+
+## Previous local implementation delta — 2026-11-27: live provider-owned signing broker in original Process
 
 Parent `5941d9f9cdc5dc9ad7fff51ab7d88d3212cd4d9a`; published AW main
 `0f9807f4` at preceding push, dotlink main `85ceccc1`, frozen

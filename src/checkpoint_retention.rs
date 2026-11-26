@@ -295,7 +295,13 @@ mod tests {
         let invoke = |store: &SessionStore, root: &Path, id: &str, recover: bool| {
             crate::checkpoint_capture::capture(store, &actor, root, &request, id, recover)
         };
-        assert!(invoke(&store, &approvals, "fixture:fresh-capture", false).is_err());
+        assert!(invoke(
+            &store,
+            &approvals,
+            "rpc:stdio:checkpoint:fixture-fresh-capture",
+            false
+        )
+        .is_err());
         assert!(git(
             &executable,
             &repo,
@@ -305,15 +311,75 @@ mod tests {
         assert_eq!(fs::read_dir(&approvals).unwrap().count(), 1);
         fs::write(&native_path, serde_json::to_vec(&native_config).unwrap()).unwrap();
         let held_config = lock_private_approval(&native_path).unwrap();
-        assert!(invoke(&store, &approvals, "fixture:fresh-capture", false).is_err());
+        assert!(invoke(
+            &store,
+            &approvals,
+            "rpc:stdio:checkpoint:fixture-fresh-capture",
+            false
+        )
+        .is_err());
         drop(held_config);
-        let fresh = invoke(&store, &approvals, "fixture:fresh-capture", false).unwrap();
+        // The successful fresh invocation goes through the actual RPC
+        // constructor port. The interrupted cases below still test the
+        // independently approved original offline recovery owner.
+        use aw::headless::{CheckpointCreatePort, CheckpointRestorePort};
+        let construction_state = |store: &SessionStore| {
+            std::sync::Arc::new(crate::StdioAgentStatePort {
+                store: store.clone(),
+                caller: actor.clone(),
+                current_project_ref: agent_before.project_ref.clone(),
+                current_agent_ref: agent_ref.clone(),
+                source_metadata: None,
+            })
+        };
+        let capture_port =
+            |store: &SessionStore, root: PathBuf| crate::source_construction_rpc::CapturePort {
+                state: construction_state(store),
+                approval_root: root,
+                history_enabled: false,
+            };
+        let capture_params = json!({"ref":agent_ref,"sources":"auto","note":"offline fixture"});
+        assert!(capture_port(&store, approvals.clone())
+            .create(
+                "foreign",
+                json!({"ref":"/d:foreign/i:foreign/p:foreign/a:foreign","sources":"auto"})
+            )
+            .is_err());
+        assert!(capture_port(&store, approvals.clone())
+            .create("none", json!({"sources":"none"}))
+            .is_err());
+        let captured = capture_port(&store, approvals.clone())
+            .create("fixture-fresh-capture", capture_params.clone())
+            .unwrap();
+        let fresh = invoke(
+            &store,
+            &approvals,
+            "rpc:stdio:checkpoint:fixture-fresh-capture",
+            false,
+        )
+        .unwrap();
+        assert_eq!(captured["id"], fresh.id);
+        assert_eq!(captured["sources"].as_array().unwrap().len(), 1);
+        assert!(captured["sources"][0].get("source_ref").is_none());
+        assert!(captured["sources"][0].get("source").is_none());
+        assert_eq!(
+            capture_port(&store, root.join("absent-approval"))
+                .create("fixture-fresh-capture", capture_params.clone())
+                .unwrap(),
+            captured
+        );
+        assert!(capture_port(&store, approvals.clone())
+            .create(
+                "fixture-fresh-capture",
+                json!({"ref":agent_ref,"sources":["code"],"note":"offline fixture"})
+            )
+            .is_err());
         assert_eq!(fresh.sources.len(), 1);
         assert_eq!(
             invoke(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:fresh-capture",
+                "rpc:stdio:checkpoint:fixture-fresh-capture",
                 false
             )
             .unwrap(),
@@ -532,7 +598,12 @@ mod tests {
         let abandon_capture = |store: &SessionStore, config: &Path, id: &str| {
             crate::checkpoint_capture::abandon(store, &actor, config, &request, id)
         };
-        assert!(abandon_capture(&store, &approvals, "fixture:fresh-capture").is_err());
+        assert!(abandon_capture(
+            &store,
+            &approvals,
+            "rpc:stdio:checkpoint:fixture-fresh-capture"
+        )
+        .is_err());
         let capture_candidate = interrupt_capture(&store, "fixture:abandon-capture");
         let private_ref = format!("refs/aw/checkpoints/{capture_candidate}/code");
         let original_oid = git(&executable, &repo, &["rev-parse", &private_ref]);
@@ -641,24 +712,81 @@ mod tests {
                 );
             };
         fs::write(destination.join("foreign"), b"keep").unwrap();
-        assert!(invoke_restore(&store, &restore_path, "fixture:restore", false).is_err());
+        assert!(invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore",
+            false
+        )
+        .is_err());
         assert_eq!(fs::read(destination.join("foreign")).unwrap(), b"keep");
         assert!(!destination.join("code").exists());
         assert!(store
-            .checkpoint_replay_restore(&actor, &restore_request, "fixture:restore")
+            .checkpoint_replay_restore(
+                &actor,
+                &restore_request,
+                "rpc:stdio:checkpoint-restore:fixture-restore"
+            )
             .unwrap()
             .is_none());
         fs::remove_file(destination.join("foreign")).unwrap();
         let held = lock_private_approval(&restore_path).unwrap();
-        assert!(invoke_restore(&store, &restore_path, "fixture:restore", false).is_err());
+        assert!(invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore",
+            false
+        )
+        .is_err());
         drop(held);
-        let published = invoke_restore(&store, &restore_path, "fixture:restore", false).unwrap();
+        let restore_port =
+            |store: &SessionStore, approval: PathBuf| crate::source_construction_rpc::RestorePort {
+                state: construction_state(store),
+                approval,
+            };
+        let restore_params = json!({"id":fresh.id,"title":"Offline restored","access":"private"});
+        assert!(restore_port(&store, restore_path.clone())
+            .restore(
+                "foreign",
+                json!({"id":fresh.id,"project":"/d:foreign/i:foreign/p:foreign"})
+            )
+            .is_err());
+        assert!(restore_port(&store, restore_path.clone())
+            .restore("task", json!({"id":fresh.id,"task":"must not activate"}))
+            .is_err());
+        assert!(restore_port(&store, restore_path.clone())
+            .restore("inherit", json!({"id":fresh.id,"access":"inherit"}))
+            .is_err());
+        let restored_rpc = restore_port(&store, restore_path.clone())
+            .restore("fixture-restore", restore_params.clone())
+            .unwrap();
+        let published = invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore",
+            false,
+        )
+        .unwrap();
+        assert_eq!(restored_rpc["agent"]["ref"], published.agent.canonical_ref);
+        assert_eq!(restored_rpc["sandbox"], json!(published.agent.sandbox_ref));
+        assert_eq!(
+            restore_port(&store, root.join("absent-approval"))
+                .restore("fixture-restore", restore_params.clone())
+                .unwrap(),
+            restored_rpc
+        );
+        assert!(restore_port(&store, restore_path.clone())
+            .restore(
+                "fixture-restore",
+                json!({"id":fresh.id,"title":"different"})
+            )
+            .is_err());
         verify_restore(&store, &published, &destination);
         assert_eq!(
             invoke_restore(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:restore",
+                "rpc:stdio:checkpoint-restore:fixture-restore",
                 false
             )
             .unwrap(),
@@ -715,14 +843,21 @@ mod tests {
             pending.mark_unknown().unwrap();
             (candidate, candidate_sandbox)
         };
-        let (candidate, candidate_sandbox) =
-            interrupt_restore(&store, &interrupted, "fixture:restore-interrupted");
+        let (candidate, candidate_sandbox) = interrupt_restore(
+            &store,
+            &interrupted,
+            "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
+        );
         drop(store);
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
-        assert!(
-            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", false).is_err()
-        );
+        assert!(invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
+            false
+        )
+        .is_err());
         let mut wrong_layout = interrupted_layout.clone();
         wrong_layout.model_hint = "different model".into();
         assert!(store
@@ -730,7 +865,7 @@ mod tests {
                 &actor,
                 &restore_request,
                 &wrong_layout,
-                "fixture:restore-interrupted",
+                "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
                 |_, _, _| panic!("wrong layout reached driver inspection")
             )
             .is_err());
@@ -743,29 +878,44 @@ mod tests {
                 &actor,
                 &wrong_request,
                 &interrupted_layout,
-                "fixture:restore-interrupted",
+                "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
                 |_, _, _| panic!("wrong request reached driver inspection")
             )
             .is_err());
         let mut wrong_config = interrupted_config.clone();
         wrong_config["binding"] = json!(wrong_layout);
         fs::write(&restore_path, serde_json::to_vec(&wrong_config).unwrap()).unwrap();
-        assert!(
-            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).is_err()
-        );
+        assert!(invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
+            true
+        )
+        .is_err());
         fs::write(
             &restore_path,
             serde_json::to_vec(&interrupted_config).unwrap(),
         )
         .unwrap();
         fs::write(interrupted.join("foreign"), b"keep").unwrap();
-        assert!(
-            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).is_err()
-        );
+        assert!(invoke_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
+            true
+        )
+        .is_err());
         assert_eq!(fs::read(interrupted.join("foreign")).unwrap(), b"keep");
         fs::remove_file(interrupted.join("foreign")).unwrap();
-        let recovered =
-            invoke_restore(&store, &restore_path, "fixture:restore-interrupted", true).unwrap();
+        // Ordinary RPC retry cannot rematerialize a Prepared/Unknown
+        // candidate. Explicit offline recovery selects that same receipt.
+        assert!(restore_port(&store, restore_path.clone())
+            .restore("fixture-restore-interrupted", restore_params.clone())
+            .is_err());
+        let recovery_id = crate::source_construction_rpc::Operation::CheckpointRestore
+            .offline_id("fixture-restore-interrupted", true, true)
+            .unwrap();
+        let recovered = invoke_restore(&store, &restore_path, &recovery_id, true).unwrap();
         verify_restore(&store, &recovered, &interrupted);
         assert_eq!(
             recovered.agent.history_content_digest,
@@ -793,7 +943,12 @@ mod tests {
         let abandon_restore = |store: &SessionStore, config: &Path, id: &str| {
             crate::checkpoint_restore::abandon(store, &actor, config, &restore_request, id)
         };
-        assert!(abandon_restore(&store, &restore_path, "fixture:restore").is_err());
+        assert!(abandon_restore(
+            &store,
+            &restore_path,
+            "rpc:stdio:checkpoint-restore:fixture-restore"
+        )
+        .is_err());
         let abandon_root = root.join("restore-abandoned");
         aw_platform::ensure_private_dir(&abandon_root).unwrap();
         let abandon_config = restore_config(&store, &abandon_root);
@@ -1087,7 +1242,13 @@ mod tests {
         let checkpoints_before = store
             .checkpoint_list_metadata(&actor, agent_ref, None, 64)
             .unwrap();
-        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        assert!(derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive",
+            false
+        )
+        .is_err());
         assert!(store
             .sandbox_prepare_derive_exact(
                 &actor,
@@ -1095,20 +1256,79 @@ mod tests {
                 &parent.canonical_ref,
                 parent.rev + 1,
                 &layout(&child_root),
-                "fixture:derive",
+                "rpc:stdio:sandbox-create:fixture-derive",
                 |_, _, _| panic!("stale parent reached planner")
             )
             .is_err());
         fs::write(&derive_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let lease = lock_private_approval(&derive_path).unwrap();
-        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        assert!(derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive",
+            false
+        )
+        .is_err());
         drop(lease);
         let foreign = child_root.join("foreign");
         fs::write(&foreign, b"keep").unwrap();
-        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        assert!(derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive",
+            false
+        )
+        .is_err());
         assert_eq!(fs::read(&foreign).unwrap(), b"keep");
         fs::remove_file(foreign).unwrap();
-        let child = derive(&store, &derive_path, "fixture:derive", false).unwrap();
+        let sandbox_port = |store: &SessionStore| crate::StdioSandboxPort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_project_ref: project.clone(),
+            source_metadata: None,
+        };
+        let derive_approval = crate::source_construction_rpc::Approvals {
+            sandbox_derive_approval: Some(derive_path.clone()),
+            ..Default::default()
+        };
+        let derive_params = json!({"from":parent.canonical_ref});
+        assert!(derive_approval
+            .create_sandbox(
+                &sandbox_port(&store),
+                "cross-project",
+                json!({"from":"/d:foreign/i:foreign/p:foreign/s:foreign"})
+            )
+            .is_err());
+        assert!(derive_approval
+            .create_sandbox(&sandbox_port(&store), "wrong-mode", json!({}))
+            .is_err());
+        let derived_rpc = derive_approval
+            .create_sandbox(
+                &sandbox_port(&store),
+                "fixture-derive",
+                derive_params.clone(),
+            )
+            .unwrap();
+        let child = derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive",
+            false,
+        )
+        .unwrap();
+        assert_eq!(derived_rpc["ref"], child.canonical_ref);
+        assert_eq!(derived_rpc["parent"], parent.canonical_ref);
+        assert!(derived_rpc["sources"][0].get("source_ref").is_none());
+        let absent_derive = crate::source_construction_rpc::Approvals {
+            sandbox_derive_approval: Some(root.join("absent-approval")),
+            ..Default::default()
+        };
+        assert_eq!(
+            absent_derive
+                .create_sandbox(&sandbox_port(&store), "fixture-derive", derive_params)
+                .unwrap(),
+            derived_rpc
+        );
         assert_eq!(
             child.parent_sandbox_ref.as_deref(),
             Some(parent.canonical_ref.as_str())
@@ -1122,13 +1342,18 @@ mod tests {
             derive(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:derive",
+                "rpc:stdio:sandbox-create:fixture-derive",
                 false
             )
             .unwrap(),
             child
         );
-        assert!(abandon_derive(&store, &derive_path, "fixture:derive").is_err());
+        assert!(abandon_derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive"
+        )
+        .is_err());
 
         let interrupt_derive = |store: &SessionStore, target: &Path, id: &str| {
             let prepared = store
@@ -1173,7 +1398,11 @@ mod tests {
             prepared.mark_unknown().unwrap();
             candidate
         };
-        let pending_ref = interrupt_derive(&store, &pending_root, "fixture:derive-pending");
+        let pending_ref = interrupt_derive(
+            &store,
+            &pending_root,
+            "rpc:stdio:sandbox-create:fixture-derive-pending",
+        );
         assert!(store
             .sandbox_inspect_derive_exact(
                 &actor,
@@ -1181,7 +1410,7 @@ mod tests {
                 &parent.canonical_ref,
                 parent.rev,
                 &layout(&discard_root),
-                "fixture:derive-pending",
+                "rpc:stdio:sandbox-create:fixture-derive-pending",
                 |_, _, _| panic!("wrong recovery layout reached inspector")
             )
             .is_err());
@@ -1192,7 +1421,7 @@ mod tests {
                 &parent.canonical_ref,
                 parent.rev + 1,
                 &layout(&pending_root),
-                "fixture:derive-pending",
+                "rpc:stdio:sandbox-create:fixture-derive-pending",
                 |_, _, _| panic!("wrong original parent revision reached inspector")
             )
             .is_err());
@@ -1201,17 +1430,39 @@ mod tests {
             serde_json::to_vec(&derive_config(&store, &discard_root)).unwrap(),
         )
         .unwrap();
-        assert!(derive(&store, &derive_path, "fixture:derive-pending", true).is_err());
+        assert!(derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive-pending",
+            true
+        )
+        .is_err());
         fs::write(
             &derive_path,
             serde_json::to_vec(&derive_config(&store, &pending_root)).unwrap(),
         )
         .unwrap();
-        assert!(derive(&store, &derive_path, "fixture:derive-pending", false).is_err());
+        assert!(derive(
+            &store,
+            &derive_path,
+            "rpc:stdio:sandbox-create:fixture-derive-pending",
+            false
+        )
+        .is_err());
         drop(store);
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
-        let derived = derive(&store, &derive_path, "fixture:derive-pending", true).unwrap();
+        assert!(derive_approval
+            .create_sandbox(
+                &sandbox_port(&store),
+                "fixture-derive-pending",
+                json!({"from":parent.canonical_ref})
+            )
+            .is_err());
+        let recovery_id = crate::source_construction_rpc::Operation::SandboxDerive
+            .offline_id("fixture-derive-pending", true, true)
+            .unwrap();
+        let derived = derive(&store, &derive_path, &recovery_id, true).unwrap();
         assert_eq!(derived.canonical_ref, pending_ref);
         assert_eq!(
             fs::read(pending_root.join("code/tracked")).unwrap(),
@@ -1312,11 +1563,23 @@ mod tests {
             .write_all(&serde_json::to_vec(&wrong).unwrap())
             .unwrap();
         drop(baseline_file);
-        assert!(create_baseline(&store, &baseline_path, "fixture:baseline-create", false).is_err());
+        assert!(create_baseline(
+            &store,
+            &baseline_path,
+            "rpc:stdio:sandbox-create:fixture-baseline-create",
+            false
+        )
+        .is_err());
         assert_eq!(fs::read_dir(&baseline_root).unwrap().count(), 0);
         fs::write(&baseline_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let lease = lock_private_approval(&baseline_path).unwrap();
-        assert!(create_baseline(&store, &baseline_path, "fixture:baseline-create", false).is_err());
+        assert!(create_baseline(
+            &store,
+            &baseline_path,
+            "rpc:stdio:sandbox-create:fixture-baseline-create",
+            false
+        )
+        .is_err());
         drop(lease);
 
         let retained_refs = git(
@@ -1325,8 +1588,55 @@ mod tests {
             &["for-each-ref", "refs/aw/checkpoints/"],
         );
         fs::write(repo.join("tracked"), b"current mutable parent").unwrap();
-        let standalone =
-            create_baseline(&store, &baseline_path, "fixture:baseline-create", false).unwrap();
+        let baseline_approval = crate::source_construction_rpc::Approvals {
+            sandbox_create_approval: Some(baseline_path.clone()),
+            ..Default::default()
+        };
+        assert!(baseline_approval
+            .create_sandbox(
+                &sandbox_port(&store),
+                "foreign",
+                json!({"project":"/d:foreign/i:foreign/p:foreign"})
+            )
+            .is_err());
+        let baseline_rpc = baseline_approval
+            .create_sandbox(&sandbox_port(&store), "fixture-baseline-create", json!({}))
+            .unwrap();
+        let standalone = create_baseline(
+            &store,
+            &baseline_path,
+            "rpc:stdio:sandbox-create:fixture-baseline-create",
+            false,
+        )
+        .unwrap();
+        assert_eq!(baseline_rpc["ref"], standalone.canonical_ref);
+        assert!(baseline_rpc["parent"].is_null());
+        assert!(baseline_rpc["sources"][0].get("source_ref").is_none());
+        let absent_baseline = crate::source_construction_rpc::Approvals {
+            sandbox_create_approval: Some(root.join("absent-approval")),
+            ..Default::default()
+        };
+        assert_eq!(
+            absent_baseline
+                .create_sandbox(
+                    &sandbox_port(&store),
+                    "fixture-baseline-create",
+                    json!({"project":project})
+                )
+                .unwrap(),
+            baseline_rpc
+        );
+        let both = crate::source_construction_rpc::Approvals {
+            sandbox_derive_approval: Some(derive_path.clone()),
+            ..baseline_approval
+        };
+        assert!(both
+            .create_sandbox(
+                &sandbox_port(&store),
+                "fixture-baseline-create",
+                json!({"from":parent.canonical_ref})
+            )
+            .is_err());
         assert!(standalone.parent_sandbox_ref.is_none());
         assert_eq!(standalone.sources.len(), 1);
         assert_eq!(
@@ -1342,13 +1652,18 @@ mod tests {
             create_baseline(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:baseline-create",
+                "rpc:stdio:sandbox-create:fixture-baseline-create",
                 false
             )
             .unwrap(),
             standalone
         );
-        assert!(abandon_baseline(&store, &baseline_path, "fixture:baseline-create").is_err());
+        assert!(abandon_baseline(
+            &store,
+            &baseline_path,
+            "rpc:stdio:sandbox-create:fixture-baseline-create"
+        )
+        .is_err());
 
         let interrupt_baseline = |store: &SessionStore, target: &Path, id: &str| {
             let prepared = store
@@ -2332,7 +2647,7 @@ mod tests {
             create_baseline(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:baseline-create",
+                "rpc:stdio:sandbox-create:fixture-baseline-create",
                 false
             )
             .unwrap()
@@ -2360,7 +2675,7 @@ mod tests {
             derive(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:derive",
+                "rpc:stdio:sandbox-create:fixture-derive",
                 false
             )
             .unwrap()
@@ -2371,7 +2686,7 @@ mod tests {
             derive(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:derive-pending",
+                "rpc:stdio:sandbox-create:fixture-derive-pending",
                 true
             )
             .unwrap()
@@ -2430,7 +2745,7 @@ mod tests {
             invoke_restore(
                 &store,
                 &root.join("absent-approval"),
-                "fixture:restore-interrupted",
+                "rpc:stdio:checkpoint-restore:fixture-restore-interrupted",
                 true
             )
             .unwrap(),

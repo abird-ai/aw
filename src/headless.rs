@@ -80,8 +80,7 @@ pub trait AgentInputsPort: Send + Sync {
 }
 
 /// Concurrent current-Project Sandbox read/lifecycle surface. Physical
-/// materialization and Sandbox creation remain unavailable until the
-/// SourceDriver/checkpoint owner can satisfy prepared-publication semantics.
+/// constructors use their separate serialized, explicitly enabled port.
 pub trait SandboxPort: Send + Sync {
     fn apply(&self, method: &str, params: Value) -> Result<Value>;
 }
@@ -187,6 +186,13 @@ pub trait Driver {
     }
     fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
         None
+    }
+    /// Explicit host constructor, serialized after request identity gates.
+    fn can_sandbox_create(&self) -> bool {
+        false
+    }
+    fn sandbox_create(&self, _request_id: &str, _params: Value) -> Result<Value> {
+        Err(Error::Denied("Sandbox construction unavailable"))
     }
     /// Explicit host source mutation, serialized after request identity
     /// gates. Never dispatched on the concurrent input reader.
@@ -447,6 +453,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "agent_inputs_send" => Some(&["ref", "ids", "rev"]),
         "sandbox_list" => Some(&["project", "limit", "cursor"]),
         "sandbox_get" => Some(&["ref", "include"]),
+        "sandbox_create" => Some(&["project", "from"]),
         "sandbox_sources_list" => Some(&["ref"]),
         "sandbox_sources_set" => Some(&["ref", "name", "binding", "rev"]),
         "checkpoint_list" => Some(&["ref", "limit", "cursor"]),
@@ -840,7 +847,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "agent_inputs_send":driver.agent_inputs_port().is_some(),
             "sandbox_list":driver.sandbox_port().is_some(),
             "sandbox_get":driver.sandbox_port().is_some(),
-            "sandbox_create":false,
+            "sandbox_create":driver.can_sandbox_create(),
             "sandbox_close":driver.sandbox_port().is_some(),
     });
     capabilities["sandbox_sources_list"] = json!(driver.sandbox_port().is_some());
@@ -934,6 +941,12 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
         match request.method.as_str() {
             // This constructor is serialized after the connection's request-ID
             // gate, not dispatched speculatively by the live input reader.
+            "sandbox_create" if driver.can_sandbox_create() => {
+                match driver.sandbox_create(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
             "sandbox_sources_set" if driver.can_sandbox_sources_set() => {
                 match driver.sandbox_sources_set(id, request.params) {
                     Ok(value) => out.emit("response", Some(id), value)?,
@@ -1582,6 +1595,17 @@ mod aw_p6_9c_protocol_tests {
         fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
             Some(self.sandbox.clone())
         }
+        fn can_sandbox_create(&self) -> bool {
+            true
+        }
+        fn sandbox_create(&self, request_id: &str, params: Value) -> Result<Value> {
+            self.sandbox
+                .calls
+                .lock()
+                .unwrap()
+                .push((format!("sandbox_create:{request_id}"), params));
+            Ok(json!({"ref":"/d:d/i:i/p:p/s:fixture"}))
+        }
         fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
             Some(self.sandbox.clone())
         }
@@ -1671,6 +1695,9 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"inputs-list","method":"agent_inputs_list","params":{"ref":"."}}"#,
             r#"{"v":1,"id":"inputs-raw","method":"agent_inputs_add","params":{"items":[],"provider":"evil"}}"#,
             r#"{"v":1,"id":"sandboxes","method":"sandbox_list","params":{"limit":8}}"#,
+            r#"{"v":1,"id":"sandbox-new","method":"sandbox_create","params":{}}"#,
+            r#"{"v":1,"id":"sandbox-new","method":"sandbox_create","params":{"from":"/d:d/i:i/p:p/s:0"}}"#,
+            r#"{"v":1,"id":"sandbox-raw","method":"sandbox_create","params":{"path":"/private"}}"#,
             r#"{"v":1,"id":"sources","method":"sandbox_sources_list","params":{"ref":"/d:d/i:i/p:p/s:0"}}"#,
             r#"{"v":1,"id":"checkpoints","method":"checkpoint_list","params":{"ref":".","limit":8}}"#,
             r#"{"v":1,"id":"checkpoint","method":"checkpoint_get","params":{"id":"cp_fixture"}}"#,
@@ -1740,7 +1767,7 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_delete"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_set"], true);
-        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
+        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_close"], true);
         assert_eq!(fake.query_calls, 1);
         assert_eq!(fake.mutation_calls, 1);
@@ -1782,6 +1809,7 @@ mod aw_p6_9c_protocol_tests {
                 "sandbox_sources_list",
                 "checkpoint_list",
                 "checkpoint_get",
+                "sandbox_create:sandbox-new",
                 "checkpoint_restore:checkpoint-restore",
                 "checkpoint_delete:cp-delete",
                 "agent_vault_list:vault-list",
@@ -1790,6 +1818,15 @@ mod aw_p6_9c_protocol_tests {
             ]
         );
         assert_eq!(sandbox_calls[0].1["limit"], 8);
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "sandbox-new" && r["data"]["ref"] == "/d:d/i:i/p:p/s:fixture"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "sandbox-new" && r["data"]["code"] == "duplicate_request_id"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "sandbox-raw" && r["data"]["code"] == "invalid_parameters"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "vault-set" && r["data"]["status"] == "applied"));

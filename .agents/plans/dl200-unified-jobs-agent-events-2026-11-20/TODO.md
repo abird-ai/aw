@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: live provider-owned signing broker in original Process (this checkpoint; local parent `5941d9f9cdc5dc9ad7fff51ab7d88d3212cd4d9a`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: explicit source construction RPC dispatch (this checkpoint; local parent `92aefcbe47f71535ceaf14480665560447759116`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1876,9 +1876,23 @@ Current implementation: live provider-owned signing broker in original Process (
       authorized metadata redaction revalidated. 300 selected locked/offline tests passed;
       strict affected Clippy, durable/minimal all-target and scoped format/diff
       checks passed. Prior five known full-Store failures were not rerun.
-      **Next:** remaining production Sandbox/Vault host RPC construction/
-      capture/restore and physical retention authority, reviewed
-      containment/extension dispatch, protected broader metadata/Views,
+      **Explicit source construction RPC:** serialized sandbox_create
+      baseline/parent and captured checkpoint create/restore using
+      configured independent private approvals and the original durable
+      receipt/physical Git owners. Current Project scope, complete
+      required sources, private taskless captured restore; no paths
+      or authority supplied by RPC. Same original semantic namespace,
+      replay before approval, no unresolved retry/rematerialization.
+      Offline --agent-rpc-request only with explicit recover/abandon;
+      existing CLI namespaces unchanged. Actual Git lifecycle through
+      ports and transport duplicate/path/advertisement checks.
+      Headless 8/8, native executable 1/1, recovery namespace 1/1,
+      actual Git lifecycle 1/1; strict Clippy, durable/minimal,
+      CLI help/parse gates and scoped fmt/diff passed. 11 selected tests.
+      Prior five legacy Store failures not rerun.
+      **Next:** physical retention authority and explicit exact host
+      cleanup dispatch, reviewed containment/extension and bound-Agent
+      structural mutation, protected broader metadata/Views,
       manifest-preserving legacy transfer/export and independent source/
       provider share policy. Raw file/env and arbitrary secret exposure
       remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
@@ -1903,7 +1917,7 @@ Current implementation: live provider-owned signing broker in original Process (
       and exact named/final-source release, plus authenticated unused-Sandbox
       Git source setter are landed; do not repeat.
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
-      task-bearing/cross-Project restore, captured-source capture/restore RPC,
+      task-bearing/cross-Project restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.
       Last independently verified published AW main `0f9807f4`, dotlink main

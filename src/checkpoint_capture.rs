@@ -48,6 +48,10 @@ pub(crate) struct Args {
     /// Reconcile only the original unpublished capture; never remove a live checkpoint.
     #[arg(long = "agent-abandon", conflicts_with = "recover")]
     abandon: bool,
+    /// Inspect the original authenticated stdio RPC request ID instead of
+    /// the standalone CLI namespace. Requires recovery or abandonment.
+    #[arg(long = "rpc-request")]
+    rpc_request: bool,
 }
 
 struct Fence {
@@ -176,6 +180,11 @@ pub(crate) fn abandon(
 }
 
 pub(crate) fn run(args: Args) -> Result<u8> {
+    let request_id = crate::source_construction_rpc::Operation::CheckpointCapture.offline_id(
+        &args.request_id,
+        args.rpc_request,
+        args.recover || args.abandon,
+    )?;
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
     let selection = if args.sources.is_empty() {
@@ -194,7 +203,7 @@ pub(crate) fn run(args: Args) -> Result<u8> {
         note: args.note.as_deref(),
     };
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
-    let request_id = format!("cli:checkpoint-capture:{}", args.request_id);
+
     if args.abandon {
         abandon(&store, &actor, &args.approval_root, &request, &request_id)?;
         super::print_json(&serde_json::json!({"status":"rejected"}))?;

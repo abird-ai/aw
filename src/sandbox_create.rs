@@ -36,6 +36,10 @@ pub(crate) struct Args {
     /// Reconcile only unpublished materializations, not the baseline refs.
     #[arg(long = "agent-abandon", conflicts_with = "recover")]
     abandon: bool,
+    /// Inspect the original authenticated stdio RPC request ID instead of
+    /// the standalone CLI namespace. Requires recovery or abandonment.
+    #[arg(long = "rpc-request")]
+    rpc_request: bool,
 }
 
 #[derive(Deserialize)]
@@ -214,10 +218,15 @@ pub(crate) fn abandon(
 }
 
 pub(crate) fn run(args: Args) -> Result<u8> {
+    let id = crate::source_construction_rpc::Operation::SandboxCreate.offline_id(
+        &args.request_id,
+        args.rpc_request,
+        args.recover || args.abandon,
+    )?;
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
-    let id = format!("cli:sandbox-create:{}", args.request_id);
+
     if args.abandon {
         abandon(&store, &actor, &args.approval, &args.project, &id)?;
         super::print_json(&serde_json::json!({"status":"rejected"}))?;

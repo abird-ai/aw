@@ -32,6 +32,8 @@ mod sandbox_source_attach;
 #[cfg(feature = "workspace")]
 mod sandbox_source_rpc;
 mod skill_package;
+#[cfg(feature = "workspace")]
+mod source_construction_rpc;
 mod source_metadata;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
@@ -980,7 +982,7 @@ struct RpcCommandCliArgs {
     /// Existing private git-native.json approval directory for this exact
     /// local Agent. Explicit native tools only; no ambient root access.
     #[cfg(feature = "workspace")]
-    #[arg(long = "native-source-root", requires_all = ["rpc_actor_owner", "rpc_native_source_grant_rev"], conflicts_with_all = ["rpc_checkpoint_create", "rpc_checkpoint_restore_root", "rpc_checkpoint_delete", "rpc_source_metadata_approval", "rpc_sandbox_source_approval", "rpc_signing_vault_root"])]
+    #[arg(long = "native-source-root", requires_all = ["rpc_actor_owner", "rpc_native_source_grant_rev"], conflicts_with_all = ["rpc_checkpoint_create", "rpc_checkpoint_restore_root", "rpc_checkpoint_delete", "rpc_source_metadata_approval", "rpc_sandbox_source_approval", "rpc_signing_vault_root", "sandbox_create_approval", "sandbox_derive_approval", "checkpoint_capture_root", "checkpoint_restore_approval"])]
     rpc_native_source_root: Option<PathBuf>,
     /// Explicit expected Sandbox grant revision (0 = first grant).
     #[cfg(feature = "workspace")]
@@ -1014,6 +1016,9 @@ struct RpcCommandCliArgs {
     #[cfg(feature = "workspace")]
     #[arg(long = "sandbox-source-approval", requires = "rpc_actor_owner")]
     rpc_sandbox_source_approval: Option<PathBuf>,
+    #[cfg(feature = "workspace")]
+    #[command(flatten)]
+    source_construction: source_construction_rpc::Approvals,
     /// Activate an existing private signing Vault and authorize binding
     /// management for this exact local Actor. Entry refs require explicit
     /// provider metadata approval. Host must independently
@@ -1117,6 +1122,8 @@ pub(crate) struct RunArgs {
     rpc_source_metadata_approval: Option<PathBuf>,
     #[cfg(feature = "workspace")]
     rpc_sandbox_source_approval: Option<PathBuf>,
+    #[cfg(feature = "workspace")]
+    source_construction: source_construction_rpc::Approvals,
     rpc_signing_vault_root: Option<PathBuf>,
     rpc_signing_broker_entry: Option<String>,
     #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1260,6 +1267,8 @@ impl RunArgs {
             rpc_source_metadata_approval: None,
             #[cfg(feature = "workspace")]
             rpc_sandbox_source_approval: None,
+            #[cfg(feature = "workspace")]
+            source_construction: Default::default(),
             rpc_signing_vault_root: None,
             rpc_signing_broker_entry: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
@@ -1720,6 +1729,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             #[cfg(feature = "workspace")]
             {
                 run.rpc_sandbox_source_approval = args.rpc_sandbox_source_approval;
+                run.source_construction = args.source_construction;
             }
             run.rpc_signing_vault_root = args.rpc_signing_vault_root;
             run.rpc_signing_broker_entry = args.rpc_signing_broker_entry;
@@ -1931,6 +1941,7 @@ fn run_agent_with_shell_containment(
             || args.rpc_checkpoint_delete
             || args.rpc_source_metadata_approval.is_some()
             || args.rpc_sandbox_source_approval.is_some()
+            || !args.source_construction.is_empty()
             || args.rpc_signing_vault_root.is_some()
             || args.context_compact_now
             || args.context_action.is_some()
@@ -3369,6 +3380,10 @@ fn run_agent_with_shell_containment(
             host.checkpoint_create_enabled = args.rpc_checkpoint_create;
             host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             host.checkpoint_delete_enabled = args.rpc_checkpoint_delete;
+            #[cfg(feature = "workspace")]
+            {
+                host.source_construction = args.source_construction;
+            }
             if let Some(path) = args.rpc_source_metadata_approval {
                 host.attach_rpc_source_metadata(&path)?;
             }
@@ -3733,6 +3748,8 @@ struct Host {
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     #[cfg(feature = "workspace")]
     sandbox_source_approval: Option<sandbox_source_rpc::ApprovalFile>,
+    #[cfg(feature = "workspace")]
+    source_construction: source_construction_rpc::Approvals,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3921,25 +3938,7 @@ struct StdioCheckpointRestorePort {
 
 impl aw::headless::CheckpointRestorePort for StdioCheckpointRestorePort {
     fn restore(&self, request_id: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let checkpoint = params
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(Error::Protocol("checkpoint_restore id must be a string"))?
-            .to_owned();
-        let access = match agent_create_access(params.get("access"))? {
-            aw_store::AgentCreateAccess::Private => aw_store::AgentHistoryForkAccess::Private,
-            aw_store::AgentCreateAccess::Inherit => aw_store::AgentHistoryForkAccess::Inherit,
-            aw_store::AgentCreateAccess::Custom(grants) => {
-                aw_store::AgentHistoryForkAccess::Custom(grants)
-            }
-        };
-        let request = aw_store::CheckpointRestoreRequest {
-            checkpoint,
-            project: agent_create_optional_string(&params, "project")?,
-            title: agent_create_optional_string(&params, "title")?,
-            task: agent_create_optional_string(&params, "task")?,
-            access,
-        };
+        let request = checkpoint_restore_request(&params)?;
         let result = self.baseline.restore(
             &request,
             &format!("rpc:stdio:checkpoint-restore:{request_id}"),
@@ -3950,6 +3949,30 @@ impl aw::headless::CheckpointRestorePort for StdioCheckpointRestorePort {
             "source_coverage": result.source_coverage,
         }))
     }
+}
+
+fn checkpoint_restore_request(
+    params: &serde_json::Value,
+) -> Result<aw_store::CheckpointRestoreRequest> {
+    let checkpoint = params
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(Error::Protocol("checkpoint_restore id must be a string"))?
+        .to_owned();
+    let access = match agent_create_access(params.get("access"))? {
+        aw_store::AgentCreateAccess::Private => aw_store::AgentHistoryForkAccess::Private,
+        aw_store::AgentCreateAccess::Inherit => aw_store::AgentHistoryForkAccess::Inherit,
+        aw_store::AgentCreateAccess::Custom(grants) => {
+            aw_store::AgentHistoryForkAccess::Custom(grants)
+        }
+    };
+    Ok(aw_store::CheckpointRestoreRequest {
+        checkpoint,
+        project: agent_create_optional_string(params, "project")?,
+        title: agent_create_optional_string(params, "title")?,
+        task: agent_create_optional_string(params, "task")?,
+        access,
+    })
 }
 
 struct StdioAgentInputsPort {
@@ -5506,6 +5529,8 @@ impl Host {
             sandbox_owner: None,
             #[cfg(feature = "workspace")]
             sandbox_source_approval: None,
+            #[cfg(feature = "workspace")]
+            source_construction: Default::default(),
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -7151,6 +7176,14 @@ impl aw::headless::Driver for Host {
     fn checkpoint_create_port(
         &self,
     ) -> Option<std::sync::Arc<dyn aw::headless::CheckpointCreatePort>> {
+        #[cfg(feature = "workspace")]
+        if let Some(root) = &self.source_construction.checkpoint_capture_root {
+            return Some(Arc::new(source_construction_rpc::CapturePort {
+                state: self.agent_state_port.as_ref()?.clone(),
+                approval_root: root.clone(),
+                history_enabled: self.checkpoint_create_enabled,
+            }));
+        }
         if !self.checkpoint_create_enabled {
             return None;
         }
@@ -7161,8 +7194,15 @@ impl aw::headless::Driver for Host {
     fn checkpoint_restore_port(
         &self,
     ) -> Option<std::sync::Arc<dyn aw::headless::CheckpointRestorePort>> {
-        let root = self.checkpoint_restore_root.as_ref()?;
         let state = self.agent_state_port.as_ref()?;
+        #[cfg(feature = "workspace")]
+        if let Some(path) = &self.source_construction.checkpoint_restore_approval {
+            return Some(Arc::new(source_construction_rpc::RestorePort {
+                state: state.clone(),
+                approval: path.clone(),
+            }));
+        }
+        let root = self.checkpoint_restore_root.as_ref()?;
         let creator = self.agent_create_owner.as_ref()?;
         Some(std::sync::Arc::new(StdioCheckpointRestorePort {
             baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
@@ -7214,6 +7254,33 @@ impl aw::headless::Driver for Host {
             .ok_or(Error::Denied("signing broker not selected"))?
             .sign(grant_rev, message)
     }
+    #[cfg(feature = "workspace")]
+    fn can_sandbox_create(&self) -> bool {
+        self.source_construction.sandbox_enabled() && self.actor_owner.is_some()
+    }
+
+    #[cfg(feature = "workspace")]
+    fn sandbox_create(
+        &self,
+        request_id: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let owner = self.actor_owner.as_ref().ok_or(Error::Denied(
+            "Sandbox construction requires the local Actor owner",
+        ))?;
+        owner.verify_rpc_state()?;
+        owner.verify_rpc_agent(
+            self.agent
+                .as_ref()
+                .ok_or(Error::Denied("original Agent unavailable"))?,
+        )?;
+        let state = self.sandbox_owner.as_ref().ok_or(Error::Denied(
+            "Sandbox construction requires the Project owner",
+        ))?;
+        self.source_construction
+            .create_sandbox(state, request_id, params)
+    }
+
     #[cfg(feature = "workspace")]
     fn can_sandbox_sources_set(&self) -> bool {
         self.sandbox_source_approval.is_some() && self.actor_owner.is_some()
