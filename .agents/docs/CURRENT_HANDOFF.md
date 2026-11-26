@@ -19,7 +19,117 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: live native source withdrawal and cooperative Turn cancellation
+## Latest local implementation delta — 2026-11-26: pre-tool restart and exact native artifact recovery
+
+Parent `3e4132bf9b646e45e26b5b62e22f5699c09a911b` (live withdrawal);
+published AW main `7b92686`. L5, clean at entry. Store v60, Git
+recovery v4 unchanged; no new execution owner or receipt ledger.
+
+- The exclusive owner startup compatibility gate previously refused
+  every unresolved source-bearing Run lacking an original source
+  claim, including process loss during its first provider request.
+  `require_pre_tool_run_in` accepts only exact direct owner Input
+  provenance with no ToolStarted/ToolFinished/ToolRevised, no possible
+  mutation effect, no unresolved Run hazard, original first attempt
+  and no routing/web dispatch. Require original Store/owner-lock
+  incarnation, exact prompt/branch anchor/revision/writer epoch,
+  original immutable Dispatching Input and owner identity; if an
+  authority segment exists it must be the single exact first owner
+  Input segment. No current grant, provider or SourceDriver needed
+  merely to reconstruct the interrupted Run. Direct/staged modes
+  remain quiescent-only; the existing claimed-effect recovery gate
+  remains unchanged. Original Store recovery reconstructs a failed
+  Turn with unknown provider usage/attempt, not a new attempt or
+  a fabricated provider result. Original Input/queue uncertainty
+  remains independently inspectable; no automatic replay or retire.
+  **Unclaimed ToolStarted remains held**, even a native/read intent:
+  absence of a source claim alone is not physical no-start proof.
+- Add `SandboxToolRecoverySelection` and
+  `sandbox_recover_tool_source_effect_exact` sharing the original
+  recovery transaction with the generic SDK method. Exact original
+  driver and optional Sandbox selection is checked before consuming
+  any recorded quiescence or immutable release. No cross-driver
+  replay. Existing `GitNativeSourceResolver::recover` and configured
+  recovery share the same physical inspection/custody implementation.
+  Registered typed native/Git driver selection is lazy for missing
+  physical proof; released replay needs no checkout or artifact
+  namespace probe. Recorded quiescence retains its original Store
+  binding revalidation/release path. No second cleanup mechanism.
+- New actual offline command:
+  `aw native-source-recover <private-recovery-approval.json>`.
+  The strict v1 file is in the **original private artifact state
+  directory**, whose identity is independently approved. Fields:
+  `{version,store_directory,store_id,store_generation,manager,agent,
+  sandbox,turn,call,base,base_identity,artifact_state_identity,
+  repositories:[{location:GitSourceLocation,binding_rev,access}]}`.
+  GitSourceLocation is `{name,repository,repository_identity}`;
+  directory identities are volume/object pairs. Exact local OS
+  principal/exclusive existing Store, current Agent View and Project
+  writer authority, original tool journal/claim and original driver
+  required. Private advisory approval lease across operation; match
+  exact original complete named source set, current binding revisions
+  and access ceilings, original base and physical identities. First
+  physical recovery consumer deliberately supports only private
+  ordinary checkouts (one base or named children), with contained
+  Git administration and disjoint Store/artifact roots. Linked
+  worktrees/other drivers not promoted. Independently trusted host
+  must ensure permanent quiescence of original native worker and
+  actual original artifact namespace custody, excluding surviving/
+  external writers, aliases, mounts, other Stores and backing users
+  throughout. Exclusive Store/pins are not kernel containment or
+  sufficient evidence of arbitrary Process death. No creation of a
+  missing artifact namespace; original driver verifies exact backing/
+  materialization, protected Git paths and actual existing registry.
+  Cleanup only exact owned artifacts using original lower capability;
+  preserve unowned lookalikes. Guard and pins through original
+  release/Unknown settlement. Terminal replay matches original
+  Agent/Turn/call/Sandbox/driver without re-running physical proof
+  or requiring old checkout. Outcome is explicitly source_effect_only;
+  no whole-Run hazard acknowledgement, queue disposition, new grant,
+  activation, tool retry or modification of the original Turn.
+- Extended existing executable fixture (one private Store, Git
+  checkout, loopback provider): actual process kill during first
+  provider request of a new Turn, no tool intent; reopen preserves
+  interrupted_unknown/unverified provider attempt, exact Dispatching
+  Input/Accepted queue, later pending item. Original explicit Input
+  and queue inspection (not provider/no-effect proof) lets a fresh
+  independent approval dispatch the next Input. At real private
+  Stage fault fixture boundary (reserved/finalized record and actual
+  owned stage file), actual native write leaves source custody
+  unresolved. Restart and offline recovery wrong artifact identity
+  refusal, exact cleanup, unowned lookalike retained, original
+  source barrier released, one Sandbox rev advance, history
+  unchanged; wrong Sandbox/driver replay denied, exact released
+  replay with checkout temporarily absent succeeds. No fixture DB
+  row fabrication, real provider credentials or user source effects.
+
+Validation (L5 Rust 1.95.0, final source): expanded actual executable
+native-source RPC/recovery 1/1 (14.78s), including original no-tool
+Run process loss and separate real native write with fault-injected
+original artifact record. Initial fixture comparison used a HistoryState
+without PartialEq; compare the same serialized history instead. Initial
+queue-priority fixture accidentally used negative (urgent) priority;
+corrected to positive later priority. Both corrections are test-only.
+Host native/Process 2/2 (7.71s), Store Sandbox 4/4, source barrier 1/1,
+Actor 46/46 (46.71s), Agent lifecycle 3/3 passed. Strict all-feature/
+all-target Store/Host/CLI Clippy, durable-only/minimal all-target checks
+(existing feature-specific dead-code warnings), full all-feature CLI
+build (48.13s incremental), actual version/help smoke, scoped fmt/diff
+and signed checkpoint. No full workspace, pinned Nix or native-platform
+qualification claimed. Actual process loss during a native mutation
+was not simulated in the executable test; the existing Host interrupted
+custody suite also passed. No broad Run-hazard or containment promotion.
+
+Next: original whole-Run hazard and custody reconciliation using
+complete original native effects/proofs; handle unclaimed ToolStarted
+only with actual original route/no-start evidence, never merely
+absence of a claim. Production explicit original Input/queue
+disposition and physical recovery of linked layouts/Process sources
+remain separate; no blanket inspection acknowledgement, Process
+containment or source-aware shared/Graph/Job execution promotion.
+Frozen physical Sandbox unchanged.
+
+## Previous local implementation delta — 2026-11-26: live native source withdrawal and cooperative Turn cancellation
 
 Parent `c963f43d4143b5a663cf9940f2e51269f3914b9f` (production
 configured native source-root stdio). Published AW main `7b92686`.

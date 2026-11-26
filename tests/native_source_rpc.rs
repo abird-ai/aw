@@ -65,7 +65,7 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let counter = calls.clone();
     let thread = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(180);
-        while counter.load(Ordering::SeqCst) < 7 {
+        while counter.load(Ordering::SeqCst) < 10 {
             assert!(Instant::now() < deadline, "provider fixture deadline");
             let (mut socket, _) = match listener.accept() {
                 Ok(value) => value,
@@ -112,33 +112,40 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
             names.sort_unstable();
             assert_eq!(names, ["read", "write"]);
             let ordinal = counter.fetch_add(1, Ordering::SeqCst);
-            if ordinal == 6 {
-                // The owning process has dispatched a real paid attempt.
-                // Withhold the reply until the original cancellation path
-                // drops the request; never invent provider-side stop proof.
+            if matches!(ordinal, 6 | 7) {
+                // A real dispatched provider attempt: withdraw or kill the
+                // owning process while waiting, without a fabricated reply.
                 let _ = socket.read(&mut [0u8; 1]);
-                break;
+                continue;
             }
-            let (delta, reason) = match ordinal % 3 {
-                0 => (
-                    json!({"tool_calls":[{"index":0,"id":format!("read-{ordinal}"),"type":"function",
-                    "function":{"name":"read","arguments":json!({"path":"tracked"}).to_string()}}]}),
+            let (delta, reason) = match ordinal {
+                8 => (
+                    json!({"tool_calls":[{"index":0,"id":"write-recovery","type":"function",
+                    "function":{"name":"write","arguments":json!({"path":"created","content":"recovery write"}).to_string()}}]}),
                     "tool_calls",
                 ),
-                1 => {
-                    assert!(request["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|message| message["role"] == "tool"
-                            && message["content"].to_string().contains("fixture data")));
-                    (
-                        json!({"tool_calls":[{"index":0,"id":format!("write-{ordinal}"),"type":"function",
-                        "function":{"name":"write","arguments":json!({"path":"created","content":"native rpc"}).to_string()}}]}),
+                9 => (json!({"content":"done after write"}), "stop"),
+                _ => match ordinal % 3 {
+                    0 => (
+                        json!({"tool_calls":[{"index":0,"id":format!("read-{ordinal}"),"type":"function",
+                    "function":{"name":"read","arguments":json!({"path":"tracked"}).to_string()}}]}),
                         "tool_calls",
-                    )
-                }
-                _ => (json!({"content":"done"}), "stop"),
+                    ),
+                    1 => {
+                        assert!(request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|message| message["role"] == "tool"
+                                && message["content"].to_string().contains("fixture data")));
+                        (
+                            json!({"tool_calls":[{"index":0,"id":format!("write-{ordinal}"),"type":"function",
+                        "function":{"name":"write","arguments":json!({"path":"created","content":"native rpc"}).to_string()}}]}),
+                            "tool_calls",
+                        )
+                    }
+                    _ => (json!({"content":"done"}), "stop"),
+                },
             };
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
@@ -257,7 +264,7 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
                 task: None,
             },
             &layout(&repo),
-            &[binding],
+            std::slice::from_ref(&binding),
             "fixture:baseline",
             "local",
         )
@@ -564,7 +571,6 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     }
     drop(stdin);
     let third = frames(&child.wait_with_output().unwrap());
-    provider.join().unwrap();
     assert_eq!(
         third[0]["data"]["capabilities"]["native_source_withdraw"],
         true
@@ -600,7 +606,8 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         settled(&third, "blocked-step")["status"],
         "unknown_or_rejected"
     );
-    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
     let view = store
         .read_agent_branch_view(&owner, &session, &branch)
         .unwrap();
@@ -629,6 +636,269 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     assert_eq!(grant.revision, 3);
     assert!(grant.active);
     assert_eq!(calls.load(Ordering::SeqCst), 7);
+    approval["sandbox_rev"] = json!(
+        store
+            .sandbox_get(&manager, &sandbox.canonical_ref)
+            .unwrap()
+            .rev
+    );
+    drop(store);
+    fs::write(&approval_path, serde_json::to_vec(&approval).unwrap()).unwrap();
+
+    // Actual process loss before ANY source-tool intent. The original
+    // Run must be recoverable even though there is no source claim.
+    let mut child = spawn(true, Some(3), None, "read,write", &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        frame(
+            "fifth",
+            "actor_enqueue",
+            json!({"request_id":"fixture-fifth","message_id":60,"text":"write after recovery","priority":1}),
+        ),
+        frame("crash", "actor_step", json!({})),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while calls.load(Ordering::SeqCst) != 8 {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            drop(stdin);
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "pre-tool crash fixture did not dispatch: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    drop(stdin);
+    assert!(!child.wait_with_output().unwrap().status.success());
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    let recovered = store
+        .read_agent_branch_view(&owner, &session, &branch)
+        .unwrap();
+    assert_eq!(recovered.history.turns.len(), 4);
+    let interrupted = &recovered.history.turns[3];
+    assert_eq!(interrupted.outcome, aw_agent_core::Outcome::Failed);
+    assert!(interrupted.tool_records.is_empty());
+    assert!(!recovered.history.needs_reconciliation);
+    assert_eq!(interrupted.invocations[0].outcome, "interrupted_unknown");
+    assert!(!interrupted.invocations[0].usage_verified);
+    assert!(recovered.branch.active_run.is_none());
+    let queue = store
+        .actor_queue_fact(&owner, &session, "fixture-fourth")
+        .unwrap();
+    assert_eq!(queue.state, aw_store::QueueState::Accepted);
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-fifth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Pending
+    );
+    let input_id = aw_store::queued_input_request_id(&session, "fixture-fourth");
+    let input = store.actor_input_fact(&owner, &session, &input_id).unwrap();
+    assert_eq!(input.state, aw_store::InputAdmissionState::Dispatching);
+    // The fixture's explicit original Input/queue disposition is not a
+    // paid-attempt retry or evidence that the provider did no work.
+    let epoch = store
+        .workspace_writer(
+            &owner,
+            None,
+            &store.session(&owner, &session).unwrap().workspace_id,
+        )
+        .unwrap()
+        .writer_epoch;
+    store
+        .actor_input_inspect(
+            &owner,
+            &session,
+            &input_id,
+            epoch,
+            "fixture owner reaped; provider result remains unknown",
+        )
+        .unwrap();
+    store
+        .actor_queue_inspect(
+            &owner,
+            &session,
+            "fixture-fourth",
+            epoch,
+            "original interrupted Turn retained; never replay",
+        )
+        .unwrap();
+    let sandbox_before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+    let store_id = store.store_id().unwrap();
+    let store_generation = store.local_process_info().unwrap().store_generation;
+    drop(store);
+
+    // Fault fixture at the original durable Stage boundary (same lower
+    // artifact registry as native execution). A real native write must
+    // retain source custody while the exact private record is unresolved.
+    use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let object_identity = |path: &Path| {
+        let meta = fs::symlink_metadata(path).unwrap();
+        ObjectIdentity {
+            volume: meta.dev(),
+            object: meta.ino(),
+        }
+    };
+    let stage_name = ".aw-stage-recovery-fixture.tmp";
+    let stage = repo.join(stage_name);
+    let unowned = repo.join(".aw-stage-unowned-fixture.tmp");
+    {
+        let artifacts =
+            aw_tools_adapter::native_filesystem::reopen_source_artifacts(&repo, &approvals)
+                .unwrap();
+        let mut reservation = artifacts
+            .reserve_name(
+                Kind::Stage,
+                String::new(),
+                object_identity(&repo),
+                stage_name.into(),
+            )
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stage)
+            .unwrap();
+        let lease = reservation.finalize(object_identity(&stage)).unwrap();
+        file.write_all(b"private staged bytes").unwrap();
+        file.sync_all().unwrap();
+        drop(lease);
+        fs::write(&unowned, b"not owned").unwrap();
+    }
+    let fifth = frames(&invoke(
+        true,
+        Some(4),
+        None,
+        "read,write",
+        &[],
+        &[frame("write-step", "actor_step", json!({}))],
+    ));
+    assert_eq!(
+        settled(&fifth, "write-step")["status"],
+        "settled",
+        "{fifth:?}"
+    );
+    provider.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    assert_eq!(fs::read(repo.join("created")).unwrap(), b"recovery write");
+    assert!(stage.is_file());
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    let source_set =
+        aw_store::SourceMutationSet::from_bindings(std::slice::from_ref(&binding)).unwrap();
+    assert!(store
+        .acquire_source_mutation_barrier(&source_set, "fixture:before-native-recovery")
+        .is_err());
+    let original = store
+        .read_agent_branch_view(&owner, &session, &branch)
+        .unwrap()
+        .history;
+    let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+    assert_eq!(current.rev, sandbox_before.rev);
+    let recover_config = json!({
+        "version":1,"store_directory":state,"store_id":store_id,"store_generation":store_generation,
+        "manager":manager,"agent":reference,"sandbox":sandbox.canonical_ref,"turn":5,"call":"write-recovery",
+        "base":repo,"base_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap(),
+        "artifact_state_identity":aw_platform::DirectoryIdentity::open(&approvals).unwrap().identity().unwrap(),
+        "repositories":[{"location":{"name":name,"repository":repo,"repository_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap()},
+            "binding_rev":current.sources[0].binding_rev,"access":"read_write"}]
+    });
+    drop(store);
+    let recovery_path = approvals.join("recover.json");
+    aw_platform::open_private_new(&recovery_path)
+        .unwrap()
+        .write_all(&serde_json::to_vec(&recover_config).unwrap())
+        .unwrap();
+    let recover = || {
+        Command::new(env!("CARGO_BIN_EXE_aw"))
+            .env("AW_GIT", &executable)
+            .args(["native-source-recover"])
+            .arg(&recovery_path)
+            .output()
+            .unwrap()
+    };
+    let mut wrong = recover_config.clone();
+    wrong["artifact_state_identity"] = json!([0, 0]);
+    fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(!recover().status.success());
+    assert!(stage.is_file());
+    fs::write(&recovery_path, serde_json::to_vec(&recover_config).unwrap()).unwrap();
+    let output = recover();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "settled");
+    assert_eq!(result["scope"], "source_effect_only");
+    assert!(!stage.exists());
+    assert_eq!(fs::read(&unowned).unwrap(), b"not owned");
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    let after = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+    assert_eq!(after.rev, current.rev + 1);
+    assert_eq!(
+        json!(
+            store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap()
+                .history
+        ),
+        json!(original)
+    );
+    store
+        .acquire_source_mutation_barrier(&source_set, "fixture:after-native-recovery")
+        .unwrap()
+        .settle(aw_store::SourceMutationOutcome::Settled)
+        .unwrap();
+    drop(store);
+
+    // Terminal release replay is original immutable evidence, not new
+    // inspection of a different Sandbox or a substituted artifact path.
+    wrong = recover_config.clone();
+    wrong["sandbox"] = json!("/d:wrong/i:wrong/p:wrong/s:wrong");
+    fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+    assert!(!recover().status.success());
+    fs::write(&recovery_path, serde_json::to_vec(&recover_config).unwrap()).unwrap();
+    let moved = root.join("temporarily-hidden-checkout");
+    fs::rename(&repo, &moved).unwrap();
+    let output = recover();
+    fs::rename(&moved, &repo).unwrap();
+    assert!(
+        output.status.success(),
+        "terminal replay probed Git: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    assert_eq!(
+        store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
+        after
+    );
+    assert!(store
+        .sandbox_recover_tool_source_effect_exact(
+            &manager,
+            &reference,
+            5,
+            "write-recovery",
+            aw_store::SandboxToolRecoverySelection {
+                driver: &aw_agent_core::DriverKey::builtin("other-driver").unwrap(),
+                sandbox_ref: Some(&sandbox.canonical_ref),
+            },
+            |_| panic!("foreign driver cannot consume original release"),
+        )
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     assert_eq!(git(&["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
     assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"fixture data");

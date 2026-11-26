@@ -538,6 +538,14 @@ pub struct SandboxToolRecovery {
     pub sources: Vec<EffectiveSourceBinding>,
 }
 
+/// Trusted recovery consumer's exact original effect scope. A
+/// driver-specific consumer cannot accidentally replay another driver's
+/// release or use its recorded quiescence as this driver's proof.
+pub struct SandboxToolRecoverySelection<'a> {
+    pub driver: &'a DriverKey,
+    pub sandbox_ref: Option<&'a str>,
+}
+
 fn authorize_recovery_in(
     tx: &Transaction<'_>,
     manager: &PrincipalId,
@@ -568,10 +576,115 @@ fn require_current_sandbox_in(tx: &Connection, key: AgentKey<'_>, claim: &Claim)
     Ok(())
 }
 
-/// Exclusive owner restart may expose held source-bearing metadata for
-/// original journal recovery. Every unresolved Run in the Session must
-/// have its own exact source-effect provenance. This is not new admission
-/// or physical proof, and does not require an installed SourceDriver.
+/// A source-bearing Run can also stop before its first tool intent.
+/// Recover that exact original direct owner Input without inventing a
+/// source claim. No missing/unclaimed tool intent is interpreted as
+/// physical no-start proof.
+fn require_pre_tool_run_in(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+    run: &str,
+    turn: u64,
+) -> Result<()> {
+    let scope = StoreScope::load(c)?;
+    let row: Option<(String, u64, u64, String, String)> = db(c
+        .query_row(
+            "SELECT r.produced_from_head,r.produced_from_revision,
+                r.produced_from_writer_epoch,r.prompt_node,r.identity_json
+         FROM runs r
+         JOIN local_process_incarnations p ON p.process_id=r.owner_process_id
+         JOIN llm_operations o ON o.id=r.operation_id
+         WHERE r.id=?1 AND r.session_id=?2 AND r.branch_id=?3 AND r.turn_id=?4
+           AND r.possible_effect=0 AND r.attempt_no=1
+           AND r.owner_store_generation=?5 AND p.store_generation=?5
+           AND p.store_id=?6 AND p.process_kind='owner_lock'
+           AND o.routing_operation_id IS NULL
+           AND NOT EXISTS(SELECT 1 FROM web_requests w WHERE w.native_run_id=r.id)
+           AND NOT EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled')
+           AND NOT EXISTS(SELECT 1 FROM run_events e WHERE e.run_id=r.id
+                          AND e.kind IN ('tool_started','tool_finished','tool_revised'))",
+            params![
+                run,
+                session,
+                branch,
+                turn,
+                scope.restore_generation(),
+                scope.id().as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional())?;
+    let (head, rev, epoch, prompt_node, identity) = row.ok_or(Error::Denied(
+        "unresolved Run has no original source custody or exact pre-tool admission",
+    ))?;
+    let identity: InvocationIdentity = crate::decode(&identity)?;
+    let prompt = crate::node_in(c, session, &prompt_node)?;
+    if prompt.kind != "prompt"
+        || prompt.parent_id.as_deref() != Some(head.as_str())
+        || prompt.actor != identity.actor
+        || prompt.payload["turn_id"].as_u64() != Some(turn)
+        || !crate::principal_is_session_owner(c, session, &identity.actor)?
+    {
+        return Err(Error::Denied(
+            "pre-tool Run differs from its original owner Input",
+        ));
+    }
+    let input = crate::actor_admission::source_dispatch_in(
+        c,
+        session,
+        branch,
+        &head,
+        rev,
+        turn,
+        epoch,
+        prompt.payload["prompt"]
+            .as_str()
+            .ok_or(Error::Storage("source Run prompt unavailable"))?,
+        false,
+    )?;
+    if input.sender != input.target {
+        return Err(Error::Denied("pre-tool Run is not a direct owner Input"));
+    }
+    // A crash before the first segment is valid; any recorded segment
+    // must still be the original owner Input, never participant/control.
+    let mut query = db(c.prepare_cached(
+        "SELECT payload FROM run_events WHERE run_id=?1
+           AND kind='authority_segment_started' ORDER BY seq LIMIT 2",
+    ))?;
+    let mut rows = db(query.query([run]))?;
+    if let Some(row) = db(rows.next())? {
+        let JournalEntry::AuthoritySegmentStarted { segment } =
+            crate::decode(&db(row.get::<_, String>(0))?)?
+        else {
+            return Err(Error::Storage("invalid original AuthoritySegment"));
+        };
+        segment.validate()?;
+        if segment.ordinal != 1
+            || segment.evidence.is_some()
+            || segment.boundary != aw_agent_core::AuthorityBoundaryKind::Input
+            || segment.boundary_id != format!("input:{}:{}", input.message_id, input.message_id)
+            || db(rows.next())?.is_some()
+        {
+            return Err(Error::Denied("pre-tool Run has another authority segment"));
+        }
+    }
+    Ok(())
+}
+
+/// Exclusive owner restart may expose source-bearing metadata for
+/// original journal recovery. Each unresolved Run must have its own
+/// original source custody, or prove the exact direct pre-tool Input.
+/// This is not new admission or physical proof, and does not require
+/// an installed SourceDriver.
 pub(crate) fn require_owner_recovery_in(
     c: &Connection,
     session: &str,
@@ -638,9 +751,7 @@ pub(crate) fn require_owner_recovery_in(
             require_current_sandbox_in(c, key, &claim)?;
         }
         if count == 0 {
-            return Err(Error::Denied(
-                "unresolved Run has no original source custody",
-            ));
+            require_pre_tool_run_in(c, session, &branch, &run, turn)?;
         }
     }
     Ok(())
@@ -805,6 +916,37 @@ impl SessionStore {
         call_id: &str,
         inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
     ) -> Result<SandboxEffectOutcome> {
+        self.recover_tool_source_effect_in(manager, agent_ref, turn_id, call_id, None, inspect)
+    }
+
+    pub fn sandbox_recover_tool_source_effect_exact(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+        selection: SandboxToolRecoverySelection<'_>,
+        inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
+    ) -> Result<SandboxEffectOutcome> {
+        self.recover_tool_source_effect_in(
+            manager,
+            agent_ref,
+            turn_id,
+            call_id,
+            Some(selection),
+            inspect,
+        )
+    }
+
+    fn recover_tool_source_effect_in(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+        selection: Option<SandboxToolRecoverySelection<'_>>,
+        inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
+    ) -> Result<SandboxEffectOutcome> {
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "source effect recovery requires the exclusive Store owner",
@@ -816,6 +958,16 @@ impl SessionStore {
                 db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
             let (observed, claim) =
                 authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id)?;
+            if selection.is_some_and(|selection| {
+                &claim.driver != selection.driver
+                    || selection
+                        .sandbox_ref
+                        .is_some_and(|reference| reference != claim.sandbox_ref)
+            }) {
+                return Err(Error::Denied(
+                    "source effect recovery differs from original driver or Sandbox",
+                ));
+            }
             let (terminal_ref, terminal) = terminal_in(&tx, &observed)?;
             if let Some(outcome) = released_in(&tx, &observed, &terminal_ref)? {
                 return Ok(outcome);

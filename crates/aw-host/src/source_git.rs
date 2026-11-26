@@ -22,7 +22,8 @@ use aw_git::{
 };
 use aw_store::{
     SandboxEffectAuthority, SandboxEffectOutcome, SandboxExecution, SandboxGrantStatus,
-    SandboxSnapshot, SandboxToolRecovery, SessionStore, VersionedSourceBinding,
+    SandboxSnapshot, SandboxToolRecovery, SandboxToolRecoverySelection, SessionStore,
+    VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
 use aw_tools_adapter::{
@@ -585,15 +586,71 @@ impl GitNativeSourceResolver {
         target: NativeSourceRecoveryTarget<'_>,
         authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
     ) -> Result<SandboxEffectOutcome> {
+        Self::recover_in(
+            &self.store,
+            manager,
+            target,
+            SandboxToolRecoverySelection {
+                driver: &native.descriptor().driver,
+                sandbox_ref: None,
+            },
+            || {
+                registry.reader()?.get(native)?;
+                Ok(self.driver.clone())
+            },
+            authorize,
+        )
+    }
+
+    /// Exact offline consumer. Acquire registered actual drivers only
+    /// for missing physical proof; original terminal replay needs neither
+    /// Git discovery nor access to old artifact directories.
+    pub fn recover_configured<F: crate::source_checkpoint::GitSourceFence>(
+        store: &SessionStore,
+        manager: &PrincipalId,
+        target: NativeSourceRecoveryTarget<'_>,
+        sandbox: &str,
+        authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
+    ) -> Result<SandboxEffectOutcome> {
+        let key = aw_agent_core::DriverKey::builtin("native-filesystem")?;
+        Self::recover_in(
+            store,
+            manager,
+            target,
+            SandboxToolRecoverySelection {
+                driver: &key,
+                sandbox_ref: Some(sandbox),
+            },
+            || {
+                let registry = SandboxDriverRegistry::new();
+                let native = registry.register(key.clone(), NativeFilesystemDriver)?;
+                registry.reader()?.get(&native)?;
+                store.source_driver_handle::<GitSourceDriver>(&aw_agent_core::DriverKey::builtin(
+                    "git",
+                )?)
+            },
+            authorize,
+        )
+    }
+
+    fn recover_in<F: crate::source_checkpoint::GitSourceFence>(
+        store: &SessionStore,
+        manager: &PrincipalId,
+        target: NativeSourceRecoveryTarget<'_>,
+        selection: SandboxToolRecoverySelection<'_>,
+        git: impl FnOnce() -> Result<SourceDriverHandle<GitSourceDriver>>,
+        authorize: impl FnOnce(&SandboxToolRecovery) -> Result<(F, PathBuf)>,
+    ) -> Result<SandboxEffectOutcome> {
+        let expected_driver = selection.driver;
         let mut held = None;
         let mut physical = None;
-        let result = self.store.sandbox_recover_tool_source_effect(
+        let result = store.sandbox_recover_tool_source_effect_exact(
             manager,
             target.agent_ref,
             target.turn_id,
             target.call_id,
+            selection,
             |recovery| {
-                registry.reader()?.get(native)?;
                 let tool = FsTool::from_name(&recovery.original.call.name).ok_or(Error::Denied(
                     "original effect is not a native filesystem tool",
                 ))?;
@@ -602,7 +659,7 @@ impl GitNativeSourceResolver {
                 } else {
                     ToolEffect::Write
                 };
-                if recovery.driver != native.descriptor().driver
+                if &recovery.driver != expected_driver
                     || recovery.original.effect != effect
                     || recovery.source != ToolSourceEvidence::trusted_host()
                     || tool == FsTool::Remove
@@ -611,6 +668,7 @@ impl GitNativeSourceResolver {
                         "original effect is not owned by this native driver",
                     ));
                 }
+                let git = git()?;
                 let (fence, state_root) = authorize(recovery)?;
                 held = Some(fence);
                 let locations = held
@@ -622,7 +680,7 @@ impl GitNativeSourceResolver {
                         "native recovery requires exact original source set",
                     ));
                 }
-                let sandbox = self.store.sandbox_get(manager, &recovery.sandbox_ref)?;
+                let sandbox = store.sandbox_get(manager, &recovery.sandbox_ref)?;
                 if locations.len() == 1
                     && locations[0].repository == sandbox.tool_root
                     && sandbox.sources.len() != 1
@@ -631,7 +689,7 @@ impl GitNativeSourceResolver {
                         "native recovery cannot grant a multi-source parent",
                     ));
                 }
-                let driver = self.store.source_driver(&self.driver)?;
+                let driver = store.source_driver(&git)?;
                 let mut repos = Vec::with_capacity(locations.len());
                 for (source, location) in recovery.sources.iter().zip(locations) {
                     if source.binding.binding.name != location.name {
@@ -643,7 +701,7 @@ impl GitNativeSourceResolver {
                         &location.repository,
                         locations.len(),
                     )?;
-                    if &source.binding.binding.driver != self.driver.driver() {
+                    if &source.binding.binding.driver != git.driver() {
                         return Err(Error::Denied(
                             "Git source identity differs from registered driver",
                         ));

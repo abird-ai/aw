@@ -13,6 +13,8 @@ mod device;
 #[cfg(feature = "workspace")]
 mod git_maintenance;
 #[cfg(feature = "workspace")]
+mod native_source_recovery;
+#[cfg(feature = "workspace")]
 mod native_source_root;
 mod private_approval;
 mod resource_cli_args;
@@ -183,6 +185,14 @@ enum TopCommand {
     SandboxRetention {
         /// Private host approval. Requires an already-closed Sandbox and
         /// independent exclusion of all other layout and Git backing users.
+        approval: PathBuf,
+    },
+    /// Offline recovery of one exact native source effect, never replay a tool.
+    #[cfg(feature = "workspace")]
+    NativeSourceRecover {
+        /// Private approval in the original artifact state directory. The
+        /// operator must independently exclude all surviving/external
+        /// writers and preserve the original namespace and layout.
         approval: PathBuf,
     },
     /// Inspect and navigate durable Sessions.
@@ -1793,6 +1803,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::CheckpointRetention { approval } => checkpoint_retention::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxRetention { approval } => sandbox_retention::run(&approval),
+        #[cfg(feature = "workspace")]
+        TopCommand::NativeSourceRecover { approval } => native_source_recovery::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxDerive { args } => sandbox_derive::run(args),
         #[cfg(feature = "workspace")]
