@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: original claim-gated native no-start recovery (this checkpoint; local parent `7ea0980b07fc9e14556d284435fd7dbf5bb96140`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: exact linked Git native artifact recovery (this checkpoint; local parent `15f4f1678be1ba1b51edb79f12bc0e965e908215`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1693,9 +1693,24 @@ Current implementation: original claim-gated native no-start recovery (this chec
       2/2, core journal 14/14, router 3/3, SQLite/JSONL provenance 1/1 each;
       strict affected Clippy, durable/minimal checks, actual version/help
       and scoped fmt/diff passed.
-      **Next:** linked-layout and independent Process recovery proof;
-      unmarked legacy native/Process no-start remains held. Separately
-      qualify legacy participant
+      **Exact linked Git native recovery landed:** existing offline effect
+      recovery accepts v2 independently approved private standard linked
+      worktree backing; v1 ordinary layout unchanged. Canonical root,
+      common/worktree admin and objects identity pins, bounded single-link
+      mapping/backlink checks before Git discovery, disjoint private
+      backing; original driver binding/source stamp still authoritative.
+      Hold independent approval and original driver/capability pins
+      through settlement, reopen only existing original artifact namespace,
+      exact cleanup/release and terminal replay without old backing.
+      Actual executable ordinary+linked grouped lifecycle, altered marker/
+      wrong ID/substituted backing refusal, original artifact custody and
+      both Git indexes preserved, whole-Run and next Input unchanged.
+      Executable 1/1 (both layouts), Host native/Process 2/2, strict
+      affected Clippy, durable/minimal all-target checks, version/help
+      and scoped fmt/diff passed.
+      **Next:** independent Process quiescence and recovery proof;
+      nonstandard/overlapping linked layouts and unmarked legacy native/
+      Process no-start remain held. Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

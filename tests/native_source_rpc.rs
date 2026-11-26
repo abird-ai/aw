@@ -165,6 +165,11 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
 
 #[test]
 fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
+    exercise_native_root_stdio(false);
+    exercise_native_root_stdio(true);
+}
+
+fn exercise_native_root_stdio(linked: bool) {
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).unwrap();
     let temp = Temp(std::env::temp_dir().join(format!(
@@ -177,16 +182,21 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     let repo = root.join("repo");
     let initial = root.join("initial");
     let approvals = root.join("approval");
-    for path in [&state, &repo, &initial, &approvals] {
+    let backing = if linked {
+        root.join("backing")
+    } else {
+        repo.clone()
+    };
+    for path in [&state, &backing, &initial, &approvals] {
         aw_platform::ensure_private_dir(path).unwrap();
     }
     let executable = std::env::var_os("AW_GIT")
         .map(PathBuf::from)
         .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from))
         .expect("trusted Git executable");
-    let git = |args: &[&str]| {
+    let git_at = |path: &Path, args: &[&str]| {
         let output = Command::new(&executable)
-            .current_dir(&repo)
+            .current_dir(path)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(args)
@@ -202,14 +212,46 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
             .trim_end()
             .to_owned()
     };
-    git(&["init", "-q"]);
-    git(&["config", "user.name", "Fixture"]);
-    git(&["config", "user.email", "fixture@example.invalid"]);
-    fs::write(repo.join("tracked"), b"fixture data").unwrap();
-    git(&["add", "tracked"]);
-    git(&["commit", "--no-gpg-sign", "-qm", "fixture"]);
+    git_at(&backing, &["init", "-q"]);
+    git_at(&backing, &["config", "user.name", "Fixture"]);
+    git_at(
+        &backing,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    fs::write(backing.join("tracked"), b"fixture data").unwrap();
+    git_at(&backing, &["add", "tracked"]);
+    git_at(&backing, &["commit", "--no-gpg-sign", "-qm", "fixture"]);
+    if linked {
+        use std::os::unix::fs::PermissionsExt;
+        git_at(
+            &backing,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                repo.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let git = |args: &[&str]| git_at(&repo, args);
     let head = git(&["rev-parse", "HEAD"]);
-    let index = fs::read(repo.join(".git/index")).unwrap();
+    let git_dir = PathBuf::from(git(&["rev-parse", "--absolute-git-dir"]));
+    let common_dir = PathBuf::from(git(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]));
+    let index = fs::read(git_dir.join("index")).unwrap();
+    let backing_index = fs::read(common_dir.join("index")).unwrap();
+    let linked_markers = linked.then(|| {
+        [
+            fs::read(repo.join(".git")).unwrap(),
+            fs::read(git_dir.join("commondir")).unwrap(),
+            fs::read(git_dir.join("gitdir")).unwrap(),
+        ]
+    });
 
     let (url, calls, provider) = fixture_provider();
     let mut profile = config::builtins().remove("llama").unwrap();
@@ -883,7 +925,7 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     );
     let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
     assert_eq!(current.rev, sandbox_before.rev);
-    let recover_config = json!({
+    let mut recover_config = json!({
         "version":1,"store_directory":state,"store_id":store_id,"store_generation":store_generation,
         "manager":manager,"agent":reference,"sandbox":sandbox.canonical_ref,"turn":5,"call":"write-recovery",
         "base":repo,"base_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap(),
@@ -891,6 +933,20 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         "repositories":[{"location":{"name":name,"repository":repo,"repository_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap()},
             "binding_rev":current.sources[0].binding_rev,"access":"read_write"}]
     });
+    if linked {
+        let identity = |path: &Path| {
+            aw_platform::DirectoryIdentity::open(path)
+                .unwrap()
+                .identity()
+                .unwrap()
+        };
+        recover_config["version"] = json!(2);
+        recover_config["repositories"][0]["linked"] = json!({
+            "git_directory":git_dir,"git_identity":identity(&git_dir),
+            "common_directory":common_dir,"common_identity":identity(&common_dir),
+            "objects_identity":identity(&common_dir.join("objects")),
+        });
+    }
     drop(store);
     // A read release cannot clear the unresolved write or its Run.
     assert!(!reconcile(5).status.success());
@@ -931,6 +987,92 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
     assert!(!recover().status.success());
     assert!(stage.is_file());
+    if let Some(markers) = &linked_markers {
+        // A linked checkout is never implicitly authorized by the ordinary
+        // v1 layout, or by an otherwise correct root identity alone.
+        let mut ordinary = recover_config.clone();
+        ordinary["version"] = json!(1);
+        ordinary["repositories"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("linked");
+        fs::write(&recovery_path, serde_json::to_vec(&ordinary).unwrap()).unwrap();
+        assert!(!recover().status.success());
+        assert!(stage.is_file());
+        for field in ["git_identity", "common_identity", "objects_identity"] {
+            let mut wrong = recover_config.clone();
+            wrong["repositories"][0]["linked"][field] = json!([0, 0]);
+            fs::write(&recovery_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+            assert!(
+                !recover().status.success(),
+                "wrong linked identity: {field}"
+            );
+            assert!(stage.is_file());
+        }
+        fs::write(&recovery_path, serde_json::to_vec(&recover_config).unwrap()).unwrap();
+        // The independently approved paths must match the original pointer,
+        // common mapping and reciprocal backlink before any Git discovery.
+        for (path, original) in [
+            repo.join(".git"),
+            git_dir.join("commondir"),
+            git_dir.join("gitdir"),
+        ]
+        .iter()
+        .zip(markers)
+        {
+            fs::write(path, b"unapproved mapping\n").unwrap();
+            let refused = recover();
+            fs::write(path, original).unwrap();
+            assert!(
+                !refused.status.success(),
+                "changed linked mapping: {path:?}"
+            );
+            assert!(stage.is_file());
+        }
+        // Even freshly approved observations cannot replace the original
+        // durable Git identity. Move the original object contents to a
+        // different directory object at the same path, then restore it.
+        let objects = common_dir.join("objects");
+        let saved = common_dir.join("fixture-original-objects");
+        fs::rename(&objects, &saved).unwrap();
+        fs::create_dir(&objects).unwrap();
+        let move_entries = |from: &Path, to: &Path| {
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                fs::rename(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        };
+        move_entries(&saved, &objects);
+        let mut substituted = recover_config.clone();
+        substituted["repositories"][0]["linked"]["objects_identity"] =
+            json!(aw_platform::DirectoryIdentity::open(&objects)
+                .unwrap()
+                .identity()
+                .unwrap());
+        fs::write(&recovery_path, serde_json::to_vec(&substituted).unwrap()).unwrap();
+        let refused = recover();
+        move_entries(&objects, &saved);
+        fs::remove_dir(&objects).unwrap();
+        fs::rename(&saved, &objects).unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("Git source or materialization identity changed"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(stage.is_file());
+        assert_eq!(fs::read(common_dir.join("index")).unwrap(), backing_index);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        assert_eq!(
+            store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
+            current
+        );
+        assert!(store
+            .acquire_source_mutation_barrier(&source_set, "fixture:linked-proof-refused")
+            .is_err());
+    }
     fs::write(&recovery_path, serde_json::to_vec(&recover_config).unwrap()).unwrap();
     let output = recover();
     assert!(
@@ -971,8 +1113,15 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     assert!(!recover().status.success());
     fs::write(&recovery_path, serde_json::to_vec(&recover_config).unwrap()).unwrap();
     let moved = root.join("temporarily-hidden-checkout");
+    let moved_backing = root.join("temporarily-hidden-backing");
     fs::rename(&repo, &moved).unwrap();
+    if linked {
+        fs::rename(&backing, &moved_backing).unwrap();
+    }
     let output = recover();
+    if linked {
+        fs::rename(&moved_backing, &backing).unwrap();
+    }
     fs::rename(&moved, &repo).unwrap();
     assert!(
         output.status.success(),
@@ -1085,6 +1234,15 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     assert_eq!(view.history.turns[5].prompt, "next input only");
     assert_eq!(json!(view.history.turns[..5]), json!(original.turns));
     assert_eq!(git(&["rev-parse", "HEAD"]), head);
-    assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(git_dir.join("index")).unwrap(), index);
+    assert_eq!(fs::read(common_dir.join("index")).unwrap(), backing_index);
     assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"fixture data");
+    if let Some(markers) = linked_markers {
+        assert_eq!(fs::read(repo.join(".git")).unwrap(), markers[0]);
+        assert_eq!(fs::read(git_dir.join("commondir")).unwrap(), markers[1]);
+        assert_eq!(fs::read(git_dir.join("gitdir")).unwrap(), markers[2]);
+        assert_eq!(git_at(&backing, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read(backing.join("tracked")).unwrap(), b"fixture data");
+        assert!(!backing.join("created").exists());
+    }
 }

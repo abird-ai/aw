@@ -513,13 +513,15 @@ impl GitNativeSourceResolver {
             repos.push(repo);
         }
         let exclusions = git_layout_exclusions(&repos)?;
-        Self::pin_verified_layout(base, roots, repos, exclusions, false)
+        let layout = Self::pin_verified_layout(base, roots, exclusions, false);
+        // Keep verified Git pins through actual capability preparation.
+        drop(repos);
+        layout
     }
 
     fn pin_verified_layout(
         base: &Path,
         roots: Vec<NativeSourceRoot>,
-        repos: Vec<Repository>,
         exclusions: Vec<ExclusionSpec>,
         recover: bool,
     ) -> Result<ApprovedSourceLayout> {
@@ -565,10 +567,7 @@ impl GitNativeSourceResolver {
                 }
             }
         }
-        let layout = ApprovedSourceLayout::pin(base, roots, exclusions)?;
-        // Retain every checkout pin through actual capability preparation.
-        drop(repos);
-        Ok(layout)
+        ApprovedSourceLayout::pin(base, roots, exclusions)
     }
 
     /// Recover an original native tool only. Independent authorization must
@@ -731,11 +730,14 @@ impl GitNativeSourceResolver {
                     });
                 }
                 let layout =
-                    Self::pin_verified_layout(&sandbox.tool_root, roots, repos, exclusions, true)?;
-                physical = Some(layout);
+                    Self::pin_verified_layout(&sandbox.tool_root, roots, exclusions, true)?;
+                // Retain the original driver's checkout and administration
+                // identities alongside the capability through settlement.
+                physical = Some((layout, repos));
                 physical
                     .as_ref()
                     .expect("pinned native recovery layout")
+                    .0
                     .reconcile_private_artifacts()?;
                 Ok(SandboxEffectOutcome::Settled)
             },

@@ -26,7 +26,78 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: original claim-gated native no-start recovery
+## Latest local implementation delta — 2026-11-26: exact linked Git native artifact recovery
+
+Parent `15f4f1678be1ba1b51edb79f12bc0e965e908215` (original claim-gated
+native no-start recovery). Published AW main remains `7b92686`. L5, clean
+at entry; Store v60, Git recovery v4 and product 0.15.0 unchanged.
+
+- Extend the existing offline `native-source-recover` consumer only.
+  Private approval v1 remains the ordinary-checkout path unchanged.
+  V2 requires at least one repository with an explicit `linked` object:
+  `{git_directory,git_identity,common_directory,common_identity,objects_identity}`
+  alongside the existing exact `location`, `binding_rev`, `access`,
+  original Store/Agent/Sandbox/Turn/call/base/artifact-root identities.
+  Each identity is a volume/object pair. Ordinary siblings may omit
+  `linked`; v1 cannot implicitly admit a linked checkout. No database
+  schema, new effect owner, grant, or frozen Sandbox change.
+- First linked cut deliberately supports the standard canonical absolute
+  `.git` worktree pointer, per-worktree admin as direct child of
+  `<common>/worktrees`, `commondir` equal to `../..`, and exact reciprocal
+  absolute `gitdir` backlink. The common directory is `.git` beneath a
+  separately approved private ordinary backing checkout disjoint from
+  the complete native execution base, Store and artifact state. Require
+  canonical directory paths, pinned checkout/common/admin/object IDs,
+  nonaliasing observations and single-link bounded regular mapping
+  files. Compare mapping bytes without following a different pointer.
+  Reject nested common-directory indirection. Relative/nonstandard
+  mappings, bare or overlapping backing layouts, aliases and unproven
+  external/mount writers are not promoted. Operator independently
+  guarantees permanent original worker quiescence and exclusive
+  protection of all selected checkout/backing/artifact users through
+  recovery; observations and advisory lock are not OS containment.
+- Acquire the approved physical fence only after the original Store
+  recovery owner authorizes the complete original effect selection.
+  The actual Git SourceDriver independently verifies the durable
+  materialization/source stamp (root, per-worktree admin, common and
+  objects); new observed IDs cannot authorize a substituted backing.
+  Reopen only the existing source-owned artifact namespace at the
+  independently approved original state directory. Retain the host
+  approval lease and layout pins, and the driver's verified Repository
+  pins with the existing native capability through original settlement.
+  Same protected Git exclusions and exact registered artifact cleanup,
+  no ambient discovery/adoption, worktree removal, retention changes,
+  tool repetition or broader Run/hazard acknowledgement. Immutable
+  released replay needs no old checkout, backing or physical proof.
+- Extend the existing real executable native-source RPC fixture to run
+  its original complete lifecycle for ordinary and actual linked
+  checkouts (private test fixture worktree, not a source-authoring
+  worktree). The actual process is killed after native write while
+  awaiting provider; original private Stage fault fixture remains.
+  Refuse v1-only linked approval, incorrect admin/common/object IDs,
+  each changed marker and a physically replaced object directory with
+  identical object contents and its correctly refreshed observed ID;
+  actual driver rejects the changed original identity. No artifact
+  cleanup or Sandbox revision on refusal; original barrier remains.
+  Correct v2 cleans only the registered artifact, preserves unowned
+  file, both Git indexes, HEAD/tracked content and all mapping files.
+  Terminal replay with both original checkout and backing absent;
+  original whole-Run reconciliation and next pending Input only.
+
+Validation (L5 Rust 1.95.0, locked/offline, final source): actual
+native_source_rpc 1/1 (34.19s, both physical layouts), Host native/Process
+2/2 (6.20s). Strict all-feature/all-target Host/CLI Clippy, durable-only
+and minimal all-target checks (feature-specific dead-code warnings),
+actual executable version/help and scoped fmt/diff passed. Full workspace,
+pinned Nix and other native-platform qualification not repeated.
+
+Next: independently evidenced Process quiescence/containment/recovery
+and actual source-aware Process/Job/Graph/extension dispatch through
+original runtime owners. Broader linked/backing layouts and legacy
+unmarked no-start remain held; no general physical containment claim.
+Phase 3 remains underway. Frozen dotlink unchanged.
+
+## Previous local implementation delta — 2026-11-26: original claim-gated native no-start recovery
 
 Parent `7ea0980b07fc9e14556d284435fd7dbf5bb96140` (reconciled handoff;
 previous implementation `a747e78`). Published AW main remains `7b92686`.

@@ -9,7 +9,12 @@ use aw_git::source_driver::{GitRestoreLocation, GitSourceLocation};
 use aw_host::source_checkpoint::GitRestoreFence;
 use aw_platform::DirectoryIdentity;
 use aw_store::SessionStore;
-use std::{fs::File, path::Path};
+use serde::Deserialize;
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 /// Canonical complete-set inputs, shared by the offline source owners.
 pub(crate) fn validate_named_locations(sources: &mut [GitSourceLocation]) -> Result<()> {
@@ -89,6 +94,142 @@ pub(crate) fn pin_private_checkout(
         Ok(_) => return Err(Error::Denied("separate Git common directory not approved")),
     }
     Ok([pin, admin_pin, objects_pin])
+}
+
+/// Independently approved backing of a standard linked Git worktree. These
+/// directory observations are not the durable SourceBinding or a grant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LinkedGitApproval {
+    git_directory: PathBuf,
+    git_identity: (u64, u64),
+    common_directory: PathBuf,
+    common_identity: (u64, u64),
+    objects_identity: (u64, u64),
+}
+
+/// A bounded, single-link regular Git mapping file; compare bytes without
+/// following any path named by untrusted worktree metadata.
+fn require_git_marker(path: &Path, expected: &[u8]) -> Result<()> {
+    const LIMIT: usize = 16 * 1024;
+    if expected.len() > LIMIT {
+        return Err(Error::Limit("Git mapping exceeds bound"));
+    }
+    let file = aw_platform::open_nofollow_read(path)?;
+    if !file.metadata()?.is_file() || aw_platform::file_link_count(&file)? != 1 {
+        return Err(Error::Denied(
+            "Git mapping must be a single-link regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes != expected {
+        return Err(Error::Conflict("approved linked Git mapping changed"));
+    }
+    Ok(())
+}
+
+/// First linked native recovery cut: a canonical absolute Git worktree
+/// pointer and backlink, ordinary private backing checkout, standard
+/// common/worktrees/<id> administration, and owned object storage. The
+/// host explicitly excludes all backing users, aliases and external writers.
+/// Do not broaden the ordinary-checkout maintenance consumers implicitly.
+pub(crate) fn pin_private_linked_checkout(
+    location: &GitSourceLocation,
+    approved: &LinkedGitApproval,
+    base: &Path,
+    protected: &[&Path],
+) -> Result<Vec<DirectoryIdentity>> {
+    let root = &location.repository;
+    let common = &approved.common_directory;
+    let git_dir = &approved.git_directory;
+    let backing = common
+        .parent()
+        .ok_or(Error::Denied("linked Git backing has no checkout"))?;
+    let worktrees = common.join("worktrees");
+    let objects = common.join("objects");
+    if common.file_name().and_then(|n| n.to_str()) != Some(".git")
+        || git_dir.parent() != Some(worktrees.as_path())
+        || !git_dir.is_absolute()
+        || overlaps(base, backing)
+        || protected
+            .iter()
+            .any(|path| overlaps(root, path) || overlaps(backing, path))
+    {
+        return Err(Error::Denied(
+            "linked Git recovery requires a disjoint approved backing layout",
+        ));
+    }
+    canonical_private_directory(root)?;
+    canonical_private_directory(backing)?;
+    // Never probe an unapproved marker target. Only these explicitly selected
+    // directories are opened, and all known identities are checked first.
+    let paths = [
+        root.as_path(),
+        backing,
+        common.as_path(),
+        worktrees.as_path(),
+        git_dir.as_path(),
+        objects.as_path(),
+    ];
+    let expected = [
+        Some(location.repository_identity),
+        None,
+        Some(approved.common_identity),
+        None,
+        Some(approved.git_identity),
+        Some(approved.objects_identity),
+    ];
+    let mut pins = Vec::with_capacity(paths.len());
+    let mut identities = std::collections::BTreeSet::new();
+    for path in protected.iter().copied().chain(std::iter::once(base)) {
+        // The single-source base may be this very checkout. Other physical
+        // aliases into private host state are never approved.
+        if path != root {
+            identities.insert(DirectoryIdentity::open(path)?.identity()?);
+        }
+    }
+    for (path, expected) in paths.into_iter().zip(expected) {
+        if path.canonicalize()? != path {
+            return Err(Error::Denied(
+                "linked Git recovery requires canonical directories",
+            ));
+        }
+        let pin = DirectoryIdentity::open(path)?;
+        let identity = pin.identity()?;
+        if expected.is_some_and(|expected| expected != identity) || !identities.insert(identity) {
+            return Err(Error::Conflict(
+                "approved linked Git directory changed or aliases host state",
+            ));
+        }
+        pins.push(pin);
+    }
+    let git_dir_text = git_dir
+        .to_str()
+        .ok_or(Error::Denied("linked Git mapping requires UTF-8 paths"))?;
+    let dotgit = root.join(".git");
+    let dotgit_text = dotgit
+        .to_str()
+        .ok_or(Error::Denied("linked Git mapping requires UTF-8 paths"))?;
+    require_git_marker(&dotgit, format!("gitdir: {git_dir_text}\n").as_bytes())?;
+    require_git_marker(&git_dir.join("commondir"), b"../..\n")?;
+    require_git_marker(
+        &git_dir.join("gitdir"),
+        format!("{dotgit_text}\n").as_bytes(),
+    )?;
+    match std::fs::symlink_metadata(common.join("commondir")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Err(Error::Denied("nested Git common directory not approved")),
+    }
+    for (pin, path) in pins.iter().zip(paths) {
+        if !pin.is_current(path)? {
+            return Err(Error::Conflict(
+                "approved linked Git layout changed during pinning",
+            ));
+        }
+    }
+    Ok(pins)
 }
 
 /// Common lexical preflight for the approved private destination.

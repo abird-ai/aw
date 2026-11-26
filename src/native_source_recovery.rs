@@ -6,7 +6,7 @@
 //! exclusive Store/approval lock are not a kernel containment proof.
 use crate::git_maintenance::{
     canonical_private_directory, open_private_approval, overlaps, pin_private_checkout,
-    require_existing_store, require_store_scope,
+    pin_private_linked_checkout, require_existing_store, require_store_scope, LinkedGitApproval,
 };
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::{validate_source_set_hard_limit, SourceAccess};
@@ -29,6 +29,9 @@ struct Repository {
     location: GitSourceLocation,
     binding_rev: u64,
     access: SourceAccess,
+    /// V2: explicit independent linked-worktree administration/backing.
+    #[serde(default)]
+    linked: Option<LinkedGitApproval>,
 }
 
 #[derive(Deserialize)]
@@ -74,7 +77,8 @@ impl Approval {
         let root = path.parent().ok_or(Error::Denied(
             "native recovery approval requires its original artifact directory",
         ))?;
-        if config.version != 1
+        let has_linked = config.repositories.iter().any(|repo| repo.linked.is_some());
+        if !matches!((config.version, has_linked), (1, false) | (2, true))
             || &config.manager != manager
             || config.store_generation == 0
             || config.turn == 0
@@ -188,10 +192,14 @@ impl Approval {
                     "native recovery requires the original named checkout layout",
                 ));
             }
-            // First production consumer is limited to private ordinary
-            // checkouts. The actual Git driver also checks its original
-            // materialization/backing identity and protected admin paths.
-            pins.extend(pin_private_checkout(location, &protected)?);
+            // Independently pinned physical approval precedes the original
+            // driver's materialization proof and artifact inspection.
+            match &repository.linked {
+                Some(linked) => pins.extend(pin_private_linked_checkout(
+                    location, linked, &c.base, &protected,
+                )?),
+                None => pins.extend(pin_private_checkout(location, &protected)?),
+            }
             locations.push(location.clone());
         }
         Ok(Fence {
