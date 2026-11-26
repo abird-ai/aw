@@ -1377,6 +1377,9 @@ impl SessionHandle {
         let mut c = self.store.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         authorize(&tx, &self.session, &self.actor, true)?;
+        // A generic note is not complete original source-effect proof.
+        // Source-bearing Turns have their exact Run reconciliation owner.
+        crate::sandbox_owner::require_execution_in(&tx, &self.session)?;
         let n: i64 = db(tx.query_row(
             "SELECT count(*) FROM runs WHERE session_id=?1 AND status='running'",
             [&self.session],

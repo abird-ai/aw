@@ -65,7 +65,7 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let counter = calls.clone();
     let thread = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(180);
-        while counter.load(Ordering::SeqCst) < 10 {
+        while counter.load(Ordering::SeqCst) < 12 {
             assert!(Instant::now() < deadline, "provider fixture deadline");
             let (mut socket, _) = match listener.accept() {
                 Ok(value) => value,
@@ -112,7 +112,7 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
             names.sort_unstable();
             assert_eq!(names, ["read", "write"]);
             let ordinal = counter.fetch_add(1, Ordering::SeqCst);
-            if matches!(ordinal, 6 | 7) {
+            if matches!(ordinal, 6 | 7 | 10) {
                 // A real dispatched provider attempt: withdraw or kill the
                 // owning process while waiting, without a fabricated reply.
                 let _ = socket.read(&mut [0u8; 1]);
@@ -120,11 +120,16 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
             }
             let (delta, reason) = match ordinal {
                 8 => (
+                    json!({"tool_calls":[{"index":0,"id":"read-recovery","type":"function",
+                    "function":{"name":"read","arguments":json!({"path":"tracked"}).to_string()}}]}),
+                    "tool_calls",
+                ),
+                9 => (
                     json!({"tool_calls":[{"index":0,"id":"write-recovery","type":"function",
                     "function":{"name":"write","arguments":json!({"path":"created","content":"recovery write"}).to_string()}}]}),
                     "tool_calls",
                 ),
-                9 => (json!({"content":"done after write"}), "stop"),
+                11 => (json!({"content":"next input only"}), "stop"),
                 _ => match ordinal % 3 {
                     0 => (
                         json!({"tool_calls":[{"index":0,"id":format!("read-{ordinal}"),"type":"function",
@@ -703,37 +708,69 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
     let input_id = aw_store::queued_input_request_id(&session, "fixture-fourth");
     let input = store.actor_input_fact(&owner, &session, &input_id).unwrap();
     assert_eq!(input.state, aw_store::InputAdmissionState::Dispatching);
-    // The fixture's explicit original Input/queue disposition is not a
-    // paid-attempt retry or evidence that the provider did no work.
-    let epoch = store
-        .workspace_writer(
-            &owner,
-            None,
-            &store.session(&owner, &session).unwrap().workspace_id,
-        )
-        .unwrap()
-        .writer_epoch;
-    store
-        .actor_input_inspect(
-            &owner,
-            &session,
-            &input_id,
-            epoch,
-            "fixture owner reaped; provider result remains unknown",
-        )
-        .unwrap();
-    store
-        .actor_queue_inspect(
-            &owner,
-            &session,
-            "fixture-fourth",
-            epoch,
-            "original interrupted Turn retained; never replay",
-        )
-        .unwrap();
     let sandbox_before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
     let store_id = store.store_id().unwrap();
     let store_generation = store.local_process_info().unwrap().store_generation;
+    drop(store);
+    let reconcile = |turn: u64| {
+        Command::new(env!("CARGO_BIN_EXE_aw"))
+            .env("AW_GIT", &executable)
+            .args(["native-turn-reconcile", "--state-dir"])
+            .arg(&state)
+            .arg(&reference)
+            .arg(turn.to_string())
+            .output()
+            .unwrap()
+    };
+    let disposition = |output: Output| -> Value {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    assert!(!reconcile(99).status.success());
+    let result = disposition(reconcile(4));
+    assert_eq!(result["source_effects"], 0);
+    assert_eq!(result["hazard_cleared"], false);
+    assert_eq!(result["input"], "inspected");
+    assert_eq!(result["queue"], "inspected");
+    assert_eq!(result["changed"], true);
+    assert_eq!(disposition(reconcile(4))["changed"], false);
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    assert_eq!(
+        json!(
+            store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap()
+                .history
+        ),
+        json!(recovered.history)
+    );
+    assert_eq!(
+        store
+            .actor_input_fact(&owner, &session, &input_id)
+            .unwrap()
+            .state,
+        aw_store::InputAdmissionState::Inspected
+    );
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-fourth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Inspected
+    );
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-fifth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Pending
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     drop(store);
 
     // Fault fixture at the original durable Stage boundary (same lower
@@ -775,21 +812,39 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         drop(lease);
         fs::write(&unowned, b"not owned").unwrap();
     }
-    let fifth = frames(&invoke(
-        true,
-        Some(4),
-        None,
-        "read,write",
-        &[],
-        &[frame("write-step", "actor_step", json!({}))],
-    ));
-    assert_eq!(
-        settled(&fifth, "write-step")["status"],
-        "settled",
-        "{fifth:?}"
-    );
-    provider.join().unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    // Stop the original process after a native read and write, while
+    // the next provider attempt is in flight. The read is already
+    // released; the write has original unresolved artifact custody.
+    let mut child = spawn(true, Some(4), None, "read,write", &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        frame(
+            "sixth",
+            "actor_enqueue",
+            json!({"request_id":"fixture-sixth","message_id":70,"text":"next input only","priority":2}),
+        ),
+        frame("write-step", "actor_step", json!({})),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while calls.load(Ordering::SeqCst) != 11 {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            drop(stdin);
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "native mutation recovery fixture did not reach provider: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    drop(stdin);
+    assert!(!child.wait_with_output().unwrap().status.success());
+    assert_eq!(calls.load(Ordering::SeqCst), 11);
     assert_eq!(fs::read(repo.join("created")).unwrap(), b"recovery write");
     assert!(stage.is_file());
     let store =
@@ -803,6 +858,28 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         .read_agent_branch_view(&owner, &session, &branch)
         .unwrap()
         .history;
+    assert!(original.needs_reconciliation);
+    assert_eq!(original.turns[4].outcome, aw_agent_core::Outcome::Failed);
+    assert_eq!(original.turns[4].tool_records.len(), 2);
+    assert_eq!(
+        original.turns[4].invocations.last().unwrap().outcome,
+        "interrupted_unknown"
+    );
+    let write_input = aw_store::queued_input_request_id(&session, "fixture-fifth");
+    assert_eq!(
+        store
+            .actor_input_fact(&owner, &session, &write_input)
+            .unwrap()
+            .state,
+        aw_store::InputAdmissionState::Dispatching
+    );
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-fifth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Accepted
+    );
     let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
     assert_eq!(current.rev, sandbox_before.rev);
     let recover_config = json!({
@@ -813,6 +890,27 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         "repositories":[{"location":{"name":name,"repository":repo,"repository_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap()},
             "binding_rev":current.sources[0].binding_rev,"access":"read_write"}]
     });
+    drop(store);
+    // A read release cannot clear the unresolved write or its Run.
+    assert!(!reconcile(5).status.success());
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    assert_eq!(
+        json!(
+            store
+                .read_agent_branch_view(&owner, &session, &branch)
+                .unwrap()
+                .history
+        ),
+        json!(original)
+    );
+    assert_eq!(
+        store
+            .actor_input_fact(&owner, &session, &write_input)
+            .unwrap()
+            .state,
+        aw_store::InputAdmissionState::Dispatching
+    );
     drop(store);
     let recovery_path = approvals.join("recover.json");
     aw_platform::open_private_new(&recovery_path)
@@ -880,7 +978,8 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         "terminal replay probed Git: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
     assert_eq!(
         store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
         after
@@ -898,7 +997,91 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
             |_| panic!("foreign driver cannot consume original release"),
         )
         .is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    let before_reconcile = store.agent_get(&manager, &reference).unwrap();
+    assert!(
+        store
+            .read_agent_branch_view(&owner, &session, &branch)
+            .unwrap()
+            .history
+            .needs_reconciliation
+    );
+    drop(store);
+    let result = disposition(reconcile(5));
+    assert_eq!(result["source_effects"], 2);
+    assert_eq!(result["hazard_cleared"], true);
+    assert_eq!(result["input"], "inspected");
+    assert_eq!(result["queue"], "inspected");
+    assert_eq!(result["changed"], true);
+    let replay = disposition(reconcile(5));
+    assert_eq!(replay["changed"], false);
+    assert_eq!(replay["hazard_cleared"], false);
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+    let view = store
+        .read_agent_branch_view(&owner, &session, &branch)
+        .unwrap();
+    assert!(!view.history.needs_reconciliation);
+    assert_eq!(json!(view.history.turns), json!(original.turns));
+    assert_eq!(
+        store.agent_get(&manager, &reference).unwrap().rev,
+        before_reconcile.rev + 1
+    );
+    assert_eq!(
+        store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap(),
+        after
+    );
+    assert_eq!(
+        store
+            .actor_input_fact(&owner, &session, &write_input)
+            .unwrap()
+            .state,
+        aw_store::InputAdmissionState::Inspected
+    );
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-fifth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Inspected
+    );
+    assert_eq!(
+        store
+            .actor_queue_fact(&owner, &session, "fixture-sixth")
+            .unwrap()
+            .state,
+        aw_store::QueueState::Pending
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 11);
+    let grant = store.sandbox_grant_status(&manager, &reference).unwrap();
+    assert_eq!(grant.revision, 5);
+    drop(store);
+    approval["sandbox_rev"] = json!(after.rev);
+    fs::write(&approval_path, serde_json::to_vec(&approval).unwrap()).unwrap();
+    let next = frames(&invoke(
+        true,
+        Some(grant.revision),
+        None,
+        "read,write",
+        &[],
+        &[
+            frame("next-step", "actor_step", json!({})),
+            frame("next-idle", "actor_step", json!({})),
+        ],
+    ));
+    assert_eq!(
+        settled(&next, "next-step")["result"]["outcome"],
+        "completed"
+    );
+    assert_eq!(settled(&next, "next-idle")["status"], "idle");
+    provider.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
+    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    let view = store
+        .read_agent_branch_view(&owner, &session, &branch)
+        .unwrap();
+    assert_eq!(view.history.turns.len(), 6);
+    assert_eq!(view.history.turns[5].prompt, "next input only");
+    assert_eq!(json!(view.history.turns[..5]), json!(original.turns));
     assert_eq!(git(&["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
     assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"fixture data");

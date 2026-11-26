@@ -149,6 +149,20 @@ fn bindings_in(connection: &Connection, sandbox: &str) -> Result<Vec<StoredBindi
 
 /// Shared durable binding decoder; only independently approved typed
 /// identities are projected. Never serialize materialization locators.
+/// Durable identity for factual recovery, never a driver admission.
+pub(super) fn versioned_bindings_in(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<Vec<VersionedSourceBinding>> {
+    Ok(bindings_in(connection, sandbox)?
+        .into_iter()
+        .map(|stored| VersionedSourceBinding {
+            binding: stored.binding,
+            binding_rev: stored.binding_rev,
+        })
+        .collect())
+}
+
 pub(super) fn project_summaries(
     connection: &Connection,
     snapshot: &mut super::SandboxSnapshot,

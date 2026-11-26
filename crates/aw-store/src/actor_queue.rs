@@ -375,6 +375,114 @@ fn audit_fact(c: &rusqlite::Connection, owner: &PrincipalId, fact: &ActorQueueFa
             .map_err(|_| Error::Storage("cannot serialize Actor queue fact"))?,
     )
 }
+/// The restart reconciler supplies the original Run owner and Input;
+/// never claim/decrypt/dispatch a queued payload here. A committed Input
+/// settlement can close a missed queue ACK, otherwise retire as Inspected.
+pub(crate) fn retire_recovered_in(
+    c: &rusqlite::Connection,
+    owner: &PrincipalId,
+    input: &crate::ActorInputAdmission,
+    process_id: &str,
+    store_generation: u64,
+    input_state: actor_admission::InputAdmissionState,
+    note: &str,
+) -> Result<(Option<ActorQueueFact>, bool)> {
+    writer(c, owner, &input.session_id, input.writer_epoch)?;
+    let mut matches = latest(&events(c, &input.session_id)?)
+        .into_values()
+        .filter(|f| {
+            queued_input_request_id(&input.session_id, &f.request.request_id) == input.request_id
+        });
+    let Some(old) = matches.next() else {
+        if input.request_id.starts_with("qi_") {
+            return Err(Error::Denied(
+                "original queued Input lost its queue custody",
+            ));
+        }
+        return Ok((None, false));
+    };
+    if matches.next().is_some() || old.request.recipient_site != "local" {
+        return Err(Error::Conflict(
+            "recovered queue differs from original native Run",
+        ));
+    }
+    require_input_claim(&old, input, process_id, store_generation)?;
+    let next = match input_state {
+        actor_admission::InputAdmissionState::Inspected => QueueState::Inspected,
+        actor_admission::InputAdmissionState::Settled => QueueState::Settled,
+        _ => {
+            return Err(Error::Denied(
+                "queue recovery requires terminal original Input",
+            ))
+        }
+    };
+    if old.state == next {
+        return Ok((Some(old), false));
+    }
+    if old.state != QueueState::Accepted {
+        return Err(Error::Conflict(
+            "original recovered queue is not accepted custody",
+        ));
+    }
+    let fact = retire_in(
+        c,
+        owner,
+        old,
+        next,
+        (next == QueueState::Inspected).then_some(note),
+    )?;
+    Ok((Some(fact), true))
+}
+
+fn require_input_claim(
+    fact: &ActorQueueFact,
+    input: &crate::ActorInputAdmission,
+    process_id: &str,
+    store_generation: u64,
+) -> Result<()> {
+    let claim = fact
+        .claim
+        .as_ref()
+        .ok_or(Error::Denied("original queue claim unavailable"))?;
+    if claim.owner_process_id.as_deref() != Some(process_id)
+        || claim.owner_store_generation != Some(store_generation)
+        || claim.writer_epoch != input.writer_epoch
+        || claim.turn_id != input.turn_id
+        || claim.message_id != input.message_id
+        || claim.recipient_actor != input.target
+        || claim.recipient_actor != input.sender
+        || fact.payload_sha256 != input.payload_sha256
+        || fact.request.priority != input.priority
+        || fact.request.session_id != input.session_id
+        || fact.request.branch_id != input.branch_id
+    {
+        return Err(Error::Conflict(
+            "queue finalization does not match original claim",
+        ));
+    }
+    Ok(())
+}
+
+fn retire_in(
+    c: &rusqlite::Connection,
+    owner: &PrincipalId,
+    old: ActorQueueFact,
+    state: QueueState,
+    note: Option<&str>,
+) -> Result<ActorQueueFact> {
+    let fact = ActorQueueFact {
+        state,
+        revision: old
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Limit("queue revision exhausted"))?,
+        note: note.map(str::to_owned).or(old.note.clone()),
+        ..old
+    };
+    audit_fact(c, owner, &fact)?;
+    Ok(fact)
+}
+
 fn collision(c: &rusqlite::Connection, session: &str, request_id: &str) -> Result<bool> {
     Ok(crate::actor_notice::events(c, session)?
         .iter()
@@ -1542,26 +1650,12 @@ impl SessionStore {
         let process = self
             .process_identity()?
             .ok_or(Error::Denied("queue finalize needs owner process"))?;
-        let claim = old
-            .claim
-            .as_ref()
-            .ok_or(Error::Denied("final queue fact lost claim"))?;
-        if old.state != QueueState::Accepted
-            || claim.owner_process_id.as_deref() != Some(process.process_id.as_str())
-            || claim.owner_store_generation != Some(process.store_generation)
-            || claim.writer_epoch != input.writer_epoch
-            || claim.turn_id != input.turn_id
-            || claim.message_id != input.message_id
-            || claim.recipient_actor != input.target
-            || claim.recipient_actor != input.sender
-            || old.payload_sha256 != input.payload_sha256
-            || old.request.priority != input.priority
-            || old.request.branch_id != input.branch_id
-        {
+        if old.state != QueueState::Accepted {
             return Err(Error::Conflict(
-                "queue finalization does not match original claim",
+                "queue finalization requires accepted custody",
             ));
         }
+        require_input_claim(&old, input, &process.process_id, process.store_generation)?;
         let input_fact = actor_admission::events(&tx, &input.session_id)?
             .into_iter()
             .rev()
@@ -1574,12 +1668,7 @@ impl SessionStore {
                 "queue cannot finalize before factual settled Input",
             ));
         }
-        let fact = ActorQueueFact {
-            state: QueueState::Settled,
-            revision: old.revision + 1,
-            ..old
-        };
-        audit_fact(&tx, owner, &fact)?;
+        let fact = retire_in(&tx, owner, old, QueueState::Settled, None)?;
         db(tx.commit())?;
         self.local_secret_store()?.delete(&fact.payload_ref)?;
         Ok(Some(fact))
@@ -1652,13 +1741,7 @@ impl SessionStore {
                 ));
             }
         }
-        let fact = ActorQueueFact {
-            state: QueueState::Inspected,
-            revision: old.revision + 1,
-            note: Some(note.to_owned()),
-            ..old
-        };
-        audit_fact(&tx, owner, &fact)?;
+        let fact = retire_in(&tx, owner, old, QueueState::Inspected, Some(note))?;
         db(tx.commit())?;
         // An explicit inspection retires the unexecutable private queue
         // payload, but never clears independent 9A or paid/tool hazards.

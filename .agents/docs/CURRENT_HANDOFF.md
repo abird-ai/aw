@@ -19,7 +19,122 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: pre-tool restart and exact native artifact recovery
+## Latest local implementation delta — 2026-11-26: exact whole-Run native recovery and Input/queue disposition
+
+Parent `7b5dae500bcf19e1af98c92eedc1e31256eb12fd` (pre-tool restart
+and native artifact recovery). Published AW main remains `7b92686`.
+L5, clean at entry; Store v60, Git recovery v4 unchanged. No new
+durable receipt, schema, effect owner or execution path.
+
+- New original Store logical recovery consumer:
+  `SessionStore::reconcile_native_turn(manager,canonical_agent,turn)`,
+  actual offline `aw native-turn-reconcile --state-dir <existing-private-Store>
+  <canonical-Agent> <original-Turn>`. No physical config selector
+  or approval implied: each actual effect must already be released
+  by its original owner (including explicit native-source-recover
+  when necessary). Exact local OS principal/exclusive existing Store,
+  current Agent Manage and Project writer/Session owner with original
+  active writer epoch, exact bound open Git Sandbox/layout. Terminal
+  attached original Run of a prior stopped/fenced owner-lock
+  incarnation in the same Store scope, no live Run in the backing
+  Session. Current live owner, unrelated/foreign Run, noncanonical
+  Agent, attachment conflict or changed owner epoch refuses.
+- Reuse the existing exact direct owner Run provenance from pre-tool
+  startup compatibility: original first attempt, immutable prompt
+  node and branch admission anchor, epoch, original Dispatching
+  Input/prompt digest, original owner identity/process/Store scope
+  and first owner authority segment (if recorded), no web/routing
+  lineage. Preserve the existing pre-tool no-intent-only startup
+  predicate. No generic no-start inference from missing claim.
+- Scan the entire bounded original immutable Run journal. Every
+  ToolStarted must be original direct local trusted-host non-Remove
+  native Read/Write, unique exact original intent; original
+  Sandbox/native driver claim, same complete named Git sources and
+  original versioned binding digest, exact ToolFinished or original
+  Interrupted Turn and actual immutable positive release. Missing/
+  Unknown/unclaimed/mixed driver/unsupported intent, orphan terminal,
+  revised tool or partial release refuses. ToolDenied is not a started
+  effect. Compare actual write intents to original Run possible_effect
+  and exact hazard root/session. Use the same claim binding validator
+  as per-effect recovery, with a read-only durable binding selection;
+  factual logical recovery does not require registered live drivers or
+  checkout probes. Never release source barriers here or manufacture
+  source settlement.
+- In one original immediate Store transaction, settle only this Run's
+  needs_inspection hazard with existing effects.inspected audit fact
+  (or retain already-settled/no hazard), then use original Input
+  and queue fact owners. Exact dispatching/Unknown Input becomes
+  Inspected, never successful or retryable; existing terminal Input
+  retained. Exact Accepted queue must match original Run process,
+  Store generation, Input sequence/Turn/epoch/target/digest/priority/
+  Session/branch and local site. Retire as Inspected, or Settled only
+  if original Input was already factually Settled (missed queue ACK).
+  Direct owner Input without queue supported; missing reserved qi_
+  receipt refuses. Shared original claim validation/retire helper
+  used by normal finalization too. No pending unrelated Input changed.
+  One Agent revision advance for actual reconciliation, no write on
+  exact terminal replay. Delete only original private encrypted
+  queue payload after immutable terminal commit; replay can finish a
+  missed unlink (original idempotent SecretStore delete). Return
+  redacted `{turn,source_effects,hazard_cleared,input,queue,changed}`;
+  hazard_cleared/changed indicate this invocation's mutation, not
+  provider success or new authority.
+- Do not rewrite original failed/interrupted/cancelled Turn,
+  provider attempt/usage, retry policy or hints, source release,
+  Sandbox revision, grant or other Run/import/coordination hazards.
+  Generic Session journal acknowledgement now retains the original
+  source-unaware layout gate; it cannot blanket-clear source-bearing
+  hazards, even from a live source-aware journal. Existing legacy
+  source-free inspection remains. No automatic replay, grant/open or
+  source-bearing retry promotion. Explicit fresh live approval and
+  grant still required for subsequent Input.
+- Extend the existing actual native RPC fixture, not parallel mock
+  owners: no-tool process kill + original unknown provider Run,
+  production reconciliation/terminal replay instead of manual Input/
+  queue inspection. Then real read (already released), native write
+  with injected exact Stage reservation and unowned lookalike,
+  actual process kill awaiting the following provider response.
+  Original interrupted Run has both native intents, unknown last paid
+  attempt, original Dispatching Input/Accepted queue and next pending
+  Input. Partial-release whole-Run refusal preserves all custody;
+  existing native-source-recover removes exact artifact only, releases
+  original write and advances Sandbox rev once, but Run hazard
+  remains. Exact whole-Run reconciliation clears only this hazard,
+  retires original Input/queue, one Agent rev, no Turn/history payload
+  rewrite; replay no changes. Fresh approved native root settles
+  only the next pending Input. Actual Git HEAD/index/tracked contents
+  preserved. Existing real Host lifecycle also checks generic
+  acknowledgement and same-current-owner whole-Run refusal.
+  Crash after real write before final Run settlement is qualified;
+  actual OS loss inside native filesystem mutation remains separate.
+
+Validation (L5 Rust 1.95.0, final source): actual executable native
+RPC/crash/whole-Run recovery 1/1 (18.62s), including no-tool and
+post-native-write process kills, partial proof refusal, original
+Input/queue disposition, idempotent replay and subsequent pending
+Input only. Agent lifecycle 3/3, Store Sandbox 4/4, Actor Input
+admission 2/2, Store queue 8/8, original recovery 2/2, Host native/
+Process 2/2, full Actor owner 46/46. Initial type-check corrections
+used the original Transaction for release lookup and imported the
+existing SecretStore trait; final check passed. Strict all-feature/
+all-target Store/Host/CLI Clippy, durable-only and minimal all-target
+checks (existing feature-specific dead-code warnings), full all-feature
+CLI build (56.59s incremental), actual version/help smoke, scoped
+rustfmt/diff and signed checkpoint. No full workspace suite, pinned
+Nix or native-platform qualification repeated. No real user source
+or provider effects.
+
+Next: narrow unclaimed ToolStarted proof/recovery only if actual
+original source route/no-start can be established, including
+journal-boundary loss before claim. Also qualify linked checkout
+artifact proof and independent Process quiescence/containment.
+Current direct native lifecycle now has explicit startup, live
+withdrawal, pre-tool/claimed-effect restart, per-effect physical
+recovery and whole-Run/Input/queue reconciliation. Do not create
+alternate recovery ledgers or broaden held shared/participant,
+Graph/Job/Process/extension execution. Frozen dotlink unchanged.
+
+## Previous local implementation delta — 2026-11-26: pre-tool restart and exact native artifact recovery
 
 Parent `3e4132bf9b646e45e26b5b62e22f5699c09a911b` (live withdrawal);
 published AW main `7b92686`. L5, clean at entry. Store v60, Git

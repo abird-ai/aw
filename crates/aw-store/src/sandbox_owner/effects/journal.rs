@@ -576,34 +576,37 @@ fn require_current_sandbox_in(tx: &Connection, key: AgentKey<'_>, claim: &Claim)
     Ok(())
 }
 
-/// A source-bearing Run can also stop before its first tool intent.
-/// Recover that exact original direct owner Input without inventing a
-/// source claim. No missing/unclaimed tool intent is interpreted as
-/// physical no-start proof.
-fn require_pre_tool_run_in(
+struct DirectRun {
+    actor: PrincipalId,
+    input: crate::ActorInputAdmission,
+    process_id: String,
+    prompt_node: String,
+}
+
+/// Corroborate the original direct owner Run from immutable Input and
+/// owner-incarnation provenance. This is neither fresh execution
+/// authority nor evidence of physical quiescence.
+fn direct_run_in(
     c: &Connection,
     session: &str,
     branch: &str,
     run: &str,
     turn: u64,
-) -> Result<()> {
+) -> Result<DirectRun> {
     let scope = StoreScope::load(c)?;
-    let row: Option<(String, u64, u64, String, String)> = db(c
+    let row: Option<(String, u64, u64, String, String, String)> = db(c
         .query_row(
             "SELECT r.produced_from_head,r.produced_from_revision,
-                r.produced_from_writer_epoch,r.prompt_node,r.identity_json
+                r.produced_from_writer_epoch,r.prompt_node,r.identity_json,r.owner_process_id
          FROM runs r
          JOIN local_process_incarnations p ON p.process_id=r.owner_process_id
          JOIN llm_operations o ON o.id=r.operation_id
          WHERE r.id=?1 AND r.session_id=?2 AND r.branch_id=?3 AND r.turn_id=?4
-           AND r.possible_effect=0 AND r.attempt_no=1
+           AND r.attempt_no=1
            AND r.owner_store_generation=?5 AND p.store_generation=?5
            AND p.store_id=?6 AND p.process_kind='owner_lock'
            AND o.routing_operation_id IS NULL
-           AND NOT EXISTS(SELECT 1 FROM web_requests w WHERE w.native_run_id=r.id)
-           AND NOT EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled')
-           AND NOT EXISTS(SELECT 1 FROM run_events e WHERE e.run_id=r.id
-                          AND e.kind IN ('tool_started','tool_finished','tool_revised'))",
+           AND NOT EXISTS(SELECT 1 FROM web_requests w WHERE w.native_run_id=r.id)",
             params![
                 run,
                 session,
@@ -619,12 +622,13 @@ fn require_pre_tool_run_in(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional())?;
-    let (head, rev, epoch, prompt_node, identity) = row.ok_or(Error::Denied(
-        "unresolved Run has no original source custody or exact pre-tool admission",
+    let (head, rev, epoch, prompt_node, identity, process_id) = row.ok_or(Error::Denied(
+        "Run lacks exact direct original owner admission",
     ))?;
     let identity: InvocationIdentity = crate::decode(&identity)?;
     let prompt = crate::node_in(c, session, &prompt_node)?;
@@ -634,9 +638,7 @@ fn require_pre_tool_run_in(
         || prompt.payload["turn_id"].as_u64() != Some(turn)
         || !crate::principal_is_session_owner(c, session, &identity.actor)?
     {
-        return Err(Error::Denied(
-            "pre-tool Run differs from its original owner Input",
-        ));
+        return Err(Error::Denied("Run differs from its original owner Input"));
     }
     let input = crate::actor_admission::source_dispatch_in(
         c,
@@ -652,7 +654,7 @@ fn require_pre_tool_run_in(
         false,
     )?;
     if input.sender != input.target {
-        return Err(Error::Denied("pre-tool Run is not a direct owner Input"));
+        return Err(Error::Denied("Run is not a direct owner Input"));
     }
     // A crash before the first segment is valid; any recorded segment
     // must still be the original owner Input, never participant/control.
@@ -674,11 +676,45 @@ fn require_pre_tool_run_in(
             || segment.boundary_id != format!("input:{}:{}", input.message_id, input.message_id)
             || db(rows.next())?.is_some()
         {
-            return Err(Error::Denied("pre-tool Run has another authority segment"));
+            return Err(Error::Denied("Run has another authority segment"));
         }
     }
+    Ok(DirectRun {
+        actor: identity.actor,
+        input,
+        process_id,
+        prompt_node,
+    })
+}
+
+/// No unclaimed ToolStarted (even read-only) is inferred to be no-start.
+fn require_pre_tool_run_in(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+    run: &str,
+    turn: u64,
+) -> Result<()> {
+    let pre_tool: bool = db(c.query_row(
+        "SELECT r.possible_effect=0
+           AND NOT EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled')
+           AND NOT EXISTS(SELECT 1 FROM run_events e WHERE e.run_id=r.id
+                          AND e.kind IN ('tool_started','tool_finished','tool_revised'))
+         FROM runs r WHERE r.id=?1",
+        [run],
+        |row| row.get(0),
+    ))?;
+    if !pre_tool {
+        return Err(Error::Denied(
+            "unresolved Run lacks original source custody",
+        ));
+    }
+    direct_run_in(c, session, branch, run, turn)?;
     Ok(())
 }
+
+mod run_recovery;
+pub use run_recovery::NativeTurnReconciliation;
 
 /// Exclusive owner restart may expose source-bearing metadata for
 /// original journal recovery. Each unresolved Run must have its own
@@ -785,6 +821,18 @@ fn recovery_sources_in(
         SourceSetLimit::default(),
         &store.inner.source_drivers.reader()?,
     )?;
+    verify_claim_bindings(claim, bindings)
+}
+
+fn verify_claim_bindings(
+    claim: &Claim,
+    bindings: Vec<crate::VersionedSourceBinding>,
+) -> Result<Vec<EffectiveSourceBinding>> {
+    if bindings.len() != claim.sources.len() || bindings.is_empty() {
+        return Err(Error::Conflict(
+            "original source effect binding set changed",
+        ));
+    }
     let sources = bindings
         .into_iter()
         .zip(&claim.sources)

@@ -195,6 +195,18 @@ enum TopCommand {
         /// writers and preserve the original namespace and layout.
         approval: PathBuf,
     },
+    /// Reconcile one original native Turn after all its source effects
+    /// have been positively released. Never retry the Input.
+    #[cfg(feature = "workspace")]
+    NativeTurnReconcile {
+        /// Existing private Store directory.
+        #[arg(long = "state-dir")]
+        state_dir: PathBuf,
+        /// Exact canonical original Agent.
+        agent: String,
+        /// Original terminal Turn number.
+        turn: u64,
+    },
     /// Inspect and navigate durable Sessions.
     Session {
         #[command(subcommand)]
@@ -1805,6 +1817,12 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::SandboxRetention { approval } => sandbox_retention::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::NativeSourceRecover { approval } => native_source_recovery::run(&approval),
+        #[cfg(feature = "workspace")]
+        TopCommand::NativeTurnReconcile {
+            state_dir,
+            agent,
+            turn,
+        } => native_source_recovery::reconcile_turn(&state_dir, &agent, turn),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxDerive { args } => sandbox_derive::run(args),
         #[cfg(feature = "workspace")]

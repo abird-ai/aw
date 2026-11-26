@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 
 pub(crate) mod journal;
-pub use journal::{SandboxToolRecovery, SandboxToolRecoverySelection, SandboxToolTerminalRef};
+pub use journal::{
+    NativeTurnReconciliation, SandboxToolRecovery, SandboxToolRecoverySelection,
+    SandboxToolTerminalRef,
+};
 
 /// A live decision of the trusted policy/tool authority owner. Implementors
 /// must guarantee these exact decisions through launch handoff until dropped.

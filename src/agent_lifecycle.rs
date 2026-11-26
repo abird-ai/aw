@@ -1324,6 +1324,10 @@ mod tests {
         assert!(store.activate(&owner, &session, &branch).is_err());
         let (view, journal) = store.activate_with_source(&source).unwrap();
         assert!(journal
+            .acknowledge("blanket inspection is not source proof".into())
+            .await
+            .is_err());
+        assert!(journal
             .begin(TurnStart {
                 turn_id: view.history.next_turn_id,
                 prompt: "unowned".into(),
@@ -1355,6 +1359,9 @@ mod tests {
             turn
         );
         assert_eq!(turn.tool_records.len(), 2);
+        assert!(store
+            .reconcile_native_turn(&manager, &reference, turn.id)
+            .is_err());
         assert_eq!(fs::read(repo.join("created")).unwrap(), b"native actor");
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(calls.load(Ordering::SeqCst), 3);

@@ -213,14 +213,15 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
     EffectiveSourceBinding, InspectedSandboxAttachment, InspectedSandboxCreate,
-    PreparedSandboxAttachment, PreparedSandboxCreate, PreparedSandboxEffect, SandboxAttachment,
-    SandboxCreateFrom, SandboxCreateSources, SandboxEffectAuthority, SandboxEffectLaunch,
-    SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
-    SandboxEffectRequest, SandboxExecution, SandboxGrantObservation, SandboxGrantPolicy,
-    SandboxGrantStatus, SandboxLifecycle, SandboxMaterializationRequest, SandboxPolicyEvidence,
-    SandboxRecoverySelection, SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease,
-    SandboxToolRecovery, SandboxToolRecoverySelection, SandboxToolTerminalRef,
-    SourceBindingCompatibility, SourceBindingSummary,
+    NativeTurnReconciliation, PreparedSandboxAttachment, PreparedSandboxCreate,
+    PreparedSandboxEffect, SandboxAttachment, SandboxCreateFrom, SandboxCreateSources,
+    SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease, SandboxEffectOrigin,
+    SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxExecution,
+    SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle,
+    SandboxMaterializationRequest, SandboxPolicyEvidence, SandboxRecoverySelection,
+    SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease, SandboxToolRecovery,
+    SandboxToolRecoverySelection, SandboxToolTerminalRef, SourceBindingCompatibility,
+    SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;

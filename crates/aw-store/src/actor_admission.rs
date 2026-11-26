@@ -302,6 +302,47 @@ pub(crate) fn source_dispatch_in(
     Ok(fact.admission.clone())
 }
 
+/// Retire exactly the original dispatched Input after its Run has
+/// been independently reconciled in the enclosing owner transaction.
+pub(crate) fn inspect_recovered_in(
+    c: &rusqlite::Connection,
+    actor: &PrincipalId,
+    admission: &ActorInputAdmission,
+    note: &str,
+) -> Result<(InputAdmissionState, bool)> {
+    writer_guard(c, actor, admission, false)?;
+    let old = current(&events(c, &admission.session_id)?, &admission.request_id)
+        .ok_or(Error::Denied("original recovered Input unavailable"))?;
+    if old.admission != *admission {
+        return Err(Error::Conflict("recovered Input identity changed"));
+    }
+    match old.state {
+        InputAdmissionState::Dispatching | InputAdmissionState::Unknown => {
+            inspect_fact_in(c, actor, old.admission, note)?;
+            Ok((InputAdmissionState::Inspected, true))
+        }
+        InputAdmissionState::Inspected | InputAdmissionState::Settled => Ok((old.state, false)),
+        _ => Err(Error::Denied(
+            "recovered Run has no original dispatched Input custody",
+        )),
+    }
+}
+
+fn inspect_fact_in(
+    c: &rusqlite::Connection,
+    actor: &PrincipalId,
+    admission: ActorInputAdmission,
+    note: &str,
+) -> Result<ActorInputFact> {
+    let result = ActorInputFact::new(
+        admission,
+        InputAdmissionState::Inspected,
+        Some(note.to_owned()),
+    );
+    append(c, actor, &result)?;
+    Ok(result)
+}
+
 fn append(c: &rusqlite::Connection, actor: &PrincipalId, fact: &ActorInputFact) -> Result<()> {
     audit(
         c,
@@ -676,12 +717,7 @@ impl SessionStore {
         // The note does not remove the original immutable fact or make the
         // same request_id eligible for retry; a new explicit user request is
         // a *new* operation with its own id and current branch revision.
-        let result = ActorInputFact::new(
-            old.admission,
-            InputAdmissionState::Inspected,
-            Some(note.to_owned()),
-        );
-        append(&tx, actor, &result)?;
+        let result = inspect_fact_in(&tx, actor, old.admission, note)?;
         db(tx.commit())?;
         Ok(result)
     }

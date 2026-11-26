@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: pre-tool restart and exact native artifact recovery (this checkpoint; local parent `3e4132bf9b646e45e26b5b62e22f5699c09a911b`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact whole-Run native recovery and Input/queue disposition (this checkpoint; local parent `7b5dae500bcf19e1af98c92eedc1e31256eb12fd`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1657,10 +1657,28 @@ Current implementation: pre-tool restart and exact native artifact recovery (thi
       Sandbox 4/4, source barrier 1/1, Actor 46/46, Agent lifecycle
       3/3; strict affected Clippy, durable/minimal targets, full CLI
       version/help, scoped fmt/diff passed. No whole-Run clearance.
-      **Next:** complete original whole-Run hazard and Input/queue
-      reconciliation, unclaimed intent proof, linked-layout and
-      independent Process recovery proof. Separately qualify legacy
-      participant Agent ACL/access_generation dispatch. No generic
+      **Whole-Run native reconciliation landed:** original terminal
+      attached direct native Git Run, prior exclusive owner/Store scope,
+      current exact Manager/Project/Session writer and original Input.
+      Every ToolStarted must have its matching complete native claim,
+      exact original versioned binding digest and positive release.
+      Partial/unknown/unclaimed/unsupported intent refuses. Original
+      Run hazard only + exact Input/queue disposition in one owner
+      transaction; Inspected is not success/retry, already-settled
+      Input supports missed queue ACK. Original payload unlink after
+      terminal fact, exact replay idempotent. No source barrier release,
+      provider/Turn rewrite, grant, or generic note-based acknowledgement.
+      Actual offline native-turn-reconcile; real process crash after
+      read/write, partial-proof refusal, per-effect cleanup, exact Run
+      reconciliation and next pending Input only.
+      Executable recovery 1/1, Agent lifecycle 3/3, Sandbox 4/4,
+      Input admission 2/2, Store queue 8/8 and recovery 2/2, Host
+      native/Process 2/2, Actor 46/46; strict affected Clippy,
+      durable/minimal targets, full executable/version/help,
+      scoped fmt/diff passed.
+      **Next:** unclaimed intent proof, linked-layout and independent
+      Process recovery proof. Separately qualify legacy participant
+      Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and

@@ -216,3 +216,17 @@ pub(crate) fn run(path: &Path) -> Result<u8> {
         0
     })
 }
+
+/// No physical approval needed for this purely factual original-owner
+/// disposition: each source effect must already have its own release.
+pub(crate) fn reconcile_turn(state_dir: &Path, agent: &str, turn: u64) -> Result<u8> {
+    require_existing_store(state_dir)?;
+    let manager = PrincipalId::new(aw_platform::local_principal()?)?;
+    let store = aw::sessions::open_sqlite_owner(state_dir)?;
+    let result = store.reconcile_native_turn(&manager, agent, turn)?;
+    super::print_json(
+        &serde_json::to_value(result)
+            .map_err(|_| Error::Storage("invalid native reconciliation result"))?,
+    )?;
+    Ok(0)
+}
