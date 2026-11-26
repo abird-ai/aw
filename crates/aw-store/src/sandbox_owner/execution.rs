@@ -57,16 +57,22 @@ impl SandboxExecution {
         let bindings = tools.permitted_bindings(&actor)?;
         if bindings.is_empty()
             || bindings.iter().any(|binding| {
-                Tool::from_name(&binding.name).is_none_or(|tool| {
-                    tool == Tool::Remove
-                        || binding.effect != native_effect(tool)
-                        || binding.source != ToolSource::trusted_host()
-                        || binding.execution_site != bindings[0].execution_site
-                })
+                let native = Tool::from_name(&binding.name).is_some_and(|tool| {
+                    tool != Tool::Remove && binding.effect == native_effect(tool)
+                });
+                // One fixed foreground Process constructor, not general Graph execution.
+                let process = bindings.len() == 1
+                    && matches!(binding.name.as_str(), "bash" | "pwsh" | "powershell")
+                    && binding.effect == ToolEffect::Process
+                    && binding.claim_route
+                        == Some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1);
+                !(native || process)
+                    || binding.source != ToolSource::trusted_host()
+                    || binding.execution_site != bindings[0].execution_site
             })
         {
             return Err(Error::Denied(
-                "source execution requires the original direct native tool set",
+                "source execution requires an exact fixed source tool set",
             ));
         }
         let c = store.connection()?;

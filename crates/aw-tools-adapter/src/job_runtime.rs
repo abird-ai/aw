@@ -142,7 +142,7 @@ impl Default for JobRuntimeOptions {
 }
 
 pub struct JobRuntime {
-    root: Arc<aw_platform::scoped_fs::Root>,
+    root: Option<Arc<aw_platform::scoped_fs::Root>>,
     authority: ToolBindingAuthority,
     tool_limits: crate::LocalToolLimits,
     shells: shell::ShellRegistry,
@@ -201,6 +201,42 @@ impl JobRuntime {
         options: JobRuntimeOptions,
         native_tools: Vec<aw_tools::filesystem::schema::Tool>,
     ) -> Result<Arc<Self>> {
+        Self::new_inner(
+            Some(root),
+            authority,
+            tool_limits,
+            concurrency,
+            options,
+            native_tools,
+        )
+    }
+
+    pub(crate) fn new_source_process(
+        authority: ToolBindingAuthority,
+        tool_limits: crate::LocalToolLimits,
+        concurrency: crate::LocalToolConcurrency,
+    ) -> Result<Arc<Self>> {
+        Self::new_inner(
+            None,
+            authority,
+            tool_limits,
+            concurrency,
+            JobRuntimeOptions {
+                max_graph_nodes: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+    }
+
+    fn new_inner(
+        root: Option<Arc<aw_platform::scoped_fs::Root>>,
+        authority: ToolBindingAuthority,
+        tool_limits: crate::LocalToolLimits,
+        concurrency: crate::LocalToolConcurrency,
+        options: JobRuntimeOptions,
+        native_tools: Vec<aw_tools::filesystem::schema::Tool>,
+    ) -> Result<Arc<Self>> {
         let JobRuntimeOptions {
             agent_jobs,
             graph_policy,
@@ -223,7 +259,7 @@ impl JobRuntime {
         )?;
         let parallelism = Arc::new(GraphParallelism::new(concurrency)?);
         let exposure = Arc::new(ExposureIndex::new(tool_limits.jobs.max_retained_jobs)?);
-        let host = Arc::new(JobHost::new_with_config(
+        let host = Arc::new(JobHost::new_with_optional_root(
             root.clone(),
             authority.clone(),
             JobHostConfig {
@@ -484,7 +520,7 @@ impl JobRuntime {
     }
 
     fn build_host(&self, scope: &LiveScope) -> Result<Arc<JobHost>> {
-        Ok(Arc::new(JobHost::new_with_config(
+        Ok(Arc::new(JobHost::new_with_optional_root(
             self.root.clone(),
             self.authority.clone(),
             JobHostConfig {

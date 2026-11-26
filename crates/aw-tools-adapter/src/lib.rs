@@ -1059,6 +1059,82 @@ pub fn configure_routed_native(
     Ok(configure_inner(builder, actor, options, None, Some(route))?.builder)
 }
 
+/// Explicit host-only foreground Process Job selection. The existing
+/// JobRuntime owns its one node and output; no ambient filesystem root,
+/// native interpreter, dynamic router or other constructor is registered.
+/// The embedding host retains the actual executor owner (the source shell
+/// registry holds a weak reference).
+pub fn configure_source_process(
+    mut builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    operation: aw_tools::OperationId,
+    executor: Arc<dyn process::SourceJobProcessExecutor>,
+) -> Result<ConfiguredLocalTools> {
+    if !matches!(
+        operation,
+        aw_tools::OperationId::Bash
+            | aw_tools::OperationId::Pwsh
+            | aw_tools::OperationId::Powershell
+    ) || options.selected_tools.as_slice() != [operation.model_name()]
+        || !options
+            .mode
+            .access()
+            .permits(aw_tools::filesystem::access::Action::Shell)
+        || options.execution_site != "local"
+        || options.bash.is_some()
+        || options.process_input
+        || options.allow_agent_graph
+        || options.allow_wake
+        || builder.tool_policy_snapshot().has_grants()
+        || options.operation_router.is_installed()?
+    {
+        return Err(Error::Denied(
+            "source Process requires one explicit foreground host driver selection",
+        ));
+    }
+    let limits = options.limits.validate_for_core_tools(&[], true, true)?;
+    let mut concurrency = options.concurrency.validate()?;
+    concurrency.graph_width = 1;
+    concurrency.parallelism.allow_parallel_shell = false;
+    let mut policy = builder.tool_policy_snapshot();
+    if policy.execution_site != options.execution_site {
+        return Err(Error::Denied(
+            "source Process requires the original local tool authority",
+        ));
+    }
+    policy.allow_parallel_bash = false;
+    policy.max_parallel_reads = policy
+        .max_parallel_reads
+        .min(concurrency.parallelism.max_parallel_reads);
+    policy.max_parallel_bash = 1;
+    let runtime = job_runtime::JobRuntime::new_source_process(
+        builder.tool_binding_authority(),
+        limits,
+        concurrency,
+    )?;
+    let shell = Arc::new(shell::NativeShell::source(
+        options.root.clone(),
+        operation,
+        limits.shell_stream_bytes,
+        executor,
+    )?);
+    runtime.register_shell(shell.clone())?;
+    policy.permit_host(actor, operation.model_name(), &ToolEffect::Process)?;
+    builder = builder
+        .scope_lifecycle(runtime.clone())
+        .tool_policy_lifecycle(runtime.clone())
+        .tool_policy_lifecycle(Arc::new(ParallelismCeiling {
+            ceiling: concurrency.parallelism,
+        }))
+        .tool_policy(policy)
+        .shared_tool(Arc::new(job_tools::JobShell::new(runtime.clone(), shell)));
+    Ok(ConfiguredLocalTools {
+        builder,
+        job_runtime: Some(runtime),
+    })
+}
+
 fn configure_inner(
     mut builder: AgentBuilder,
     actor: PrincipalId,

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact Process receipt custody and independent recovery fence (this checkpoint; local parent `a101dc572aff6c36cbc9cc97ebed0be456109524`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: source-aware foreground Process Job dispatch (this checkpoint; local parent `a58e39e1ede99a5ec0119380daa6d8dd57565c9e`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1721,11 +1721,24 @@ Current implementation: exact Process receipt custody and independent recovery f
       Host native/Process 2/2, adapter Process 29/29, aw-process 8/8,
       actual executable recovery 1/1, strict affected Clippy, durable/minimal
       checks, version/help and scoped fmt/diff passed.
-      **Next:** reviewed production source-aware Process driver and dispatch
-      with actual independent containment/quiescence proof, broader original
-      Run/Input/queue disposition. No strong Unix backend promoted; arbitrary
-      Process effects, nonstandard/overlapping linked layouts and unmarked
-      legacy native/Process no-start remain held. Separately qualify legacy participant
+      **Source-aware foreground Process Job dispatch:** registered
+      physical driver + independent live source decision compose the original
+      Agent, source scope and root-free one-node Job runtime. Fixed
+      `ProcessSourceV1` route, original journal/source claim/fenced spawn,
+      original Job-owned stream writers and terminal, held independent
+      proof and post-journal release; no ambient fallback or new owner.
+      Actual Actor regression exercises reviewed fixed child and strict
+      containment refusal/no-spawn, original stream/result/claim settlement,
+      revision and queue preservation, runtime retirement and reopen.
+      Actor lifecycle 3/3, adapter 259/259, shared Process 8/8.
+      Host native/Process 2/2, executable recovery 1/1, strict affected
+      Clippy, durable/minimal checks, version/help and scoped fmt/diff passed.
+      **Next:** exact original Process Run/Input/queue disposition for
+      qualified source routes and positive original no-start/quiescence;
+      general reviewed containment driver and broader Job/Graph/extension
+      dispatch remain open. No arbitrary shell CLI or strong Unix backend
+      promoted; nonstandard/overlapping linked layouts and unmarked legacy
+      native/Process no-start remain held. Separately qualify legacy participant
       Agent ACL/access_generation dispatch. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,

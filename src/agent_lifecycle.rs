@@ -1073,6 +1073,76 @@ mod tests {
         use serde_json::json;
         use std::{fs, io::Write, path::Path, process::Command, time::Duration};
 
+        const PROCESS_COMMAND: &str = "printf process-owned > process-created; printf process-stdout; printf process-stderr >&2";
+
+        // A reviewed fixed builtin-only fixture, NOT a general shell
+        // containment driver. It never interprets arbitrary model text.
+        struct FixedProcessDriver {
+            approval: aw_host::source_approval::NativeSourceApproval,
+            bash: PathBuf,
+        }
+        impl aw_host::source_process::SourceProcessDriver for FixedProcessDriver {
+            type Pins = aw_platform::DirectoryIdentity;
+            type Witness = aw_host::source_approval::NativeSourceApprovalGuard;
+            type Fence = Self::Witness;
+            fn operation(&self) -> aw_tools::OperationId {
+                aw_tools::OperationId::Bash
+            }
+            fn prepare(
+                &self,
+                plan: &aw_store::SandboxEffectPlan,
+                arguments: &serde_json::Value,
+            ) -> Result<(
+                aw_tools_adapter::process::PreparedPipeLaunch<Self::Pins>,
+                Self::Witness,
+            )> {
+                if arguments != &json!({"command":PROCESS_COMMAND}) {
+                    return Err(Error::Denied(
+                        "fixture driver admits only the reviewed fixed command",
+                    ));
+                }
+                let guard = self.approval.read()?;
+                assert_eq!(plan.grant.sources.len(), 1);
+                assert_eq!(guard.roots().len(), 1);
+                assert_eq!(plan.grant.sources[0], guard.roots()[0].source);
+                assert_eq!(plan.sandbox.tool_root, guard.base());
+                let pin = aw_platform::DirectoryIdentity::open(guard.base())?;
+                assert_eq!(
+                    pin.identity()?,
+                    (
+                        guard.roots()[0].physical.volume,
+                        guard.roots()[0].physical.object
+                    )
+                );
+                let mut command = Command::new(&self.bash);
+                command.env_clear().current_dir(guard.base()).args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    PROCESS_COMMAND,
+                ]);
+                Ok((
+                    aw_tools_adapter::process::PreparedPipeLaunch::from_trusted_command(
+                        command, false, pin,
+                    ),
+                    guard,
+                ))
+            }
+            fn prove_quiescent(
+                &self,
+                witness: Self::Witness,
+                terminal: &aw_tools::filesystem::runner::ProcessTerminal,
+            ) -> Result<Self::Fence> {
+                // This fixed builtin-only command has no external or
+                // descendant execution. The original Process has been reaped.
+                assert_eq!(
+                    terminal.exit,
+                    aw_tools::filesystem::runner::ProcessExit::Code(0)
+                );
+                Ok(witness)
+            }
+        }
+
         struct NativeProvider {
             calls: Arc<AtomicUsize>,
         }
@@ -1088,14 +1158,58 @@ mod tests {
                 sink: &'a mut DeltaSink<'_>,
             ) -> aw_agent_core::provider::ModelFuture<'a> {
                 Box::pin(async move {
-                    assert_eq!(tools.len(), 2);
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     let user = messages.iter().rposition(|m| m.role == Role::User).unwrap();
                     let results: Vec<_> = messages[user + 1..]
                         .iter()
                         .filter(|m| m.role == Role::Tool)
                         .collect();
-                    let call = match (messages[user].content.as_str(), results.len()) {
+                    let prompt = messages[user].content.as_str();
+                    if matches!(
+                        prompt,
+                        "perform source Process" | "reject uncontained Process"
+                    ) {
+                        assert_eq!(tools.len(), 1);
+                        assert_eq!(tools[0].name, "bash");
+                        assert!(tools[0].parameters["properties"]
+                            .get("background")
+                            .is_none());
+                    } else {
+                        assert_eq!(tools.len(), 2);
+                    }
+                    let call = match (prompt, results.len()) {
+                        ("perform source Process" | "reject uncontained Process", 0) => {
+                            Some(ToolCall {
+                                id: "source-process-fixture".into(),
+                                name: "bash".into(),
+                                arguments: json!({"command":PROCESS_COMMAND}),
+                            })
+                        }
+                        ("reject uncontained Process", 1) => {
+                            assert!(
+                                results[0].content.contains(
+                                    "required closed descendant containment is unavailable"
+                                ),
+                                "{:?}",
+                                results[0]
+                            );
+                            sink("containment refused")?;
+                            None
+                        }
+                        ("perform source Process", 1) => {
+                            assert!(
+                                results[0].content.contains("process-stdout"),
+                                "{:?}",
+                                results[0]
+                            );
+                            assert!(
+                                results[0].content.contains("process-stderr"),
+                                "{:?}",
+                                results[0]
+                            );
+                            sink("process done")?;
+                            None
+                        }
                         ("interrupt-read-before-claim", 0) => Some(ToolCall {
                             id: "no-start-read".into(),
                             name: "read".into(),
@@ -1570,6 +1684,187 @@ mod tests {
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        {
+            let store =
+                SessionStore::open_with_sources(&state, registry.clone(), Default::default())
+                    .unwrap();
+            let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            // Fresh independent approval, not the prior durable grant.
+            // Use the already configured original source layout.
+            // The refresh closure updates the private config using current rev.
+            drop(refresh(&store));
+            let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
+            let approval = resolver
+                .provision_configured_approval(&manager, &approvals)
+                .unwrap();
+            let drivers = SandboxDriverRegistry::new();
+            let bash = std::env::var_os("AW_BASH")
+                .map(PathBuf::from)
+                .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from))
+                .expect("trusted fixture Bash");
+            let driver = drivers
+                .register(
+                    DriverKey::builtin("fixture-source-process").unwrap(),
+                    FixedProcessDriver {
+                        approval: approval.clone(),
+                        bash,
+                    },
+                )
+                .unwrap();
+            let independent = approval.clone();
+            let host =
+                aw_host::source_process::SourceProcessHost::new(drivers, driver, move || {
+                    independent.read()
+                })
+                .unwrap();
+            let mut options = aw_tools_adapter::LocalToolOptions::new(
+                repo.clone(),
+                aw_tools_adapter::ToolMode::Trusted,
+            );
+            options.selected_tools = vec!["bash".into()];
+            options.bash = None;
+            let build_process = |options: &aw_tools_adapter::LocalToolOptions| {
+                host.build_execution(
+                    &store,
+                    owner.clone(),
+                    execution.clone(),
+                    Agent::builder_from_selection(
+                        selection.clone(),
+                        AgentOptions::new("fixture", "model"),
+                    ),
+                    options,
+                )
+            };
+            assert!(build_process(&options).is_err());
+            grant_rev = approval
+                .publish_grant(&manager, grant_rev)
+                .unwrap()
+                .revision;
+            for (strict, message_id, prompt) in [
+                (true, 5, "reject uncontained Process"),
+                (false, 6, "perform source Process"),
+            ] {
+                options.local_process_containment = if strict {
+                    aw_tools_adapter::process::ContainmentRequirement::ClosedDescendants
+                } else {
+                    aw_tools_adapter::process::ContainmentRequirement::BestAvailable
+                };
+                let (mut agent, source, jobs) = build_process(&options).unwrap();
+                let jobs_weak = Arc::downgrade(&jobs);
+                assert_eq!(agent.registered_tool_names(), ["bash"]);
+                let request_id = if strict {
+                    "fixture:process-strict"
+                } else {
+                    "fixture:process"
+                };
+                let (view, journal) = store.activate_with_source(&source).unwrap();
+                let turn_id = view.history.next_turn_id;
+                agent
+                    .load_history(view.history, Some(Arc::new(journal)))
+                    .unwrap();
+                let actor = actor_owner::Service::attach_for_agent_with_source(
+                    store.clone(),
+                    &agent,
+                    source.clone(),
+                )
+                .unwrap();
+                actor
+                    .enqueue_bound_text(
+                        &agent,
+                        request_id,
+                        message_id,
+                        aw_store::QueueTarget::Auto,
+                        -1,
+                        prompt,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actor
+                        .admit_next_queued(&agent)
+                        .unwrap()
+                        .unwrap()
+                        .request
+                        .request_id,
+                    request_id
+                );
+                let turn = actor
+                    .run_once(&mut agent, |_| Ok(()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(turn.id, turn_id);
+                assert_eq!(turn.outcome, aw_agent_core::Outcome::Completed, "{turn:?}");
+                assert_eq!(turn.tool_records.len(), 1);
+                assert_eq!(
+                    turn.tool_records[0].status,
+                    if strict {
+                        aw_agent_core::ToolStatus::Failed
+                    } else {
+                        aw_agent_core::ToolStatus::Succeeded
+                    }
+                );
+                if strict {
+                    assert!(!repo.join("process-created").exists());
+                } else {
+                    assert_eq!(
+                        fs::read(repo.join("process-created")).unwrap(),
+                        b"process-owned"
+                    );
+                }
+                assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+                assert_eq!(
+                    store
+                        .sandbox_get(&manager, &sandbox.canonical_ref)
+                        .unwrap()
+                        .rev,
+                    current.rev + u64::from(!strict)
+                );
+                assert_eq!(
+                    store
+                        .actor_queue_fact(&owner, &session, request_id)
+                        .unwrap()
+                        .state,
+                    aw_store::QueueState::Settled,
+                );
+                assert_eq!(
+                    store
+                        .actor_queue_fact(&owner, &session, "fixture:next")
+                        .unwrap()
+                        .state,
+                    aw_store::QueueState::Pending
+                );
+                // The original journal, not the Job result alone, authorizes
+                // the physical release; exact terminal replay needs no proof.
+                assert_eq!(
+                    store
+                        .sandbox_recover_tool_source_effect(
+                            &manager,
+                            &reference,
+                            turn_id,
+                            "source-process-fixture",
+                            |_| panic!("released original Process must not inspect")
+                        )
+                        .unwrap(),
+                    if strict {
+                        aw_store::SandboxEffectOutcome::NotStarted
+                    } else {
+                        aw_store::SandboxEffectOutcome::Settled
+                    },
+                );
+                drop(actor);
+                drop(agent);
+                drop(source);
+                drop(jobs);
+                assert!(
+                    jobs_weak.upgrade().is_none(),
+                    "source Job runtime retained its owner"
+                );
+            }
+            drop(host);
+            drop(approval);
+            drop(store);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -1591,8 +1886,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 4
-                            && v.history.turns[3].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 6
+                            && v.history.turns[5].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -1602,7 +1897,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

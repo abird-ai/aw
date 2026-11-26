@@ -413,13 +413,14 @@ impl ToolContext {
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>>;
-/// Versioned trusted executor contract, not a tool grant. A native-source
-/// V1 executor cannot perform a source operation before its original durable
+/// Versioned trusted executor contract, not a tool grant. A source-gated
+/// executor cannot perform a source operation before its original durable
 /// Sandbox claim commits. A replaceable or fallback route must not advertise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolClaimRoute {
     NativeSourceV1,
+    ProcessSourceV1,
 }
 
 pub trait Tool: Send + Sync {
@@ -761,10 +762,16 @@ impl ToolRegistry {
         let claim_route = tool.claim_route();
         if claim_route.is_some()
             && (source != ToolSource::trusted_host()
-                || !matches!(spec.effect, ToolEffect::Read | ToolEffect::Write))
+                || !matches!(
+                    (claim_route, &spec.effect),
+                    (
+                        Some(ToolClaimRoute::NativeSourceV1),
+                        ToolEffect::Read | ToolEffect::Write
+                    ) | (Some(ToolClaimRoute::ProcessSourceV1), ToolEffect::Process)
+                ))
         {
             return Err(Error::Denied(
-                "claim-gated route requires a trusted native effect",
+                "claim-gated route requires its exact trusted effect",
             ));
         }
         let result_ceiling_bytes = tool.result_ceiling_bytes();

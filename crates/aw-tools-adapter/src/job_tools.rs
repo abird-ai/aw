@@ -174,12 +174,21 @@ fn batch_parameters_with_background(
 
 #[derive(Clone)]
 pub(crate) struct JobShell {
-    runtime: Arc<JobRuntime>,
+    runtime: std::sync::Weak<JobRuntime>,
     shell: Arc<shell::NativeShell>,
 }
 impl JobShell {
     pub(crate) fn new(runtime: Arc<JobRuntime>, shell: Arc<shell::NativeShell>) -> Self {
-        Self { runtime, shell }
+        Self {
+            runtime: Arc::downgrade(&runtime),
+            shell,
+        }
+    }
+
+    fn runtime(&self) -> Result<Arc<JobRuntime>> {
+        self.runtime
+            .upgrade()
+            .ok_or(Error::Denied("original Process Job runtime is gone"))
     }
 
     fn retained_text(
@@ -205,6 +214,9 @@ impl JobShell {
 impl Tool for JobShell {
     fn spec(&self) -> ToolSpec {
         let mut spec = self.shell.spec();
+        if self.shell.source_backed() {
+            return spec;
+        }
         if let Some(properties) = spec
             .parameters
             .get_mut("properties")
@@ -214,7 +226,11 @@ impl Tool for JobShell {
                 "background".into(),
                 json!({"type":"boolean","default":false}),
             );
-            if self.runtime.wake_capable() {
+            if self
+                .runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.wake_capable())
+            {
                 properties.insert("wake".into(), constructor_event_rules_schema());
             }
         }
@@ -224,9 +240,23 @@ impl Tool for JobShell {
         spec
     }
 
+    fn claim_route(&self) -> Option<aw_agent_core::tool::ToolClaimRoute> {
+        self.shell
+            .source_backed()
+            .then_some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1)
+    }
+
+    fn is_available(&self) -> bool {
+        self.runtime.strong_count() != 0 && self.shell.revalidate().is_ok()
+    }
+
     fn validate(&self, arguments: &Value) -> Result<()> {
+        let runtime = self.runtime()?;
+        if self.shell.source_backed() {
+            return self.shell.validate(arguments);
+        }
         let run_background = background(arguments)?;
-        let _ = constructor_wake_rules(arguments, &self.runtime)?;
+        let _ = constructor_wake_rules(arguments, &runtime)?;
         let semantic = semantic_constructor_arguments(arguments)?;
         self.shell.validate(&semantic)?;
         if semantic
@@ -248,23 +278,32 @@ impl Tool for JobShell {
 
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
+            let runtime = self.runtime()?;
             self.validate(arguments)?;
+            if self.shell.source_backed()
+                && (ctx.execution_scope.is_some()
+                    || ctx.effect != aw_agent_core::ToolEffect::Process
+                    || ctx.source != aw_agent_core::ToolSource::trusted_host()
+                    || ctx.execution_owner.is_none()
+                    || ctx.scope.is_none())
+            {
+                return Err(Error::Denied(
+                    "source Process requires its original direct Agent tool invocation",
+                ));
+            }
             let run_background = background(arguments)?;
-            let wake = match constructor_wake_rules(arguments, &self.runtime)? {
-                Some(rules) => self.runtime.prepare_initial_wake(&ctx, rules)?,
+            let wake = match constructor_wake_rules(arguments, &runtime)? {
+                Some(rules) => runtime.prepare_initial_wake(&ctx, rules)?,
                 None => None,
             };
             let semantic = semantic_constructor_arguments(arguments)?;
-            let direct_budget = ctx.result_budget(self.runtime.result_limit())?;
+            let direct_budget = ctx.result_budget(runtime.result_limit())?;
             let graph = json!({"ops":[[self.shell.spec().name, semantic]]});
             let decision = match wake {
-                Some(wake) => self.runtime.start_replay_with_initial_wake(
-                    &ctx,
-                    &graph,
-                    run_background,
-                    wake,
-                )?,
-                None => self.runtime.start_replay(&ctx, &graph, run_background)?,
+                Some(wake) => {
+                    runtime.start_replay_with_initial_wake(&ctx, &graph, run_background, wake)?
+                }
+                None => runtime.start_replay(&ctx, &graph, run_background)?,
             };
             let mut started = match decision {
                 StartDecision::New(started) => {
@@ -307,7 +346,7 @@ impl Tool for JobShell {
                 result = &mut started.task => result,
                 _ = ctx.cancellation.cancelled() => {
                     handoff.expose()?;
-                    let _ = self.runtime.cancel(&ctx, &started.id)?;
+                    let _ = runtime.cancel(&ctx, &started.id)?;
                     return Err(Error::Cancelled);
                 },
             };
@@ -1887,7 +1926,7 @@ mod tests {
     #[tokio::test]
     async fn direct_job_shell_preserves_nonzero_tool_error_compatibility() {
         let (root, _agent, runtime, ctx, shell) = shell_fixture();
-        let tool = JobShell::new(runtime, shell);
+        let tool = JobShell::new(runtime.clone(), shell);
         let output = tool
             .execute(ctx, &json!({"command":"printf nope; exit 7"}))
             .await

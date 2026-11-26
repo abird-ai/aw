@@ -15,10 +15,13 @@ use aw_tools::{
     filesystem::runner::{ProcessExit, ProcessTerminal},
 };
 use aw_tools_adapter::process::{
-    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt, ProcessReceiptBinding,
-    SpawnOnce,
+    JobProcessOutputs, PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt,
+    ProcessReceiptBinding, SpawnOnce,
 };
 use tokio::time::Instant;
+
+mod job;
+pub use job::{SourceProcessDriver, SourceProcessHost};
 
 /// Existing Process consumers use the same source/tool authority composition.
 pub type ProcessToolAuthority<A> = SourceToolAuthority<A>;
@@ -204,6 +207,7 @@ async fn spawn_source_process<P, A>(
     boundary: SandboxEffectLaunch,
     deadline: Instant,
     control: &SourceProcessControl,
+    outputs: Option<JobProcessOutputs>,
     project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
 ) -> std::result::Result<PipeProcess, PipeLaunchFailure>
 where
@@ -212,18 +216,26 @@ where
 {
     let check = control.probe();
     let signal = control.clone();
-    PipeProcess::spawn_prepared_fenced_until(
-        launch
-            .requiring_containment(authority.process_containment())
-            .with_custody(authority),
-        deadline,
-        // ToolBinding is checked under its actual synchronous launch fence.
-        // Do not reenter its read lock from the final cancellation probe.
-        check,
-        async move { signal.cancelled().await },
-        move |spawn, (_, authority)| project(spawn, authority, boundary),
-    )
-    .await
+    let launch = launch
+        .requiring_containment(authority.process_containment())
+        .with_custody(authority);
+    // Do not reenter the ToolBinding read lock from the last probe.
+    let cancelled = async move { signal.cancelled().await };
+    let fence = move |spawn: SpawnOnce<'_>, (_, authority): &(P, ProcessToolAuthority<A>)| {
+        project(spawn, authority, boundary)
+    };
+    match outputs {
+        Some(outputs) => {
+            PipeProcess::spawn_prepared_fenced_with_job_outputs_until(
+                launch, outputs, deadline, check, cancelled, fence,
+            )
+            .await
+        }
+        None => {
+            PipeProcess::spawn_prepared_fenced_until(launch, deadline, check, cancelled, fence)
+                .await
+        }
+    }
 }
 
 fn ordinary_projection<A: SandboxEffectAuthority>(
@@ -311,6 +323,7 @@ where
         prepared,
         deadline,
         cancellation,
+        None,
         ordinary_projection,
         prove_quiescent,
     )
@@ -339,6 +352,7 @@ where
         prepared,
         deadline,
         cancellation,
+        None,
         signing_projection(registry, handle, selection),
         prove_quiescent,
     )
@@ -349,6 +363,7 @@ async fn run_fenced_source_process<P, A, F>(
     prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
+    outputs: Option<JobProcessOutputs>,
     project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
     prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<F> + Send + 'static,
 ) -> Result<SourceProcessCompletion>
@@ -365,21 +380,22 @@ where
     let _awaiter = CancelAwaiter(abandoned);
     let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
     tokio::spawn(async move {
-        let receipt =
-            match spawn_source_process(launch, authority, boundary, deadline, &control, project)
-                .await
-            {
-                Ok(mut process) => {
-                    process.close_stdin();
-                    Ok(process
-                        .wait(
-                            control.cancelled(),
-                            deadline.saturating_duration_since(Instant::now()),
-                        )
-                        .await)
-                }
-                Err(failure) => Err(failure),
-            };
+        let receipt = match spawn_source_process(
+            launch, authority, boundary, deadline, &control, outputs, project,
+        )
+        .await
+        {
+            Ok(mut process) => {
+                process.close_stdin();
+                Ok(process
+                    .wait(
+                        control.cancelled(),
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .await)
+            }
+            Err(failure) => Err(failure),
+        };
         let terminal = receipt
             .as_ref()
             .map(|receipt| receipt.terminal)
@@ -440,8 +456,10 @@ where
         abandoned: None,
     };
     let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
-    let mut launch =
-        spawn_source_process(launch, authority, boundary, deadline, &control, project).await;
+    let mut launch = spawn_source_process(
+        launch, authority, boundary, deadline, &control, None, project,
+    )
+    .await;
     let evidence = match &mut launch {
         Ok(process) => LaunchEvidence::Spawned(process.receipt_binding()),
         Err(failure) => LaunchEvidence::Failed(launch_outcome(failure)),
@@ -952,6 +970,7 @@ mod tests {
             boundary,
             deadline(),
             &control,
+            None,
             ordinary_projection,
         )
         .await

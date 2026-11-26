@@ -212,7 +212,7 @@ pub struct JobHost {
     graph_policy: Arc<crate::operation_router::GraphPolicyRouterSlot>,
     graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
     authority: ToolBindingAuthority,
-    root: Arc<aw_platform::scoped_fs::Root>,
+    root: Option<Arc<aw_platform::scoped_fs::Root>>,
     session: String,
     branch: String,
     root_binding: [u8; 32],
@@ -500,6 +500,14 @@ impl JobHost {
         authority: ToolBindingAuthority,
         config: JobHostConfig,
     ) -> Result<Self> {
+        Self::new_with_optional_root(Some(root), authority, config)
+    }
+
+    pub(crate) fn new_with_optional_root(
+        root: Option<Arc<aw_platform::scoped_fs::Root>>,
+        authority: ToolBindingAuthority,
+        config: JobHostConfig,
+    ) -> Result<Self> {
         let JobHostConfig {
             session,
             branch,
@@ -523,7 +531,9 @@ impl JobHost {
                 "Job Graph node ceiling exceeds the shared safety maximum".into(),
             ));
         }
-        if native_tools.iter().any(|tool| !tool.graph_eligible()) {
+        if (root.is_none() && !native_tools.is_empty())
+            || native_tools.iter().any(|tool| !tool.graph_eligible())
+        {
             return Err(Error::Config(
                 "Job native registry contains a direct-only filesystem tool".into(),
             ));
@@ -1218,13 +1228,25 @@ impl JobHost {
                     let request =
                         canonical_request(native, &step.arguments, self.tool_limits).ok_or(())?;
                     (
-                        request.footprint(self.root.as_ref()).map_err(|_| ())?,
+                        request
+                            .footprint(self.root.as_deref().ok_or(())?)
+                            .map_err(|_| ())?,
                         self.root_binding,
                         one,
                         self.tool_limits.result_bytes,
                     )
                 } else if step.tool.is_shell() {
                     let shell = self.shells.get(step.tool).ok_or(())?;
+                    if shell.source_backed()
+                        && (!one
+                            || ctx.execution_scope.is_some()
+                            || ctx.effect != aw_agent_core::ToolEffect::Process
+                            || ctx.source != aw_agent_core::ToolSource::trusted_host()
+                            || binding.claim_route
+                                != Some(aw_agent_core::tool::ToolClaimRoute::ProcessSourceV1))
+                    {
+                        return Err(());
+                    }
                     let prepared = shell.prepare(&step.arguments).map_err(|_| ())?;
                     (
                         shell.footprint(&prepared),
@@ -1782,7 +1804,7 @@ impl JobHost {
             .permitted_binding(actor, plan.tool().name())
             .ok()?;
         let runtime_live = if plan.tool().native().is_some() {
-            plan.runtime_binding() == self.root_binding
+            self.root.is_some() && plan.runtime_binding() == self.root_binding
         } else if plan.tool().is_shell() {
             self.shells.get(plan.tool()).is_some_and(|shell| {
                 shell
@@ -2244,10 +2266,34 @@ impl JobHost {
         // preparation age do not consume this timeout; Spawn Facility queueing does.
         let execution_deadline = tokio::time::Instant::now() + prepared.timeout;
 
+        let launch = match prepared.launch {
+            shell::ShellLaunch::Local(launch) => launch,
+            shell::ShellLaunch::Source(executor) => {
+                // The original sealed node owns these streams and this
+                // deadline. The trusted source driver owns source custody,
+                // not Job identity, scheduling or terminal classification.
+                let completion = executor
+                    .execute(process::SourceJobProcessRequest {
+                        context: ctx,
+                        operation: plan.tool().operation(),
+                        arguments: plan.arguments(),
+                        outputs: (stdout, stderr),
+                        deadline: execution_deadline,
+                        cancellation,
+                    })
+                    .await;
+                return self.settle_source_shell_completion(
+                    id,
+                    coordinate,
+                    running_sequence,
+                    completion,
+                );
+            }
+        };
         let spawn_cancel = cancellation.clone();
         let spawn_cancel_signal = cancellation.clone();
         let mut process = match process::PipeProcess::spawn_prepared_with_job_outputs_until(
-            prepared.launch,
+            launch,
             stdout,
             stderr,
             execution_deadline,
@@ -2392,6 +2438,49 @@ impl JobHost {
             Some(terminal),
             status,
         )
+    }
+
+    fn settle_source_shell_completion(
+        &self,
+        id: &str,
+        coordinate: usize,
+        running_sequence: u64,
+        completion: process::SourceJobProcessCompletion,
+    ) -> Result<Status> {
+        let (terminal, mut status, mut content) = match completion.receipt {
+            Ok(receipt) => {
+                let terminal =
+                    self.retained_process_terminal(id, coordinate, receipt.runner_terminal())?;
+                (
+                    Some(terminal),
+                    receipt.runner_status(),
+                    terminal.compact_result(),
+                )
+            }
+            Err(failure) => {
+                self.finish_shell_streams(id, coordinate);
+                let primary = match &failure {
+                    process::PipeLaunchFailure::NotStarted(_) => Primary::Fail,
+                    process::PipeLaunchFailure::Unknown(_) => Primary::Unknown,
+                };
+                let detail = aw_tools::task::bounded_task_error(failure.into_error().to_string());
+                (
+                    None,
+                    Status {
+                        primary,
+                        more: false,
+                        incomplete: false,
+                    },
+                    format!("{} launch={detail}", primary.as_str()),
+                )
+            }
+        };
+        if !completion.source_settled {
+            status.primary = Primary::Unknown;
+            status.incomplete = true;
+            content.push_str(" source=unresolved");
+        }
+        self.settle_shell_result(id, coordinate, running_sequence, content, terminal, status)
     }
 
     pub(crate) fn graph_preseal_request(
@@ -2845,7 +2934,11 @@ impl JobHost {
                 return Err(error);
             }
         };
-        let current_footprint = match request.footprint(self.root.as_ref()) {
+        let Some(root) = &self.root else {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Denied("Job has no native filesystem authority"));
+        };
+        let current_footprint = match request.footprint(root.as_ref()) {
             Ok(footprint) => footprint,
             Err(_) => {
                 self.settle_unlaunched(id, coordinate, claimed_sequence)?;
@@ -2874,7 +2967,7 @@ impl JobHost {
                     return Err(error);
                 }
             };
-        let root = self.root.clone();
+        let root = root.clone();
         let token = cancellation.clone();
         let executed = aw_tools::asynchronous::run_blocking(move || {
             aw_tools::filesystem::direct::execute(root.as_ref(), request, direct_limits, &|| {

@@ -26,7 +26,80 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: exact Process receipt custody and independent recovery fence
+## Latest local implementation delta — 2026-11-26: source-aware foreground Process Job dispatch
+
+Parent `a58e39e1ede99a5ec0119380daa6d8dd57565c9e` (exact Process
+receipt custody and independent recovery fence). Published AW main remains
+`7b92686`. L5; clean at entry, Store v60, Git recovery v4 and product
+0.15.0 unchanged.
+
+- Connect the registered physical source driver to the original Process
+  Job path, not a parallel direct-shell owner. `SourceProcessHost` builds
+  the actual Agent, independent `SandboxExecution` and one existing
+  `JobRuntime`. A typed `SourceProcessDriver` prepares inert launch pins
+  for the exact effective source set and returns its independent physical
+  witness; the witness and original driver remain held through positive
+  quiescence and its Store commit. An ambient command rooted at a Sandbox
+  is not a valid general containment driver. Grant publication and Agent
+  opening remain separate explicit operations.
+- `ProcessSourceV1` identifies the fixed direct host Process constructor.
+  `SandboxExecution` admits only that exact single source Process route,
+  with existing Agent/source/ToolBinding authority checks. The original
+  ToolStarted intent, source claim, final fenced spawn and ToolResult
+  settlement hook are retained. Complete approved source set required;
+  caller write hints do not narrow custody. No fallback to ambient shell
+  and no native filesystem capability opened by this Job runtime.
+- The existing JobHost seals and claims its single node, attaches its own
+  retained stream writers and dispatches the fixed registered executor.
+  Source execution reuses the original fenced Process launch and finite
+  worker; the actual Process terminal remains distinct from source proof.
+  Failed/unknown source proof yields unresolved Job status, not a fabricated
+  terminal or positive release. Original journal and source settlement
+  owner remain authoritative. The existing JobShell handles result
+  projection; the shell registry and JobShell use weak backreferences to
+  avoid source-route/registry and runtime/ToolBinding ownership cycles.
+- Narrow foreground-only surface: exact selected shell operation, local
+  original Agent call, no dynamic router, ambient executable, stdin,
+  background, wake, interactive or parallel/Graph construction. Ordinary
+  shell/Graph paths retain their existing local bindings. No new schema,
+  ledger, owner, kernel backend or model-facing CLI route.
+- Extend the existing actual Actor lifecycle fixture with a registered
+  reviewed fixed-builtin child through `SourceProcessHost`. Strict closed
+  descendant requirement on direct Unix refuses before spawn, preserves
+  Sandbox revision and records original no-spawn. Independently approved
+  fixed-command success retains both Job streams, writes only its exact
+  approved fixture source, preserves Git index, releases custody and
+  advances Sandbox rev once. Original release replay requires no new
+  inspection; Job runtime can drop and Store reopen; the pending native
+  Input remains untouched until its actual later dispatch. No blanket
+  Run/hazard acknowledgement or new Process no-start recovery.
+
+Validation (locked/offline L5 final source): Actor lifecycle 3/3 (11.82s),
+full adapter library 259/259 (1.38s), shared Process 8/8 (0.35s).
+Host native/Process 2/2 (6.29s), actual native_source_rpc 1/1 (34.26s,
+ordinary and linked layouts). Strict all-feature/all-target affected
+Clippy, durable/minimal all-target checks (existing feature-specific
+dead-code warnings), actual CLI version/help and scoped fmt/diff passed.
+Full workspace and other native-platform qualification not repeated.
+
+Scope: actual reusable embedding-host composition, qualified with a
+reviewed fixed-command fixture and real Store/Actor/Job/Process. No
+arbitrary shell containment implementation, no general Linux/Windows
+closed-backend qualification, no CLI exposure or production mount-plan
+promotion. The frozen 017 PID-namespace/Bubblewrap implementation is
+unchanged. Physical driver proof is a trusted contract, not inferred
+from process-group absence or a successful exit. Remaining general
+source-aware Process, multi-node/interactive/background Job/Graph and
+extension dispatch, independent physical containment drivers, and
+original Process Run/no-start/queue recovery remain open.
+
+Next: extend exact original Run/Input/queue reconciliation to supported
+source Process facts, with the original route/no-start and independent
+quiescence evidence (never infer from missing claims), then broader
+reviewed driver and Job/Graph/extension qualification. Phase 3 remains
+underway.
+
+## Previous local implementation delta — 2026-11-26: exact Process receipt custody and independent recovery fence
 
 Parent `a101dc572aff6c36cbc9cc97ebed0be456109524` (linked Git native
 artifact recovery). Published AW main remains `7b92686`. L5, clean at

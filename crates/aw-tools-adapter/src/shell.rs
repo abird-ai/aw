@@ -4,7 +4,7 @@
 //! Same-UID trusted shell access is emphatically NOT an OS sandbox.
 use crate::process::{
     ContainmentRequirement, Outcome as ProcessOutcome, PipeLaunchFailure, PipeProcess, PipeSpec,
-    PreparedPipeLaunch,
+    PreparedPipeLaunch, SourceJobProcessExecutor,
 };
 use aw_agent_core::*;
 use serde::Deserialize;
@@ -67,12 +67,28 @@ impl ShellRegistry {
 #[derive(Clone)]
 pub(crate) struct NativeShell {
     root: PathBuf,
-    executable: PathBuf,
-    executable_identity: Arc<aw_platform::FileIdentity>,
-    path: String,
+    backend: ShellBackend,
     tool_name: &'static str,
     max_output_bytes: usize,
-    containment: ContainmentRequirement,
+}
+
+#[derive(Clone)]
+enum ShellBackend {
+    Local {
+        executable: PathBuf,
+        executable_identity: Arc<aw_platform::FileIdentity>,
+        path: String,
+        containment: ContainmentRequirement,
+    },
+    Source {
+        executor: std::sync::Weak<dyn SourceJobProcessExecutor>,
+        binding: [u8; 32],
+    },
+}
+
+pub(crate) enum ShellLaunch {
+    Local(PreparedPipeLaunch),
+    Source(Arc<dyn SourceJobProcessExecutor>),
 }
 #[cfg(unix)]
 pub(crate) type Bash = NativeShell;
@@ -125,18 +141,56 @@ impl NativeShell {
             })?);
         Ok(Self {
             root,
-            executable,
-            executable_identity,
-            path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            backend: ShellBackend::Local {
+                executable,
+                executable_identity,
+                path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+                containment: ContainmentRequirement::BestAvailable,
+            },
             tool_name,
             max_output_bytes,
-            containment: ContainmentRequirement::BestAvailable,
         })
     }
 
     pub(crate) fn requiring_containment(mut self, requirement: ContainmentRequirement) -> Self {
-        self.containment = self.containment.intersect(requirement);
+        if let ShellBackend::Local { containment, .. } = &mut self.backend {
+            *containment = containment.intersect(requirement);
+        }
         self
+    }
+
+    /// No ambient executable or filesystem capability is constructed.
+    pub(crate) fn source(
+        root: PathBuf,
+        operation: aw_tools::OperationId,
+        max_output_bytes: usize,
+        executor: Arc<dyn SourceJobProcessExecutor>,
+    ) -> Result<Self> {
+        if !root.is_absolute()
+            || !matches!(
+                operation,
+                aw_tools::OperationId::Bash
+                    | aw_tools::OperationId::Pwsh
+                    | aw_tools::OperationId::Powershell
+            )
+            || !(1..=48 * 1024).contains(&max_output_bytes)
+        {
+            return Err(Error::Denied("invalid source Process Job configuration"));
+        }
+        executor.revalidate()?;
+        Ok(Self {
+            root,
+            backend: ShellBackend::Source {
+                binding: executor.runtime_binding(),
+                executor: Arc::downgrade(&executor),
+            },
+            tool_name: operation.model_name(),
+            max_output_bytes,
+        })
+    }
+
+    pub(crate) fn source_backed(&self) -> bool {
+        matches!(self.backend, ShellBackend::Source { .. })
     }
 }
 
@@ -152,15 +206,31 @@ impl NativeShell {
     }
 
     pub(crate) fn runtime_binding(&self) -> Result<[u8; 32]> {
-        let (volume, object) = self
-            .executable_identity
+        let ShellBackend::Local {
+            executable,
+            executable_identity,
+            containment,
+            ..
+        } = &self.backend
+        else {
+            let ShellBackend::Source { binding, .. } = &self.backend else {
+                unreachable!()
+            };
+            let mut hash = Sha256::new();
+            hash.update(b"aw-source-process-job-v1\0");
+            hash.update(binding);
+            hash.update(self.tool_name.as_bytes());
+            hash.update((self.max_output_bytes as u64).to_le_bytes());
+            return Ok(hash.finalize().into());
+        };
+        let (volume, object) = executable_identity
             .identity()
             .map_err(|_| Error::Denied("prepared shell executable identity unavailable"))?;
         let mut hash = Sha256::new();
         hash.update(b"aw-native-shell-runtime-v1\0");
         for value in [
             self.tool_name,
-            self.executable.to_string_lossy().as_ref(),
+            executable.to_string_lossy().as_ref(),
             self.root.to_string_lossy().as_ref(),
         ] {
             hash.update((value.len() as u64).to_le_bytes());
@@ -171,7 +241,7 @@ impl NativeShell {
         hash.update((self.max_output_bytes as u64).to_le_bytes());
         // Preserve legacy BestAvailable identities; a stricter sealed plan
         // must never execute against a weaker registered interpreter.
-        match self.containment {
+        match containment {
             ContainmentRequirement::BestAvailable => {}
             ContainmentRequirement::ClosedDescendants => hash.update(b"\0closed-descendants"),
         }
@@ -179,9 +249,25 @@ impl NativeShell {
     }
 
     pub(crate) fn revalidate(&self) -> Result<()> {
-        if !self
-            .executable_identity
-            .is_current(&self.executable)
+        let ShellBackend::Local {
+            executable,
+            executable_identity,
+            ..
+        } = &self.backend
+        else {
+            let ShellBackend::Source { executor, binding } = &self.backend else {
+                unreachable!()
+            };
+            let executor = executor
+                .upgrade()
+                .ok_or(Error::Denied("source Process driver owner is gone"))?;
+            if executor.runtime_binding() != *binding {
+                return Err(Error::Denied("source Process route binding changed"));
+            }
+            return executor.revalidate();
+        };
+        if !executable_identity
+            .is_current(executable)
             .map_err(|_| Error::Denied("prepared shell executable cannot be revalidated"))?
         {
             return Err(Error::Denied("prepared shell executable changed"));
@@ -197,6 +283,11 @@ impl NativeShell {
             footprint::{Access, Extent, Footprint, Scope},
             write_hint::WriteHint,
         };
+        if self.source_backed() {
+            // The complete independently approved source set is claimed,
+            // never the model's advisory write hints.
+            return Footprint::unknown(true, true);
+        }
         let WriteHint::Known(paths) = &prepared.writes else {
             return Footprint::unknown(true, true);
         };
@@ -236,6 +327,29 @@ impl NativeShell {
         let args: Args = serde_json::from_value(v.clone())
             .map_err(|_| Error::Denied("invalid shell arguments"))?;
         let _ = args.parallel;
+        let ShellBackend::Local {
+            executable,
+            path,
+            containment,
+            ..
+        } = &self.backend
+        else {
+            let ShellBackend::Source { executor, .. } = &self.backend else {
+                unreachable!()
+            };
+            return Ok(PreparedShell {
+                launch: ShellLaunch::Source(
+                    executor
+                        .upgrade()
+                        .ok_or(Error::Denied("source Process driver owner is gone"))?,
+                ),
+                stdin: None,
+                interactive: false,
+                timeout: Duration::from_secs(args.timeout_secs.unwrap_or(600)),
+                max_output_bytes: args.max_output_bytes.unwrap_or(self.max_output_bytes),
+                writes: aw_tools::filesystem::write_hint::WriteHint::Unknown,
+            });
+        };
         let cwd = if args.dir == "." {
             self.root.clone()
         } else {
@@ -266,7 +380,7 @@ impl NativeShell {
             args.command,
         ];
         let environment = BTreeMap::from([
-            ("PATH".into(), self.path.clone()),
+            ("PATH".into(), path.clone()),
             ("HOME".into(), self.root.to_string_lossy().into_owned()),
             ("LANG".into(), "C.UTF-8".into()),
         ]);
@@ -284,15 +398,17 @@ impl NativeShell {
             );
         }
         Ok(PreparedShell {
-            launch: PipeSpec {
-                root: cwd,
-                program: self.executable.clone(),
-                args: shell_args,
-                env: environment,
-                stdin_open: args.stdin.is_some() || args.interactive,
-            }
-            .prepare()?
-            .requiring_containment(self.containment),
+            launch: ShellLaunch::Local(
+                PipeSpec {
+                    root: cwd,
+                    program: executable.clone(),
+                    args: shell_args,
+                    env: environment,
+                    stdin_open: args.stdin.is_some() || args.interactive,
+                }
+                .prepare()?
+                .requiring_containment(*containment),
+            ),
             stdin: args.stdin.map(String::into_bytes),
             interactive: args.interactive,
             timeout: Duration::from_secs(args.timeout_secs.unwrap_or(600)),
@@ -302,7 +418,7 @@ impl NativeShell {
     }
 }
 pub(crate) struct PreparedShell {
-    pub launch: PreparedPipeLaunch,
+    pub launch: ShellLaunch,
     pub stdin: Option<Vec<u8>>,
     pub interactive: bool,
     pub timeout: Duration,
@@ -331,7 +447,7 @@ fn dot() -> String {
 }
 impl Tool for NativeShell {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
+        let mut spec = ToolSpec {
             name:self.tool_name.into(),
             description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, bounded stdin, interactive input through jobs_send, timeout_secs and per-stream max_output_bytes under host ceilings. Parallel waves require parallel=true and non-overlapping explicit writes scopes on every command. Writes are advisory scheduling hints, never permissions, sandboxing, or coordination guarantees.".into(),
             parameters:json!({"type":"object","properties":{
@@ -346,11 +462,35 @@ impl Tool for NativeShell {
                     "items":{"type":"string"}}
             },"required":["command"],"additionalProperties":false}),
             effect:ToolEffect::Process
+        };
+        if self.source_backed() {
+            spec.description = "Run a foreground Process Job through the independently approved source driver. The driver enforces actual source access and containment. No ambient shell, interactive, background or parallel execution.".into();
+            let properties = spec.parameters["properties"]
+                .as_object_mut()
+                .expect("shell schema properties");
+            for key in ["stdin", "interactive", "parallel", "writes"] {
+                properties.remove(key);
+            }
         }
+        spec
     }
     fn validate(&self, v: &Value) -> Result<()> {
         let args: Args = serde_json::from_value(v.clone())
             .map_err(|_| Error::Denied("bash accepts only a command string"))?;
+        if self.source_backed()
+            && v.as_object().is_none_or(|object| {
+                object.keys().any(|name| {
+                    !matches!(
+                        name.as_str(),
+                        "command" | "dir" | "timeout_secs" | "max_output_bytes"
+                    )
+                })
+            })
+        {
+            return Err(Error::Denied(
+                "source Process Job supports foreground command, dir and bounded limits only",
+            ));
+        }
         if args.command.trim().is_empty()
             || args.command.len() > 16_384
             || args.command.contains('\0')
@@ -383,6 +523,9 @@ impl Tool for NativeShell {
         Ok(())
     }
     fn can_run_parallel(&self, first: &Value, second: &Value) -> bool {
+        if self.source_backed() {
+            return false;
+        }
         use aw_tools::filesystem::write_hint::{normalize_names, overlaps};
         let scopes = |value: &Value| {
             let dir = value.get("dir").and_then(Value::as_str).unwrap_or(".");
@@ -420,8 +563,13 @@ impl Tool for NativeShell {
                 .ok_or(Error::Timeout)?;
             let spawn_cancel = ctx.cancellation.clone();
             let spawn_cancel_signal = ctx.cancellation.clone();
+            let ShellLaunch::Local(launch) = prepared.launch else {
+                return Err(Error::Denied(
+                    "source Process requires its original Job owner",
+                ));
+            };
             let mut process = PipeProcess::spawn_prepared_until(
-                prepared.launch,
+                launch,
                 deadline,
                 move || spawn_cancel.is_cancelled(),
                 async move { spawn_cancel_signal.cancelled().await },

@@ -683,6 +683,40 @@ impl ProcessReceipt {
     }
 }
 
+/// The existing Job's retained streams, transferred to its actual
+/// Process owner. This is not a new output namespace.
+pub type JobProcessOutputs = (OutputWriter, OutputWriter);
+
+/// Exact foreground one-node Process Job dispatch selected by a trusted
+/// host. The original JobHost retains planning, status and result ownership.
+pub struct SourceJobProcessRequest<'a> {
+    pub context: &'a aw_agent_core::ToolContext,
+    pub operation: aw_tools::OperationId,
+    pub arguments: &'a serde_json::Value,
+    pub outputs: JobProcessOutputs,
+    pub deadline: Instant,
+    pub cancellation: aw_agent_core::CancellationToken,
+}
+
+pub struct SourceJobProcessCompletion {
+    pub receipt: std::result::Result<ProcessReceipt, PipeLaunchFailure>,
+    /// Whether the original source owner has positively recorded settlement.
+    /// This does not replace the physical ProcessTerminal.
+    pub source_settled: bool,
+}
+
+pub type SourceJobProcessFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = SourceJobProcessCompletion> + Send + 'a>>;
+
+/// Explicit immutable host driver route. It must independently enforce
+/// the authorized source environment and containment, and use the original
+/// Process/Job outputs; a shell tool grant is not physical authority.
+pub trait SourceJobProcessExecutor: Send + Sync {
+    fn runtime_binding(&self) -> [u8; 32];
+    fn revalidate(&self) -> crate::Result<()>;
+    fn execute<'a>(&'a self, request: SourceJobProcessRequest<'a>) -> SourceJobProcessFuture<'a>;
+}
+
 enum SpawnOutputTarget {
     None,
     Legacy(HostSpoolFiles),
@@ -965,6 +999,47 @@ impl PipeProcess {
         cancelled_signal: impl Future<Output = ()> + Send + 'static,
         fence: impl FnOnce(SpawnOnce<'_>, &P) + Send + 'static,
     ) -> std::result::Result<Self, PipeLaunchFailure> {
+        Self::spawn_prepared_fenced_inner(
+            launch,
+            SpawnOutputTarget::None,
+            deadline,
+            cancelled,
+            cancelled_signal,
+            fence,
+        )
+        .await
+    }
+
+    /// The same final authority fence with the original Job output writers.
+    /// The Process owner, not the source driver, drains both streams.
+    pub async fn spawn_prepared_fenced_with_job_outputs_until<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        outputs: JobProcessOutputs,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>, &P) + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        let (stdout, stderr) = outputs;
+        Self::spawn_prepared_fenced_inner(
+            launch,
+            SpawnOutputTarget::Job { stdout, stderr },
+            deadline,
+            cancelled,
+            cancelled_signal,
+            fence,
+        )
+        .await
+    }
+
+    async fn spawn_prepared_fenced_inner<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        target: SpawnOutputTarget,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>, &P) + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
         let PreparedPipeLaunch {
             command,
             stdin_open,
@@ -980,7 +1055,7 @@ impl PipeProcess {
         Self::spawn_command_inner(
             command,
             stdin_open,
-            SpawnOutputTarget::None,
+            target,
             None,
             Some(control),
             containment,
