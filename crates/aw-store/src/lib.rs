@@ -216,8 +216,8 @@ pub use sandbox_owner::{
     PreparedSandboxAttachment, PreparedSandboxCreate, PreparedSandboxEffect, SandboxAttachment,
     SandboxCreateFrom, SandboxCreateSources, SandboxEffectAuthority, SandboxEffectLaunch,
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
-    SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
-    SandboxLifecycle, SandboxMaterializationRequest, SandboxPolicyEvidence,
+    SandboxEffectRequest, SandboxExecution, SandboxGrantObservation, SandboxGrantPolicy,
+    SandboxGrantStatus, SandboxLifecycle, SandboxMaterializationRequest, SandboxPolicyEvidence,
     SandboxRecoverySelection, SandboxSnapshot, SandboxSourceGrant, SandboxSourceRelease,
     SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility, SourceBindingSummary,
 };
@@ -2273,17 +2273,50 @@ impl SessionStore {
         session: &str,
         branch: &str,
     ) -> Result<(SessionView, SessionHandle)> {
+        self.activate_in(actor, session, branch, None)
+    }
+
+    /// Explicit exact native owner activation. Source-unaware callers
+    /// retain the original fail-closed layout gate.
+    pub fn activate_with_source(
+        &self,
+        source: &SandboxExecution,
+    ) -> Result<(SessionView, SessionHandle)> {
+        self.activate_in(
+            source.actor(),
+            source.agent().session_id(),
+            source.agent().branch_id(),
+            Some(source),
+        )
+    }
+
+    fn activate_in(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        source: Option<&SandboxExecution>,
+    ) -> Result<(SessionView, SessionHandle)> {
+        let guard = sandbox_owner::execution::read(source, self)?;
         let c = self.connection()?;
-        // Activation keeps its historical ID-or-name selector. Pinned readers
-        // use exact IDs and never receive this effect-capable handle.
-        let view = read_branch_view_in(&c, actor, session, branch, false)?;
-        sandbox_owner::require_execution_in(&c, &view.session.id)?;
+        // Legacy selection preserves ID-or-name; native activation exact.
+        let view = read_branch_view_in(&c, actor, session, branch, source.is_some())?;
+        match guard.as_ref() {
+            Some(guard) => sandbox_owner::execution::require_future_in(
+                &c,
+                actor,
+                agent_owner::AgentKey::new(&view.session.id, &view.branch.id),
+                Some(guard),
+            )?,
+            None => sandbox_owner::require_execution_in(&c, &view.session.id)?,
+        }
         let handle = SessionHandle::new(
             self.clone(),
             actor.clone(),
             view.session.id.clone(),
             view.branch.clone(),
-        );
+        )
+        .with_source_execution(source.cloned());
         Ok((view, handle))
     }
     pub fn fork(

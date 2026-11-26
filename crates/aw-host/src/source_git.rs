@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use aw_agent_core::{
-    AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
+    Agent, AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
     SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext, ToolEffect,
     ToolSourceEvidence,
 };
@@ -21,8 +21,8 @@ use aw_git::{
     Repository,
 };
 use aw_store::{
-    SandboxEffectAuthority, SandboxEffectOutcome, SandboxGrantStatus, SandboxSnapshot,
-    SandboxToolRecovery, SessionStore, VersionedSourceBinding,
+    SandboxEffectAuthority, SandboxEffectOutcome, SandboxExecution, SandboxGrantStatus,
+    SandboxSnapshot, SandboxToolRecovery, SessionStore, VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
 use aw_tools_adapter::{
@@ -709,6 +709,21 @@ pub struct GitNativeSourceHost {
     native: SandboxDriverHandle<NativeFilesystemDriver>,
 }
 
+/// A current independent policy guard and the actual verified Git pins.
+struct GitExecutionFence {
+    approval: NativeSourceApprovalGuard,
+    _repositories: Vec<Repository>,
+}
+
+impl SandboxEffectAuthority for GitExecutionFence {
+    fn policy(&self) -> &aw_store::SandboxGrantPolicy {
+        self.approval.policy()
+    }
+    fn tool_ceiling(&self) -> &[aw_agent_core::NamedSourceAccess] {
+        self.approval.tool_ceiling()
+    }
+}
+
 impl GitNativeSourceHost {
     pub fn new(
         approval: NativeSourceApproval,
@@ -796,6 +811,54 @@ impl GitNativeSourceHost {
             authority: guard,
             layout,
         })
+    }
+
+    /// Build the original native-only Agent and its matching live source
+    /// execution scope together. No implicit durable admission change.
+    pub fn build_execution(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+    ) -> Result<(Agent, SandboxExecution)> {
+        let mut agent = self
+            .configure(store, actor.clone(), execution.clone(), builder, options)?
+            .build()?;
+        agent.bind_execution_owner(execution.clone())?;
+        let base = self.approval.read()?.base().to_owned();
+        let base_pin = aw_platform::DirectoryIdentity::open(&base)?;
+        let host = self.clone();
+        let source = SandboxExecution::from_trusted_host(
+            store,
+            actor,
+            execution,
+            base,
+            &agent.tool_binding_authority(),
+            move || {
+                let approval = host.approval.read()?;
+                if !base_pin.is_current(approval.base())? {
+                    return Err(Error::Denied("native source base identity changed"));
+                }
+                host.registry.reader()?.get(&host.native)?;
+                let driver = host.resolver.store.source_driver(&host.resolver.driver)?;
+                let mut repositories = Vec::with_capacity(approval.roots().len());
+                for root in approval.roots() {
+                    let physical = &root.physical;
+                    repositories.push(driver.verify_materialization(
+                        &root.source.binding.binding,
+                        &physical.path,
+                        (physical.volume, physical.object),
+                    )?);
+                }
+                Ok(GitExecutionFence {
+                    approval,
+                    _repositories: repositories,
+                })
+            },
+        )?;
+        Ok((agent, source))
     }
 
     /// Construct the actual root-free tool route on the original builder.

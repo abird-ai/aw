@@ -19,7 +19,99 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: reconcile EventInput journal bridge and formatting
+## Latest local implementation delta — 2026-11-26: live native source Actor/Turn admission
+
+Parent `7b926864bd0aa1a733323933f56eacdf68b88e72` (formatting)
+and `fdcdb549` (EventInput forwarding) are signed, published to AW main;
+the worktree was clean at entry. L5 only. No new schema (Store v60),
+receipt ledger, Actor, queue, execution or tool registry owner.
+
+- Add the owner-local `SandboxExecution` scope: explicit trusted-host
+  acquisition of the live independent policy guard on every admission,
+  exact original Agent/actor/StoreScope and writer epoch, current
+  registered native tool authority (weak identity, exact snapshots),
+  isolated bound Sandbox, original named binding/grant/ACL ceilings,
+  and exact immutable Session layout. Require all approved bindings,
+  matching execution site, no shared Session/Sandbox/layout, no
+  unresolved layout reservation, and unleased complete source set
+  before new Input/Turn. No source-unaware execution gate is widened.
+- `agent_open_with_source` is explicit Manage/CAS under live policy,
+  not approval provisioning or implicit admission on activation.
+  `activate_with_source` returns the original SessionHandle, carrying
+  that scoped acquisition. Persisted open intent survives restart
+  but is not live authority; a fresh configured host decision and
+  durable grant publication are needed. Original held admission,
+  source-free activation, factual close and retirement remain.
+- Existing Actor queue claim, Input prepare/accept/dispatch and
+  original journal begin recheck current scope; begin requires the
+  exact original Dispatching Input (branch anchor, Turn, epoch and
+  prompt digest), never an ambient prompt. Original context and
+  disclosure gates are retained; journal authority/model/tool starts
+  acquire the live policy through their Store transaction. Existing
+  actual native effects keep their own live ToolBinding admission
+  fence and physical realization guard through effect custody.
+  Factual terminal records are not conditional on current approval.
+  The source scope is direct native-only; participant authority,
+  steer/interrupt/freeze/resume, argument revision, retry/routing/web
+  submission and non-native tools do not acquire new source effects.
+  Cancellation remains supported by the original owner.
+- Correct original tool intent observation for the first owner Input
+  segment without participant evidence: corroborate the Run identity
+  with the immutable historical Dispatching Input, produced-from
+  branch anchor, prompt node/digest, writer epoch and exact Input
+  segment identity. No ACL inference or new durable evidence.
+  Preserve the original recovery path for journal-linked source
+  custody even if persisted admission was open. Broader unresolved
+  Run recovery without an original source claim is still held.
+- Existing `GitNativeSourceHost` builds the native route and exact
+  execution scope together. Acquire actual live approval, verify
+  original registered driver and Git materialization pins plus base
+  identity before Store admission. This is an independently controlled
+  layout, not OS-level containment; no physical proof promotion.
+  The original `HostAgentActivation` now consumes the scope, either
+  using already-open intent or explicit Manage/CAS opening. No new
+  worker or alternate inference loop. No CLI flag activates a
+  source-bearing root yet.
+- Real configured Git-backed Actor test: deny before grant and while
+  held, deny source-unaware activation and journal begin without an
+  original Input; first direct Actor Turn executes read/write against
+  actual checkout (Git index unchanged), next original queue item
+  stays pending on hold and live revocation; reopen Store preserving
+  open intent, observe the actual new Sandbox rev after write, create
+  fresh independent approval, reject stale persisted grant, publish
+  new grant by CAS, activate existing host worker and settle original
+  queued Turn once; factual close. No fixture-only authority shim.
+
+Validation: focused real native Actor lifecycle 1/1 (8.13s), grouped
+Agent lifecycle 3/3, Store Sandbox 4/4, Host source Process/native 2/2
+passed. Broader original Actor suite 44/46: two failures in unchanged
+legacy paths, `jobs_send_agent_queue_is_replay_safe_and_revision_fenced`
+(expected stale Agent revision Conflict) and
+`shared_session_submit_keeps_one_agent_branch_and_uses_participant_provider_authority`
+(Session-only permission setup cannot read the Agent binding). The
+failure sites are outside new native scope; baseline was not independently
+re-run, so neither failure is certified pre-existing or dismissed.
+No weakening of those checks or unrelated fixture changes. Strict
+all-feature/all-target Store/Host/CLI Clippy and durable-only/minimal
+all-target checks passed (existing feature-specific dead-code warnings).
+Full all-feature CLI binary link exceeded the 180s time budget; stopped
+without a new executable/version claim. All-target Clippy/type checks
+passed. Pinned Nix/native-platform and cross-repo qualification not repeated.
+
+Next: investigate the two legacy Actor qualification failures before
+broader release. Explicit production configured source-root activation
+through the original CLI/stdio owner is the next implementation slice,
+followed by live withdrawal/stop and original restart reconciliation of
+incomplete source-bearing Turns.
+General shared/forked/multi-source-policy dispatch, source-aware
+Job/Process/Graph/extension execution and physical recovery proof
+remain independently held. Do not treat this direct native scope as
+a generic containment or provider-fence implementation. Git physical
+verification is intentionally conservative per admission; reuse of
+verified live pins without redundant full Git probes remains a hot
+path optimization, subject to preserving exact current mapping proof.
+
+## Previous local implementation delta — 2026-11-26: reconcile EventInput journal bridge and formatting
 
 Parent `b8564e3047e4cc180e6bc935dbbf046584236739` (authenticated
 Sandbox source setter) was independently verified published to main.

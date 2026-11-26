@@ -38,7 +38,10 @@ pub trait SandboxEffectAuthority {
     /// fence with the Store commit. A live external guard remains owned by
     /// self through launch; a ToolBinding publication lock need not cross
     /// an await. Its revocation after admission uses normal Process stop.
-    fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+    fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T>
+    where
+        Self: Sized,
+    {
         admit()
     }
 }

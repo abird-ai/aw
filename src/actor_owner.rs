@@ -237,6 +237,7 @@ pub struct Service {
     branch: String,
     site: String,
     controller: AgentSessionController,
+    source_execution: Option<aw_store::SandboxExecution>,
     state: Arc<Mutex<State>>,
     change: Arc<tokio::sync::Notify>,
 }
@@ -342,6 +343,7 @@ impl Service {
             branch,
             site,
             controller,
+            source_execution: None,
             state: Arc::new(Mutex::new(State::default())),
             change,
         })
@@ -450,6 +452,59 @@ impl Service {
         )?;
         service.verify_rpc_agent(agent)?;
         Ok(service)
+    }
+
+    /// Attach the exact native source scope to the same original Actor
+    /// and journaled Agent. All other constructors remain source-unaware.
+    pub fn attach_for_agent_with_source(
+        store: SessionStore,
+        agent: &Agent,
+        source: aw_store::SandboxExecution,
+    ) -> Result<Self> {
+        if agent.execution_binding() != Some(source.agent())
+            || agent.actor() != source.actor()
+            || !source.matches_tools(&agent.tool_binding_authority())
+        {
+            return Err(Error::Denied(
+                "source execution belongs to another original Agent/tool authority",
+            ));
+        }
+        let mut service = Self::attach_for_agent(
+            store,
+            source.agent().session_id(),
+            source.agent().branch_id(),
+            agent,
+        )?;
+        if service.epoch.get() != source.writer_epoch() {
+            return Err(Error::Denied("source execution writer epoch changed"));
+        }
+        service.source_execution = Some(source);
+        Ok(service)
+    }
+
+    fn prepare_input(&self, admission: ActorInputAdmission) -> Result<ActorInputFact> {
+        match &self.source_execution {
+            Some(source) => self
+                .store
+                .actor_input_prepare_with_source(source, admission),
+            None => self.store.actor_input_prepare(&self.owner, admission),
+        }
+    }
+
+    fn transition_input(
+        &self,
+        admission: &ActorInputAdmission,
+        expect: InputAdmissionState,
+        next: InputAdmissionState,
+    ) -> Result<ActorInputFact> {
+        match &self.source_execution {
+            Some(source) => self
+                .store
+                .actor_input_transition_with_source(source, admission, expect, next),
+            None => self
+                .store
+                .actor_input_transition(&self.owner, admission, expect, next),
+        }
     }
 
     /// One accepted Input per current branch view. We never persist prompt
@@ -614,6 +669,11 @@ impl Service {
         selected: &ProviderSelection,
         text: &str,
     ) -> Result<ActorInputFact> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit participant Inputs",
+            ));
+        }
         if text.is_empty() || text.len() > crate::config::MAX_PROMPT_BYTES || text.contains('\0') {
             return Err(Error::Denied(
                 "participant Agent Input text is invalid or too large",
@@ -693,6 +753,11 @@ impl Service {
         &self,
         agent: &Agent,
     ) -> Result<ParticipantControlAuthority> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit participant Control",
+            ));
+        }
         self.verify_rpc_agent(agent)?;
         let scope = agent.journal_scope()?.ok_or(Error::Denied(
             "participant Control requires a journaled Agent",
@@ -744,6 +809,11 @@ impl Service {
         turn_id: u64,
         request_id: &str,
     ) -> Result<ParticipantInputAdmission> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit steering or shared authority changes",
+            ));
+        }
         if authority.session_id != self.session
             || authority.branch_id != self.branch
             || authority.agent_ref.is_empty()
@@ -794,6 +864,11 @@ impl Service {
         canonical_target: &str,
         text: &str,
     ) -> Result<AuthoritySteerFact> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit steering or shared authority changes",
+            ));
+        }
         if !matches!(
             boundary,
             aw_agent_core::AuthorityBoundaryKind::Steer
@@ -926,6 +1001,11 @@ impl Service {
         boundary: aw_agent_core::AuthorityBoundaryKind,
         text: &str,
     ) -> Result<aw_agent_core::AuthoritySegment> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit steering or shared authority changes",
+            ));
+        }
         self.verify_rpc_state()?;
         match boundary {
             aw_agent_core::AuthorityBoundaryKind::Steer => self
@@ -992,7 +1072,7 @@ impl Service {
         {
             return Err(Error::Conflict("Actor owner has unsettled accepted Input"));
         }
-        self.controller.validate_agent_binding(agent)?;
+        self.verify_rpc_agent(agent)?;
         let scope = agent.journal_scope()?.ok_or(Error::Denied(
             "durable Actor owner needs an actual Session/branch journal",
         ))?;
@@ -1042,8 +1122,7 @@ impl Service {
             priority: message.priority,
             participant,
         };
-        self.store
-            .actor_input_prepare(&self.owner, admission.clone())?;
+        self.prepare_input(admission.clone())?;
         let delivered = if let Some(participant) = &admission.participant {
             self.controller.send_with_authority(
                 message,
@@ -1059,8 +1138,7 @@ impl Service {
                 // immutable acceptance ACK commits, it MUST NOT dispatch.
                 state.input = Some(admission.clone());
                 state.input_sender = Some(input_sender);
-                match self.store.actor_input_transition(
-                    &self.owner,
+                match self.transition_input(
                     &admission,
                     InputAdmissionState::Prepared,
                     InputAdmissionState::Accepted,
@@ -1075,9 +1153,7 @@ impl Service {
             }
             Ok(Delivery::Consumed) | Err(_) => {
                 if self
-                    .store
-                    .actor_input_transition(
-                        &self.owner,
+                    .transition_input(
                         &admission,
                         InputAdmissionState::Prepared,
                         InputAdmissionState::Rejected,
@@ -1094,8 +1170,7 @@ impl Service {
                 // A deferred admission lacks a durable payload/continuation;
                 // an Accepted record would falsely imply a dispatchable Input.
                 state.poisoned = true;
-                let _ = self.store.actor_input_transition(
-                    &self.owner,
+                let _ = self.transition_input(
                     &admission,
                     InputAdmissionState::Prepared,
                     InputAdmissionState::Unknown,
@@ -1677,6 +1752,11 @@ impl Service {
         expected_revision: Option<u64>,
         text: &str,
     ) -> Result<AuthoritySteerFact> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit steer/interrupt",
+            ));
+        }
         self.jobs_authority_update_text(
             ctx,
             canonical_target,
@@ -1696,6 +1776,11 @@ impl Service {
         expected_revision: Option<u64>,
         text: &str,
     ) -> Result<AuthoritySteerFact> {
+        if self.source_execution.is_some() {
+            return Err(Error::Denied(
+                "native source Actor does not admit steer/interrupt",
+            ));
+        }
         self.jobs_authority_update_text(
             ctx,
             canonical_target,
@@ -2554,6 +2639,16 @@ impl Service {
     /// Select the same already-journaled Agent and narrowed Envelope at the
     /// external transport entry; cannot create or select another provider.
     pub fn verify_rpc_agent(&self, agent: &Agent) -> Result<()> {
+        if let Some(source) = &self.source_execution {
+            if agent.execution_binding() != Some(source.agent())
+                || agent.actor() != source.actor()
+                || !source.matches_tools(&agent.tool_binding_authority())
+            {
+                return Err(Error::Denied(
+                    "native source Actor requires its original Agent and registry",
+                ));
+            }
+        }
         self.controller.validate_agent_binding(agent)
     }
 
@@ -2660,7 +2755,7 @@ impl Service {
                 ));
             }
         }
-        self.controller.validate_agent_binding(agent)?;
+        self.verify_rpc_agent(agent)?;
         let scope = agent
             .journal_scope()?
             .ok_or(Error::Denied("queue requires real Agent journal"))?;
@@ -2767,7 +2862,7 @@ impl Service {
             state.claiming = true;
         }
         let result = (|| {
-            self.controller.validate_agent_binding(agent)?;
+            self.verify_rpc_agent(agent)?;
             let scope = agent
                 .journal_scope()?
                 .ok_or(Error::Denied("queue requires journal"))?;
@@ -2781,14 +2876,21 @@ impl Service {
                     "queue receiver branch/Turn/mailbox is not ready",
                 ));
             }
-            self.store.actor_queue_claim_next(
-                &self.owner,
-                &self.session,
-                &self.branch,
-                &self.site,
-                &label(self.actor),
-                self.epoch.get(),
-            )
+            match &self.source_execution {
+                Some(source) => self.store.actor_queue_claim_next_with_source(
+                    source,
+                    &self.site,
+                    &label(self.actor),
+                ),
+                None => self.store.actor_queue_claim_next(
+                    &self.owner,
+                    &self.session,
+                    &self.branch,
+                    &self.site,
+                    &label(self.actor),
+                    self.epoch.get(),
+                ),
+            }
         })();
         let claimed = match result {
             Ok(Some(claim)) => claim,
@@ -2990,8 +3092,7 @@ impl Service {
                             "withdrawn Agent Input differs from durable acceptance",
                         ));
                     }
-                    match self.store.actor_input_transition(
-                        &self.owner,
+                    match self.transition_input(
                         &input,
                         InputAdmissionState::Accepted,
                         InputAdmissionState::Rejected,
@@ -3122,6 +3223,11 @@ impl Service {
         action: ActorControlAction,
         message_id: u64,
     ) -> Result<ActorControlFact> {
+        if self.source_execution.is_some() && action != ActorControlAction::CancelTurn {
+            return Err(Error::Denied(
+                "native source Actor admits cancellation only",
+            ));
+        }
         let mut state = self
             .state
             .lock()
@@ -3262,6 +3368,7 @@ impl Service {
     where
         F: FnMut(&AgentEvent) -> Result<()> + Send,
     {
+        self.verify_rpc_agent(agent)?;
         let admission = {
             let mut state = self
                 .state
@@ -3350,8 +3457,7 @@ impl Service {
                     "Actor Input has no exact SQLite acceptance receipt",
                 ));
             }
-            self.store.actor_input_transition(
-                &self.owner,
+            self.transition_input(
                 &admission,
                 InputAdmissionState::Accepted,
                 InputAdmissionState::Dispatching,
@@ -3392,8 +3498,7 @@ impl Service {
                 ))
             }
             Err(error) => {
-                let _ = self.store.actor_input_transition(
-                    &self.owner,
+                let _ = self.transition_input(
                     &admission,
                     InputAdmissionState::Dispatching,
                     InputAdmissionState::Unknown,
@@ -3408,16 +3513,14 @@ impl Service {
             self.epoch.get(),
             admission.turn_id,
         ) {
-            let _ = self.store.actor_input_transition(
-                &self.owner,
+            let _ = self.transition_input(
                 &admission,
                 InputAdmissionState::Dispatching,
                 InputAdmissionState::Unknown,
             );
             return Err(error);
         }
-        self.store.actor_input_transition(
-            &self.owner,
+        self.transition_input(
             &admission,
             InputAdmissionState::Dispatching,
             InputAdmissionState::Settled,

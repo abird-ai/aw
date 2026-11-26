@@ -965,13 +965,26 @@ pub(crate) fn authorize_model_context_for_participation(
     identity: &aw_agent_core::InvocationIdentity,
     action: crate::SessionParticipationAction,
 ) -> Result<()> {
+    authorize_model_context_with_source(c, session, branch, identity, action, None)
+}
+
+/// Retain the same disclosure, context and participation checks; only the
+/// exact source execution owner can replace the ambient layout refusal.
+pub(crate) fn authorize_model_context_with_source(
+    c: &Connection,
+    session: &str,
+    branch: &BranchInfo,
+    identity: &aw_agent_core::InvocationIdentity,
+    action: crate::SessionParticipationAction,
+    source: Option<&crate::sandbox_owner::execution::SandboxExecutionGuard<'_>>,
+) -> Result<()> {
     match authorize(c, session, &identity.actor, true) {
         Ok(()) => {}
         Err(Error::Denied(_)) => {
             match crate::session_participation::authorize_in(c, &identity.actor, session, action) {
                 Ok(_) => {
                     return authorize_model_context_after_append_authorized(
-                        c, session, branch, identity,
+                        c, session, branch, identity, source,
                     );
                 }
                 Err(Error::Denied(_)) => {}
@@ -982,7 +995,7 @@ pub(crate) fn authorize_model_context_for_participation(
                 && crate::multiplayer::draft_submit_authorized_in(c, session, &identity.actor)?
             {
                 return authorize_model_context_after_append_authorized(
-                    c, session, branch, identity,
+                    c, session, branch, identity, source,
                 );
             }
             return Err(Error::Denied(match action {
@@ -997,7 +1010,7 @@ pub(crate) fn authorize_model_context_for_participation(
         }
         Err(error) => return Err(error),
     }
-    authorize_model_context_after_append_authorized(c, session, branch, identity)
+    authorize_model_context_after_append_authorized(c, session, branch, identity, source)
 }
 
 fn authorize_model_context_after_append_authorized(
@@ -1005,8 +1018,12 @@ fn authorize_model_context_after_append_authorized(
     session: &str,
     branch: &BranchInfo,
     identity: &aw_agent_core::InvocationIdentity,
+    source: Option<&crate::sandbox_owner::execution::SandboxExecutionGuard<'_>>,
 ) -> Result<()> {
-    crate::sandbox_owner::require_execution_in(c, session)?;
+    match source {
+        Some(source) => source.require_in(c, &identity.actor, session, &branch.id, false)?,
+        None => crate::sandbox_owner::require_execution_in(c, session)?,
+    }
     authorize_node(c, session, &branch.head, &identity.actor)?;
     materialized::authorize_projected_for_model(c, &identity.actor, session, branch)?;
     let mut refs = Vec::new();

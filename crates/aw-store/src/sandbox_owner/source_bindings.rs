@@ -984,11 +984,10 @@ pub(crate) fn revalidate_in(
     if !any {
         return Ok(());
     }
-    // A restored source-bearing Agent is discoverable but effect-inert
-    // until the actual source realization/grant admission exists. Never
-    // accept an executable or unowned legacy association on reopen.
-    // Exclusive owner startup may recover original journal-linked effects
-    // while admission remains held. Direct/staged paths stay quiescent-only.
+    // Persisted open admission is intent, never live source authority.
+    // Only an explicit current source execution owner can use it. Keep
+    // exact layout and original unresolved-effect recovery requirements;
+    // direct/staged paths remain quiescent-only.
     let mut query = db(tx.prepare(
         "SELECT a.session_id,a.branch_id,a.admission,b.active_run
          FROM agent_state_current a
@@ -1002,10 +1001,8 @@ pub(crate) fn revalidate_in(
         let branch: String = db(row.get(1))?;
         let admission: String = db(row.get(2))?;
         let active_run: Option<String> = db(row.get(3))?;
-        if admission != "held" {
-            return Err(Error::Denied(
-                "source-bearing Agent requires held admission",
-            ));
+        if !matches!(admission.as_str(), "held" | "open") {
+            return Err(Error::Denied("invalid source-bearing Agent admission"));
         }
         let (project, layout, sandbox, _, lifecycle) =
             super::agent_project_and_layout(tx, &session, &branch)?;

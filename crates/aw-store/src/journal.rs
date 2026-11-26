@@ -18,6 +18,7 @@ pub struct SessionHandle {
     pending_event_input: Arc<Mutex<Option<String>>>,
     pending_retry_operation: Arc<Mutex<Option<String>>>,
     pending_retry_policy: Arc<Mutex<Option<crate::RetryPolicy>>>,
+    source_execution: Option<crate::SandboxExecution>,
     #[cfg(feature = "routing")]
     pending_routing_operation: Arc<Mutex<Option<String>>>,
 }
@@ -164,10 +165,16 @@ impl SessionHandle {
             pending_event_input: Arc::new(Mutex::new(None)),
             pending_retry_operation: Arc::new(Mutex::new(None)),
             pending_retry_policy: Arc::new(Mutex::new(None)),
+            source_execution: None,
             #[cfg(feature = "routing")]
             pending_routing_operation: Arc::new(Mutex::new(None)),
         }
     }
+    pub(crate) fn with_source_execution(mut self, source: Option<crate::SandboxExecution>) -> Self {
+        self.source_execution = source;
+        self
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session
     }
@@ -179,9 +186,11 @@ impl SessionHandle {
     }
     pub fn view(&self) -> Result<SessionView> {
         let b = self.branch()?;
-        self.store
-            .activate(&self.actor, &self.session, &b.id)
-            .map(|x| x.0)
+        match &self.source_execution {
+            Some(source) => self.store.activate_with_source(source),
+            None => self.store.activate(&self.actor, &self.session, &b.id),
+        }
+        .map(|x| x.0)
     }
     pub fn store(&self) -> SessionStore {
         self.store.clone()
@@ -337,6 +346,8 @@ impl SessionHandle {
         Ok(())
     }
     fn begin_sync(&self, start: TurnStart) -> Result<()> {
+        let source =
+            crate::sandbox_owner::execution::read(self.source_execution.as_ref(), &self.store)?;
         let receipt = self
             .pending_web_receipt
             .lock()
@@ -406,7 +417,43 @@ impl SessionHandle {
                 &start.identity,
             )?;
         }
-        context::authorize_model_context(&tx, &self.session, &b, &start.identity)?;
+        if let Some(source) = source.as_ref() {
+            if receipt.is_some()
+                || retry_of.is_some()
+                || routing_operation.is_some()
+                || shared_submission.is_some()
+            {
+                return Err(Error::Denied(
+                    "native source Turn requires its original direct Actor Input",
+                ));
+            }
+            crate::sandbox_owner::execution::require_future_in(
+                &tx,
+                &start.identity.actor,
+                crate::agent_owner::AgentKey::new(&self.session, &b.id),
+                Some(source),
+            )?;
+            crate::model_agent_pause::require_future_admission(&tx, &self.session, &b.id)?;
+            crate::actor_admission::source_dispatch_in(
+                &tx,
+                &self.session,
+                &b.id,
+                &b.head,
+                b.revision,
+                start.turn_id,
+                writer.writer_epoch,
+                &start.prompt,
+                true,
+            )?;
+        }
+        context::authorize_model_context_with_source(
+            &tx,
+            &self.session,
+            &b,
+            &start.identity,
+            crate::SessionParticipationAction::Submit,
+            source.as_ref(),
+        )?;
         if b.revision != cursor.revision
             || b.head != cursor.head
             || b.active_run.is_some()
@@ -684,6 +731,20 @@ impl SessionHandle {
         Ok(())
     }
     fn append_sync(&self, turn_id: u64, entry: JournalEntry) -> Result<()> {
+        let starts = matches!(
+            &entry,
+            JournalEntry::AuthoritySegmentStarted { .. }
+                | JournalEntry::ModelInvocationAdmitted { .. }
+                | JournalEntry::InvocationStarted { .. }
+                | JournalEntry::ToolStarted { .. }
+                | JournalEntry::ToolRevised { .. }
+        );
+        // Current authority is needed for new admissions, not terminal
+        // receipts for already-started effects. Retain it through commit.
+        let source = crate::sandbox_owner::execution::read(
+            self.source_execution.as_ref().filter(|_| starts),
+            &self.store,
+        )?;
         let cursor = self.branch()?;
         let process = self.store.process_identity()?;
         let mut c = self.store.connection()?;
@@ -701,20 +762,40 @@ impl SessionHandle {
         // Factual InvocationFinished/ToolFinished/Assistant receipts are NOT
         // blocked here: already attempted paid/external work must remain
         // journalable for explicit inspection, never discarded/replayed.
-        if matches!(
-            &entry,
-            JournalEntry::AuthoritySegmentStarted { .. }
-                | JournalEntry::ModelInvocationAdmitted { .. }
-                | JournalEntry::InvocationStarted { .. }
-                | JournalEntry::ToolStarted { .. }
-                | JournalEntry::ToolRevised { .. }
-        ) {
+        if starts {
             let admitted_epoch: u64 = db(tx.query_row(
                 "SELECT produced_from_writer_epoch FROM runs WHERE id=?1",
                 [&run],
                 |row| row.get(0),
             ))?;
             workspace_writer::verify_writer_epoch_for_session(&tx, &self.session, admitted_epoch)?;
+            if let Some(source) = source.as_ref() {
+                source.require_in(&tx, &actor, &self.session, &branch.id, false)?;
+                match &entry {
+                    JournalEntry::AuthoritySegmentStarted { segment }
+                        if segment.boundary != AuthorityBoundaryKind::Input =>
+                    {
+                        return Err(Error::Denied(
+                            "native source Turn does not admit shared/control segments",
+                        ));
+                    }
+                    JournalEntry::ToolStarted {
+                        record,
+                        source: evidence,
+                    } => source.require_tool(
+                        &record.call.name,
+                        &record.effect,
+                        &record.execution_site,
+                        evidence.as_ref(),
+                    )?,
+                    JournalEntry::ToolRevised { .. } => {
+                        return Err(Error::Denied(
+                            "native source argument revision is not enabled",
+                        ))
+                    }
+                    _ => {}
+                }
+            }
         }
         let encoded = json(&entry)?;
         if encoded.len() > 2 * aw_agent_core::tool::MAX_TRACE_BYTES {
@@ -952,12 +1033,13 @@ impl SessionHandle {
                             crate::SessionParticipationAction::Control
                         }
                     };
-                    context::authorize_model_context_for_participation(
+                    context::authorize_model_context_with_source(
                         &tx,
                         &self.session,
                         &branch,
                         &admission.identity,
                         action,
+                        source.as_ref(),
                     )?;
                 } else {
                     if admission.identity.actor != actor {
@@ -965,11 +1047,13 @@ impl SessionHandle {
                             "legacy ModelInvocationAdmission actor differs from active run",
                         ));
                     }
-                    context::authorize_model_context(
+                    context::authorize_model_context_with_source(
                         &tx,
                         &self.session,
                         &branch,
                         &admission.identity,
+                        crate::SessionParticipationAction::Submit,
+                        source.as_ref(),
                     )?;
                 }
                 if prior.iter().any(|entry| {
@@ -1052,12 +1136,13 @@ impl SessionHandle {
                                 crate::SessionParticipationAction::Control
                             }
                         };
-                        context::authorize_model_context_for_participation(
+                        context::authorize_model_context_with_source(
                             &tx,
                             &self.session,
                             &branch,
                             identity,
                             action,
+                            source.as_ref(),
                         )?;
                     } else {
                         if identity.actor != actor {
@@ -1065,7 +1150,14 @@ impl SessionHandle {
                                 "legacy provider invocation actor differs from active run",
                             ));
                         }
-                        context::authorize_model_context(&tx, &self.session, &branch, identity)?;
+                        context::authorize_model_context_with_source(
+                            &tx,
+                            &self.session,
+                            &branch,
+                            identity,
+                            crate::SessionParticipationAction::Submit,
+                            source.as_ref(),
+                        )?;
                     }
                 } else {
                     if identity.actor != actor {
@@ -1073,7 +1165,14 @@ impl SessionHandle {
                             "unsegmented provider invocation actor differs from active run",
                         ));
                     }
-                    context::authorize_model_context(&tx, &self.session, &branch, identity)?;
+                    context::authorize_model_context_with_source(
+                        &tx,
+                        &self.session,
+                        &branch,
+                        identity,
+                        crate::SessionParticipationAction::Submit,
+                        source.as_ref(),
+                    )?;
                 }
                 // AW-P6-10H: original paid provider invocations are SERIAL
                 // and strictly ordinal. The primary key (run_id,ordinal)
@@ -1315,6 +1414,10 @@ impl TurnJournal for SessionHandle {
         let this = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 let expected = this.branch()?;
                 let b = branch_in(&c, &this.session, &expected.id)?;
@@ -1322,6 +1425,9 @@ impl TurnJournal for SessionHandle {
                     return Err(Error::Conflict(
                         "stored context changed; reload before inference",
                     ));
+                }
+                if let Some(source) = source.as_ref() {
+                    source.require_in(&c, &this.actor, &this.session, &b.id, false)?;
                 }
                 authorize_append_or_current_shared_submit(&c, &this.actor, &this.session)?;
                 context::authorize_node(&c, &this.session, &b.head, &this.actor)
@@ -1338,6 +1444,10 @@ impl TurnJournal for SessionHandle {
         let identity = identity.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 if identity.actor != this.actor {
                     crate::session_participation::authorize_in(
@@ -1354,7 +1464,14 @@ impl TurnJournal for SessionHandle {
                         "stored context changed; reload before inference",
                     ));
                 }
-                context::authorize_model_context(&c, &this.session, &b, &identity)
+                context::authorize_model_context_with_source(
+                    &c,
+                    &this.session,
+                    &b,
+                    &identity,
+                    crate::SessionParticipationAction::Submit,
+                    source.as_ref(),
+                )
             })
             .await
             .map_err(|_| Error::Storage("context destination gate worker failed"))?
@@ -1370,6 +1487,10 @@ impl TurnJournal for SessionHandle {
         let segment = segment.cloned();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 if identity.actor != this.actor {
                     let segment = segment.as_ref().ok_or(Error::Denied(
@@ -1418,15 +1539,23 @@ impl TurnJournal for SessionHandle {
                             crate::SessionParticipationAction::Control
                         }
                     };
-                    context::authorize_model_context_for_participation(
+                    context::authorize_model_context_with_source(
                         &c,
                         &this.session,
                         &b,
                         &identity,
                         action,
+                        source.as_ref(),
                     )
                 } else {
-                    context::authorize_model_context(&c, &this.session, &b, &identity)
+                    context::authorize_model_context_with_source(
+                        &c,
+                        &this.session,
+                        &b,
+                        &identity,
+                        crate::SessionParticipationAction::Submit,
+                        source.as_ref(),
+                    )
                 }
             })
             .await
@@ -1438,8 +1567,15 @@ impl TurnJournal for SessionHandle {
         let this = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 let b = branch_in(&c, &this.session, &this.branch()?.id)?;
+                if let Some(source) = source.as_ref() {
+                    source.require_in(&c, &this.actor, &this.session, &b.id, false)?;
+                }
                 context::apply::pending_context(&c, &this.actor, &this.session, &b)
             })
             .await
@@ -1456,9 +1592,20 @@ impl TurnJournal for SessionHandle {
         let actor = identity.actor.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 let b = branch_in(&c, &this.session, &this.branch()?.id)?;
-                context::authorize_model_context(&c, &this.session, &b, &identity)?;
+                context::authorize_model_context_with_source(
+                    &c,
+                    &this.session,
+                    &b,
+                    &identity,
+                    crate::SessionParticipationAction::Submit,
+                    source.as_ref(),
+                )?;
                 context::apply::pending_context(&c, &actor, &this.session, &b)
             })
             .await
@@ -1477,6 +1624,10 @@ impl TurnJournal for SessionHandle {
         let actor = identity.actor.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let source = crate::sandbox_owner::execution::read(
+                    this.source_execution.as_ref(),
+                    &this.store,
+                )?;
                 let c = this.store.connection()?;
                 let b = branch_in(&c, &this.session, &this.branch()?.id)?;
                 if identity.actor != this.actor {
@@ -1508,15 +1659,23 @@ impl TurnJournal for SessionHandle {
                             "shared participant attachment authority/audience changed",
                         ));
                     }
-                    context::authorize_model_context_for_participation(
+                    context::authorize_model_context_with_source(
                         &c,
                         &this.session,
                         &b,
                         &identity,
                         action,
+                        source.as_ref(),
                     )?;
                 } else {
-                    context::authorize_model_context(&c, &this.session, &b, &identity)?;
+                    context::authorize_model_context_with_source(
+                        &c,
+                        &this.session,
+                        &b,
+                        &identity,
+                        crate::SessionParticipationAction::Submit,
+                        source.as_ref(),
+                    )?;
                 }
                 context::apply::pending_context(&c, &actor, &this.session, &b)
             })

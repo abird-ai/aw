@@ -104,7 +104,7 @@ impl SourceMutationSet {
         self
     }
 
-    pub(crate) fn require_unleased_in(&self, tx: &Transaction<'_>) -> Result<()> {
+    pub(crate) fn require_unleased_in(&self, tx: &Connection) -> Result<()> {
         if self.scopes.is_empty() {
             return Ok(());
         }

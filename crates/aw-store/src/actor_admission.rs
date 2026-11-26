@@ -255,6 +255,53 @@ fn writer_guard(
     }
     Ok(())
 }
+/// Exact original owner Input at a Run's admission anchor. A current
+/// Dispatching fact is required at Turn begin; later source effects and
+/// recovery can use the immutable original Dispatching transition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn source_dispatch_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    head: &str,
+    revision: u64,
+    turn: u64,
+    writer_epoch: u64,
+    prompt: &str,
+    require_current: bool,
+) -> Result<ActorInputAdmission> {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(prompt.as_bytes()));
+    let all = events(c, session)?;
+    let matches = |fact: &&ActorInputFact| {
+        fact.state == InputAdmissionState::Dispatching
+            && fact.admission.branch_id == branch
+            && fact.admission.branch_head == head
+            && fact.admission.branch_revision == revision
+            && fact.admission.writer_epoch == writer_epoch
+            && fact.admission.turn_id == turn
+            && fact.admission.payload_sha256 == digest
+            && fact.admission.participant.is_none()
+    };
+    let mut matched = all.iter().filter(matches);
+    let fact = matched.next().ok_or(Error::Denied(
+        "source Turn requires its exact original Actor Input dispatch",
+    ))?;
+    if matched.next().is_some()
+        || (require_current
+            && all
+                .iter()
+                .rev()
+                .find(|later| later.admission.request_id == fact.admission.request_id)
+                .is_none_or(|latest| latest.state != InputAdmissionState::Dispatching))
+    {
+        return Err(Error::Denied(
+            "source Turn Actor Input dispatch is ambiguous or no longer current",
+        ));
+    }
+    Ok(fact.admission.clone())
+}
+
 fn append(c: &rusqlite::Connection, actor: &PrincipalId, fact: &ActorInputFact) -> Result<()> {
     audit(
         c,
@@ -289,7 +336,35 @@ impl SessionStore {
         actor: &PrincipalId,
         admission: ActorInputAdmission,
     ) -> Result<ActorInputFact> {
+        self.actor_input_prepare_in(actor, admission, None)
+    }
+
+    pub fn actor_input_prepare_with_source(
+        &self,
+        source: &crate::SandboxExecution,
+        admission: ActorInputAdmission,
+    ) -> Result<ActorInputFact> {
+        self.actor_input_prepare_in(source.actor(), admission, Some(source))
+    }
+
+    fn actor_input_prepare_in(
+        &self,
+        actor: &PrincipalId,
+        admission: ActorInputAdmission,
+        source: Option<&crate::SandboxExecution>,
+    ) -> Result<ActorInputFact> {
         admission.validate()?;
+        if source.is_some_and(|source| {
+            admission.participant.is_some()
+                || admission.writer_epoch != source.writer_epoch()
+                || admission.session_id != source.agent().session_id()
+                || admission.branch_id != source.agent().branch_id()
+        }) {
+            return Err(Error::Denied(
+                "native source admission supports only the exact owner Input",
+            ));
+        }
+        let guard = crate::sandbox_owner::execution::read(source, self)?;
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         writer_guard(&tx, actor, &admission, true)?;
@@ -297,9 +372,11 @@ impl SessionStore {
         // UNDER THE SAME SQLite writer transaction before allocating an
         // Input Prepared fact. A model cannot interrupt its own paid Turn;
         // this only blocks another Turn after the current one.
-        crate::agent_owner::require_future_admission(
+        crate::sandbox_owner::execution::require_future_in(
             &tx,
+            actor,
             crate::agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+            guard.as_ref(),
         )?;
         crate::model_agent_pause::require_future_admission(
             &tx,
@@ -427,6 +504,27 @@ impl SessionStore {
         expect: InputAdmissionState,
         next: InputAdmissionState,
     ) -> Result<ActorInputFact> {
+        self.actor_input_transition_in(actor, admission, expect, next, None)
+    }
+
+    pub fn actor_input_transition_with_source(
+        &self,
+        source: &crate::SandboxExecution,
+        admission: &ActorInputAdmission,
+        expect: InputAdmissionState,
+        next: InputAdmissionState,
+    ) -> Result<ActorInputFact> {
+        self.actor_input_transition_in(source.actor(), admission, expect, next, Some(source))
+    }
+
+    fn actor_input_transition_in(
+        &self,
+        actor: &PrincipalId,
+        admission: &ActorInputAdmission,
+        expect: InputAdmissionState,
+        next: InputAdmissionState,
+        source: Option<&crate::SandboxExecution>,
+    ) -> Result<ActorInputFact> {
         admission.validate()?;
         let legal = matches!(
             (expect, next),
@@ -451,8 +549,37 @@ impl SessionStore {
         if !legal {
             return Err(Error::Denied("invalid Actor Input fact transition"));
         }
+        // Positive new custody/dispatch requires live authority; factual
+        // rejection/Unknown/settlement must remain journalable after withdrawal.
+        let admits = matches!(
+            next,
+            InputAdmissionState::Accepted | InputAdmissionState::Dispatching
+        );
+        if source.is_some_and(|source| {
+            admission.participant.is_some()
+                || admission.writer_epoch != source.writer_epoch()
+                || admission.session_id != source.agent().session_id()
+                || admission.branch_id != source.agent().branch_id()
+        }) {
+            return Err(Error::Denied(
+                "native source Input authority differs from its exact owner",
+            ));
+        }
+        let guard =
+            crate::sandbox_owner::execution::read(if admits { source } else { None }, self)?;
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if admits {
+            match guard.as_ref() {
+                Some(guard) => crate::sandbox_owner::execution::require_future_in(
+                    &tx,
+                    actor,
+                    agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+                    Some(guard),
+                )?,
+                None => crate::sandbox_owner::require_execution_in(&tx, &admission.session_id)?,
+            }
+        }
         writer_guard(
             &tx,
             actor,

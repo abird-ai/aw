@@ -1264,6 +1264,50 @@ impl SessionStore {
         recipient_actor: &str,
         writer_epoch: u64,
     ) -> Result<Option<ClaimedQueueInput>> {
+        self.actor_queue_claim_next_in(
+            owner,
+            session,
+            branch,
+            site,
+            recipient_actor,
+            writer_epoch,
+            None,
+        )
+    }
+
+    pub fn actor_queue_claim_next_with_source(
+        &self,
+        source: &crate::SandboxExecution,
+        site: &str,
+        recipient_actor: &str,
+    ) -> Result<Option<ClaimedQueueInput>> {
+        if site != source.execution_site() {
+            return Err(Error::Denied(
+                "native source queue site differs from the approved route",
+            ));
+        }
+        self.actor_queue_claim_next_in(
+            source.actor(),
+            source.agent().session_id(),
+            source.agent().branch_id(),
+            site,
+            recipient_actor,
+            source.writer_epoch(),
+            Some(source),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn actor_queue_claim_next_in(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        branch: &str,
+        site: &str,
+        recipient_actor: &str,
+        writer_epoch: u64,
+        source: Option<&crate::SandboxExecution>,
+    ) -> Result<Option<ClaimedQueueInput>> {
         if !token(site, 128) || !token(recipient_actor, 128) {
             return Err(Error::Denied("invalid bound queue recipient"));
         }
@@ -1271,6 +1315,7 @@ impl SessionStore {
             .process_identity()?
             .ok_or(Error::Denied("durable queue requires a real owner process"))?;
         let vault = self.local_secret_store()?;
+        let guard = crate::sandbox_owner::execution::read(source, self)?;
         let mut conn = self.connection()?;
         let tx = db(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         writer(&tx, owner, session, writer_epoch)?;
@@ -1278,9 +1323,11 @@ impl SessionStore {
         // queue Claim transaction, before custody/ref decryption or claim
         // append. A rejected attempt must leave Pending intact, including
         // after process restart or an uncertain original paid Turn.
-        crate::agent_owner::require_future_admission(
+        crate::sandbox_owner::execution::require_future_in(
             &tx,
+            owner,
             crate::agent_owner::AgentKey::new(session, branch),
+            guard.as_ref(),
         )?;
         crate::model_agent_pause::require_future_admission(&tx, session, branch)?;
         let turn = safe_to_claim(&tx, session, branch)?;

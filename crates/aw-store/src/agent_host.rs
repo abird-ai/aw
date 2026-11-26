@@ -1304,12 +1304,48 @@ impl SessionStore {
         state: AgentAdmission,
         expected_rev: Option<u64>,
     ) -> Result<AgentSnapshot> {
+        self.agent_admission_in(actor, canonical_ref, state, expected_rev, None)
+    }
+
+    /// Explicit Manage operation under the actual live source execution
+    /// decision. A configured route or persisted grant alone cannot reopen.
+    pub fn agent_open_with_source(
+        &self,
+        manager: &PrincipalId,
+        expected_rev: u64,
+        source: &crate::SandboxExecution,
+    ) -> Result<AgentSnapshot> {
+        self.agent_admission_in(
+            manager,
+            source.agent().canonical_ref(),
+            AgentAdmission::Open,
+            Some(expected_rev),
+            Some(source),
+        )
+    }
+
+    fn agent_admission_in(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        state: AgentAdmission,
+        expected_rev: Option<u64>,
+        source: Option<&crate::SandboxExecution>,
+    ) -> Result<AgentSnapshot> {
+        let guard = crate::sandbox_owner::execution::read(source, self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (session, branch) = key_for_ref_in(&tx, canonical_ref)?;
         let agent = agent_owner::AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, actor, agent, AgentPermission::Manage)?;
-        let (rev, changed) = agent_owner::set_admission(&tx, agent, expected_rev, state.as_str())?;
+        let (rev, changed) = agent_owner::set_admission(
+            &tx,
+            agent,
+            expected_rev,
+            state.as_str(),
+            guard.as_ref(),
+            source.map_or(actor, |source| source.actor()),
+        )?;
         if changed {
             audit(
                 &tx,

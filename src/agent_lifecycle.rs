@@ -679,8 +679,31 @@ impl HostAgentActivation {
     /// Returns Some only when this call installed the live runtime. Exact
     /// create replay returns None when the canonical Agent is already live.
     pub fn activate(&self, canonical_ref: &str) -> Result<Option<ActivatedHostAgent>> {
+        self.activate_in(canonical_ref, None)
+    }
+
+    /// Explicit Manage-authorized opening of an existing source-bearing
+    /// Agent, only after building its original native execution route.
+    #[cfg(feature = "workspace")]
+    pub fn open_and_activate_source(
+        &self,
+        canonical_ref: &str,
+        manager: &PrincipalId,
+        expected_rev: u64,
+    ) -> Result<Option<ActivatedHostAgent>> {
+        self.activate_in(canonical_ref, Some((manager, expected_rev)))
+    }
+
+    fn activate_in(
+        &self,
+        canonical_ref: &str,
+        source_open: Option<(&PrincipalId, u64)>,
+    ) -> Result<Option<ActivatedHostAgent>> {
         let binding = self.binding_for(canonical_ref)?;
         if self.router.has_live_owner(canonical_ref)? {
+            if source_open.is_some() {
+                return Err(Error::Conflict("source Agent already has a live owner"));
+            }
             return Ok(None);
         }
         let execution = AgentExecutionBinding::from_trusted_host(
@@ -688,42 +711,71 @@ impl HostAgentActivation {
             binding.session_id.clone(),
             binding.branch_id.clone(),
         )?;
-        #[cfg(feature = "workspace")]
-        if let Some(host) = &self.source_host {
-            host.preflight(&self.store, &self.actor, &execution, &self.tools)?;
+        // Ordinary activation must still pass its source-free Store
+        // gate before ambient tools are configured. The explicit native
+        // route instead builds from read-only immutable Session metadata,
+        // then activates its exact journal under the actual live policy.
+        let native_source = {
+            #[cfg(feature = "workspace")]
+            {
+                self.source_host.is_some()
+            }
+            #[cfg(not(feature = "workspace"))]
+            {
+                false
+            }
+        };
+        if !native_source && source_open.is_some() {
+            return Err(Error::Denied(
+                "explicit source opening requires a native host",
+            ));
         }
-        // Store activation is read-only but authority-bearing. In particular,
-        // a held source-bearing Agent must not open/reconcile an ambient tool
-        // root before the original execution gate has admitted it.
-        let (view, journal) =
-            self.store
-                .activate(&self.actor, &binding.session_id, &binding.branch_id)?;
+        let legacy = if native_source {
+            None
+        } else {
+            Some(
+                self.store
+                    .activate(&self.actor, &binding.session_id, &binding.branch_id)?,
+            )
+        };
+        let session = match &legacy {
+            Some((view, _)) => view.session.clone(),
+            None => self.store.session(&self.actor, &binding.session_id)?,
+        };
         let mut options = self.options.clone();
-        options.system_prompt = view.session.binding.system_prompt.clone();
+        options.system_prompt = session.binding.system_prompt.clone();
         let mut tools = self.tools.clone();
-        tools.root = view.session.binding.tool_root.clone();
+        tools.root = session.binding.tool_root.clone();
         let builder = Agent::builder_from_selection(self.selection.clone(), options);
         #[cfg(feature = "workspace")]
-        let (configured, native_source) = match &self.source_host {
-            Some(host) => (
-                aw_tools_adapter::ConfiguredLocalTools {
-                    builder: host.configure(
-                        &self.store,
-                        self.actor.clone(),
-                        execution.clone(),
-                        builder,
-                        &tools,
-                    )?,
-                    job_runtime: None,
-                },
-                true,
-            ),
-            None => (self.configure_legacy(builder, tools)?, false),
+        let (mut agent, job_runtime, source) = match &self.source_host {
+            Some(host) => {
+                let (agent, source) = host.build_execution(
+                    &self.store,
+                    self.actor.clone(),
+                    execution.clone(),
+                    builder,
+                    &tools,
+                )?;
+                if let Some((manager, rev)) = source_open {
+                    self.store.agent_open_with_source(manager, rev, &source)?;
+                }
+                (agent, None, Some(source))
+            }
+            None => {
+                let configured = self.configure_legacy(builder, tools)?;
+                (configured.builder.build()?, configured.job_runtime, None)
+            }
         };
         #[cfg(not(feature = "workspace"))]
-        let (configured, native_source) = (self.configure_legacy(builder, tools)?, false);
-        let job_runtime = configured.job_runtime;
-        let mut agent = configured.builder.build()?;
+        let (mut agent, job_runtime, source): (_, _, Option<aw_store::SandboxExecution>) = {
+            let configured = self.configure_legacy(builder, tools)?;
+            (configured.builder.build()?, configured.job_runtime, None)
+        };
+        let (view, journal) = match source.as_ref() {
+            Some(source) => self.store.activate_with_source(source)?,
+            None => legacy.ok_or(Error::Storage("legacy Agent activation missing"))?,
+        };
         agent.load_history(view.history, Some(Arc::new(journal)))?;
         agent.bind_execution_owner(execution)?;
         if !native_source {
@@ -734,12 +786,19 @@ impl HostAgentActivation {
             )?;
         }
 
-        let owner = actor_owner::Service::attach_for_agent(
-            self.store.clone(),
-            &binding.session_id,
-            &binding.branch_id,
-            &agent,
-        )?;
+        let owner = match source {
+            Some(source) => actor_owner::Service::attach_for_agent_with_source(
+                self.store.clone(),
+                &agent,
+                source,
+            )?,
+            None => actor_owner::Service::attach_for_agent(
+                self.store.clone(),
+                &binding.session_id,
+                &binding.branch_id,
+                &agent,
+            )?,
+        };
         let close = Arc::new(RootAgentClose::new(
             self.store.clone(),
             self.actor.clone(),
@@ -995,6 +1054,406 @@ mod tests {
                 unreachable!()
             })
         }
+    }
+
+    #[cfg(all(feature = "workspace", unix))]
+    #[tokio::test]
+    async fn native_source_actor_admission_revalidates_original_live_owner() {
+        use aw_agent_core::{
+            journal::{TurnJournal, TurnStart},
+            CheckpointPolicy, DriverKey, Role, SandboxDriverRegistry, SourceAccess,
+            SourceDriverRegistry, SourceName, ToolCall,
+        };
+        use aw_git::source_driver::GitSourceDriver;
+        use aw_host::{
+            source_filesystem::NativeFilesystemDriver,
+            source_git::{GitNativeSourceHost, GitNativeSourceResolver},
+        };
+        use aw_store::{AgentAdmission, AgentHistoryForkAccess, CheckpointRestoreRequest};
+        use serde_json::json;
+        use std::{fs, io::Write, path::Path, process::Command, time::Duration};
+
+        struct NativeProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Provider for NativeProvider {
+            fn supports_tools(&self) -> bool {
+                true
+            }
+            fn stream_tools<'a>(
+                &'a self,
+                messages: &'a [Message],
+                _model: &'a str,
+                tools: &'a [aw_agent_core::ToolSpec],
+                sink: &'a mut DeltaSink<'_>,
+            ) -> aw_agent_core::provider::ModelFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(tools.len(), 2);
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let user = messages.iter().rposition(|m| m.role == Role::User).unwrap();
+                    let results: Vec<_> = messages[user + 1..]
+                        .iter()
+                        .filter(|m| m.role == Role::Tool)
+                        .collect();
+                    let call = match results.len() {
+                        0 => Some(ToolCall {
+                            id: "read-fixture".into(),
+                            name: "read".into(),
+                            arguments: json!({"path":"tracked"}),
+                        }),
+                        1 => {
+                            assert!(
+                                results[0].content.contains("fixture data"),
+                                "{:?}",
+                                results[0]
+                            );
+                            Some(ToolCall {
+                                id: "write-fixture".into(),
+                                name: "write".into(),
+                                arguments: json!({"path":"created","content":"native actor"}),
+                            })
+                        }
+                        2 => {
+                            sink("done")?;
+                            None
+                        }
+                        _ => panic!("unexpected native tool round"),
+                    };
+                    Ok(aw_agent_core::provider::ModelReply {
+                        meta: CompletionMeta {
+                            finish_reason: if call.is_some() { "tool_calls" } else { "stop" }
+                                .into(),
+                            usage: Usage {
+                                input_tokens: Some(3),
+                                output_tokens: Some(2),
+                            },
+                        },
+                        tool_calls: call.into_iter().collect(),
+                        provider_context: None,
+                    })
+                })
+            }
+            fn stream<'a>(
+                &'a self,
+                _messages: &'a [Message],
+                _model: &'a str,
+                _sink: &'a mut DeltaSink<'_>,
+            ) -> CompletionFuture<'a> {
+                Box::pin(async { Err(Error::Denied("fixture requires native tools")) })
+            }
+        }
+
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(crate::test_support::temp_dir("native-source-actor"));
+        aw_platform::ensure_private_dir(&temp.0).unwrap();
+        let state = temp.0.join("state");
+        let repo = temp.0.join("repo");
+        let initial = temp.0.join("initial");
+        let approvals = temp.0.join("approvals");
+        for path in [&state, &repo, &initial, &approvals] {
+            aw_platform::ensure_private_dir(path).unwrap();
+        }
+        let executable = std::env::var_os("AW_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+        let git = |args: &[&str]| {
+            let out = Command::new(&executable)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(repo.join("tracked"), b"fixture data").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--no-gpg-sign", "-qm", "fixture"]);
+        let index = fs::read(repo.join(".git/index")).unwrap();
+        let registry = SourceDriverRegistry::new();
+        let handle = GitSourceDriver::new(&executable)
+            .unwrap()
+            .register(&registry)
+            .unwrap();
+        let manager = PrincipalId::new(aw_platform::local_principal().unwrap()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        let layout = |path: &Path| StoredSessionBinding {
+            working_directory: path.to_owned(),
+            tool_root: path.to_owned(),
+            system_prompt: "fixture".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "model".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let (parent, branch) = store.create(&manager, "fixture", layout(&initial)).unwrap();
+        let info = store
+            .agent_binding(&manager, &parent.id, &branch.id)
+            .unwrap();
+        let parent_ref = format!(
+            "/d:{}/i:{}/p:{}/a:{}",
+            info.domain_handle, info.identity_handle, info.project_handle, info.agent_handle
+        );
+        let history = store
+            .checkpoint_create_history_only(&manager, &parent_ref, None, "fixture:history")
+            .unwrap();
+        let name = SourceName::new("code").unwrap();
+        let binding = store
+            .source_driver(&handle)
+            .unwrap()
+            .binding(
+                &repo,
+                name.clone(),
+                SourceAccess::ReadWrite,
+                CheckpointPolicy::Required,
+            )
+            .unwrap();
+        let restored = store
+            .checkpoint_restore_baseline(
+                &manager,
+                &CheckpointRestoreRequest {
+                    checkpoint: history.id,
+                    project: None,
+                    title: None,
+                    access: AgentHistoryForkAccess::Private,
+                    task: None,
+                },
+                &layout(&repo),
+                &[binding],
+                "fixture:baseline",
+                "local",
+            )
+            .unwrap();
+        let reference = restored.agent.canonical_ref;
+        let execution = store.agent_execution_binding(&manager, &reference).unwrap();
+        let session = execution.session_id().to_owned();
+        let branch = execution.branch_id().to_owned();
+        let owner = store.session(&manager, &session).unwrap().owner;
+        let sandbox = store
+            .sandbox_get(&manager, restored.agent.sandbox_ref.as_deref().unwrap())
+            .unwrap();
+        let mut config = json!({
+            "version":1, "store_directory":state,
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":manager, "actor":owner, "agent_ref":reference,
+            "sandbox_ref":sandbox.canonical_ref, "sandbox_rev":sandbox.rev,
+            "policy_ref":"host:fixture-native-actor", "base":repo,
+            "directories":[{"name":name, "repository":repo,
+                "repository_identity":aw_platform::DirectoryIdentity::open(&repo).unwrap().identity().unwrap(),
+                "binding_rev":sandbox.sources[0].binding_rev,"access":"read_write"}]
+        });
+        aw_platform::open_private_new(&approvals.join("git-native.json"))
+            .unwrap()
+            .write_all(&serde_json::to_vec(&config).unwrap())
+            .unwrap();
+        let provision = |store: &SessionStore| {
+            let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
+            let approval = resolver
+                .provision_configured_approval(&manager, &approvals)
+                .unwrap();
+            let drivers = SandboxDriverRegistry::new();
+            let native = drivers
+                .register(
+                    DriverKey::builtin("native-filesystem").unwrap(),
+                    NativeFilesystemDriver,
+                )
+                .unwrap();
+            GitNativeSourceHost::new(approval, handle.clone(), drivers, native).unwrap()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seed = Agent::builder(
+            Arc::new(NativeProvider {
+                calls: calls.clone(),
+            }),
+            AgentOptions::new("fixture", "model"),
+        )
+        .account(
+            AccountDescriptor::personal("fixture", owner.clone(), "local", ["model".into()]),
+            owner.clone(),
+            "local",
+        )
+        .build()
+        .unwrap();
+        let selection = seed
+            .provider_accounts()
+            .select(&owner, "fixture", "model")
+            .unwrap();
+        let mut tools = aw_tools_adapter::LocalToolOptions::new(
+            repo.clone(),
+            aw_tools_adapter::ToolMode::Workspace,
+        );
+        tools.selected_tools = vec!["read".into(), "write".into()];
+        let host = provision(&store);
+        let build = |store: &SessionStore, host: &GitNativeSourceHost| {
+            host.build_execution(
+                store,
+                owner.clone(),
+                execution.clone(),
+                Agent::builder_from_selection(
+                    selection.clone(),
+                    AgentOptions::new("fixture", "model"),
+                ),
+                &tools,
+            )
+        };
+        assert!(build(&store, &host).is_err());
+        let grant = host.publish_grant(&manager, 0).unwrap();
+        let (mut agent, source) = build(&store, &host).unwrap();
+        let held = store.agent_get(&manager, &reference).unwrap();
+        assert_eq!(held.admission, AgentAdmission::Held);
+        assert!(store.activate_with_source(&source).is_err());
+        assert!(store
+            .agent_admission(&manager, &reference, AgentAdmission::Open, Some(held.rev))
+            .is_err());
+        store
+            .agent_open_with_source(&manager, held.rev, &source)
+            .unwrap();
+        assert!(store.activate(&owner, &session, &branch).is_err());
+        let (view, journal) = store.activate_with_source(&source).unwrap();
+        assert!(journal
+            .begin(TurnStart {
+                turn_id: view.history.next_turn_id,
+                prompt: "unowned".into(),
+                identity: selection.identity().clone()
+            })
+            .await
+            .is_err());
+        agent
+            .load_history(view.history, Some(Arc::new(journal)))
+            .unwrap();
+        let actor = actor_owner::Service::attach_for_agent_with_source(
+            store.clone(),
+            &agent,
+            source.clone(),
+        )
+        .unwrap();
+        actor
+            .submit_bound_text(&agent, "perform source task")
+            .unwrap();
+        let turn = actor
+            .run_once(&mut agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            turn.outcome,
+            aw_agent_core::Outcome::Completed,
+            "{:?}",
+            turn
+        );
+        assert_eq!(turn.tool_records.len(), 2);
+        assert_eq!(fs::read(repo.join("created")).unwrap(), b"native actor");
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        actor
+            .enqueue_bound_text(
+                &agent,
+                "fixture:next",
+                2,
+                aw_store::QueueTarget::Auto,
+                0,
+                "second source task",
+            )
+            .unwrap();
+        let held = store
+            .agent_admission(&manager, &reference, AgentAdmission::Held, None)
+            .unwrap();
+        assert!(actor.admit_next_queued(&agent).is_err());
+        store
+            .agent_open_with_source(&manager, held.rev, &source)
+            .unwrap();
+        assert!(host.revoke().await);
+        assert!(actor.admit_next_queued(&agent).is_err());
+        assert!(store.activate_with_source(&source).is_err());
+        assert_eq!(
+            store.sandbox_grant_status(&manager, &reference).unwrap(),
+            grant
+        );
+        assert!(store
+            .actor_queue_list(&owner, &session)
+            .unwrap()
+            .iter()
+            .all(|fact| fact.state == aw_store::QueueState::Pending));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        drop(actor);
+        drop(agent);
+        drop(source);
+        drop(host);
+        drop(store);
+
+        // Same durable open intent and pending ciphertext, but no live grant.
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        assert!(store.activate(&owner, &session, &branch).is_err());
+        // The fixture is the independent approving host. Observe the
+        // committed write's new Sandbox revision before approving again.
+        let current = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+        assert!(current.rev > sandbox.rev);
+        assert_eq!(current.sources, sandbox.sources);
+        config["sandbox_rev"] = json!(current.rev);
+        fs::write(
+            approvals.join("git-native.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let host = provision(&store);
+        assert!(build(&store, &host).is_err());
+        host.publish_grant(&manager, grant.revision).unwrap();
+        let router = Arc::new(agent_jobs::Router::new(store.clone(), owner.clone(), 8).unwrap());
+        let activation = HostAgentActivation::new(
+            store.clone(),
+            owner.clone(),
+            selection.clone(),
+            AgentOptions::new("fixture", "model"),
+            tools.clone(),
+            router,
+        )
+        .unwrap()
+        .with_git_native_source_host(host);
+        let activated = activation.activate(&reference).unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if store
+                    .read_agent_branch_view(&owner, &session, &branch)
+                    .is_ok_and(|v| {
+                        v.history.turns.len() == 2
+                            && v.history.turns[1].outcome == aw_agent_core::Outcome::Completed
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("original queued source input did not settle");
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
+        activated.close().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.agent_get(&manager, &reference).unwrap().lifecycle
+                    == AgentLifecycle::Closed
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

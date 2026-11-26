@@ -127,7 +127,8 @@ fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Resu
         None
     };
     // The original authority segment at start, not the current Agent ACL.
-    // An explicitly present segment without actor evidence is insufficient.
+    // The original owner Input has no participant evidence. Only its
+    // exact historical Actor dispatch may corroborate the Run identity.
     let segment: Option<String> = db(c
         .query_row(
             "SELECT payload FROM run_events WHERE run_id=?1 AND seq<?2
@@ -141,12 +142,46 @@ fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Resu
             return Err(Error::Storage("invalid original AuthoritySegment"));
         };
         segment.validate()?;
-        segment
-            .evidence
-            .ok_or(Error::Denied(
-                "original authority segment actor unavailable",
-            ))?
-            .actor
+        match segment.evidence {
+            Some(evidence) => evidence.actor,
+            None if segment.ordinal == 1
+                && segment.boundary == aw_agent_core::AuthorityBoundaryKind::Input =>
+            {
+                let (head, revision, prompt_node): (String, u64, String) = db(c.query_row(
+                    "SELECT produced_from_head,produced_from_revision,prompt_node FROM runs WHERE id=?1",
+                    [&run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ))?;
+                let prompt = crate::node_in(c, &session, &prompt_node)?;
+                let actor = crate::decode::<InvocationIdentity>(&identity)?.actor;
+                let input = crate::actor_admission::source_dispatch_in(
+                    c,
+                    &session,
+                    &branch,
+                    &head,
+                    revision,
+                    turn_id,
+                    writer_epoch,
+                    prompt.payload["prompt"]
+                        .as_str()
+                        .ok_or(Error::Storage("source Run prompt unavailable"))?,
+                    false,
+                )?;
+                if prompt.actor != actor
+                    || segment.boundary_id
+                        != format!("input:{}:{}", input.message_id, input.message_id)
+                {
+                    return Err(Error::Denied(
+                        "source Run differs from its original owner Input segment",
+                    ));
+                }
+                actor
+            }
+            None => {
+                return Err(Error::Denied(
+                    "original authority segment actor unavailable",
+                ))
+            }
+        }
     } else {
         crate::decode::<InvocationIdentity>(&identity)?.actor
     };
@@ -567,15 +602,15 @@ pub(crate) fn require_owner_recovery_in(
         let branch: String = db(row.get(1))?;
         let turn: u64 = db(row.get(2))?;
         let key = AgentKey::new(session, &branch);
-        let held: bool = db(c.query_row(
+        let bound: bool = db(c.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_state_current a
-             WHERE a.session_id=?1 AND a.branch_id=?2 AND a.admission='held'
+             WHERE a.session_id=?1 AND a.branch_id=?2 AND a.admission IN ('held','open')
                AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current s WHERE s.sandbox_id=a.sandbox_id))",
             params![session, branch], |row| row.get(0),
         ))?;
-        if !held {
+        if !bound {
             return Err(Error::Denied(
-                "unresolved Run has no held source-bearing Agent",
+                "unresolved Run has no exact source-bearing Agent",
             ));
         }
         let reference = agent_owner::canonical_ref(c, key)?;

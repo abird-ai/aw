@@ -1093,6 +1093,8 @@ pub(crate) fn set_admission(
     agent: AgentKey<'_>,
     expected_rev: Option<u64>,
     state: &str,
+    source: Option<&crate::sandbox_owner::execution::SandboxExecutionGuard<'_>>,
+    source_actor: &PrincipalId,
 ) -> Result<(u64, bool)> {
     validate(agent)?;
     if !matches!(state, "open" | "held") {
@@ -1113,7 +1115,12 @@ pub(crate) fn set_admission(
         ));
     }
     if state == "open" {
-        crate::sandbox_owner::require_execution_in(connection, agent.session)?;
+        match source {
+            Some(source) => {
+                source.require_in(connection, source_actor, agent.session, agent.branch, true)?
+            }
+            None => crate::sandbox_owner::require_execution_in(connection, agent.session)?,
+        }
     }
     if admission == state {
         return Ok((rev, false));

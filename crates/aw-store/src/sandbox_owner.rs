@@ -28,6 +28,8 @@ pub use construction::{
     InspectedSandboxCreate, PreparedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
     SandboxRecoverySelection,
 };
+pub(crate) mod execution;
+pub use execution::SandboxExecution;
 mod grants;
 pub use grants::{
     EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
