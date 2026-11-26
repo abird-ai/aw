@@ -45,6 +45,13 @@ pub trait LiveControlPort: Send + Sync {
     fn apply(&self, operation: Value) -> Result<Value>;
 }
 
+/// Permanently withdraw the independently selected live native source
+/// decision. No target, paths, grant or recovery parameters from transport.
+/// Non-blocking: existing admitted guards may still settle.
+pub trait LiveSourceWithdrawalPort: Send + Sync {
+    fn request_withdrawal(&self) -> bool;
+}
+
 /// Concurrent owner-bound Agent lifecycle port. The transport supplies only
 /// the target ref/revision; Project, provider, Sandbox and execution authority
 /// remain fixed by the already-bound host.
@@ -161,6 +168,9 @@ pub trait Driver {
         false
     }
     fn live_control_port(&self) -> Option<Arc<dyn LiveControlPort>> {
+        None
+    }
+    fn live_source_withdrawal_port(&self) -> Option<Arc<dyn LiveSourceWithdrawalPort>> {
         None
     }
     fn agent_close_port(&self) -> Option<Arc<dyn AgentClosePort>> {
@@ -455,7 +465,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
             "priority",
             "target_turn",
         ]),
-        "actor_step" => Some(&[]),
+        "actor_step" | "native_source_withdraw" => Some(&[]),
         "actor_notice_read" => Some(&["request_id"]),
         _ => None,
     };
@@ -519,6 +529,7 @@ fn bounded_history(turns: &[Turn], limit: usize) -> Value {
 enum Inbound {
     Request(Request, bool),
     LiveResult(Request, std::result::Result<Value, &'static str>),
+    Rejected { id: String, code: &'static str },
     Invalid,
 }
 fn read_bounded_line<R: BufRead>(input: &mut R) -> io::Result<Option<(Vec<u8>, bool)>> {
@@ -554,6 +565,7 @@ fn read_bounded_line<R: BufRead>(input: &mut R) -> io::Result<Option<(Vec<u8>, b
 #[derive(Default)]
 struct ReaderPorts {
     live_control: Option<Arc<dyn LiveControlPort>>,
+    source_withdrawal: Option<Arc<dyn LiveSourceWithdrawalPort>>,
     agent_create: Option<Arc<dyn AgentCreatePort>>,
     agent_close: Option<Arc<dyn AgentClosePort>>,
     agent_state: Option<Arc<dyn AgentStatePort>>,
@@ -569,6 +581,9 @@ fn stdin_reader<R: Read + Send + 'static>(
     ports: ReaderPorts,
 ) {
     let mut reader = BufReader::new(input);
+    // The original connection-local identity budget must precede every
+    // reader-side effect (including cooperative abort), not just output.
+    let mut seen = BTreeSet::<String>::new();
     loop {
         let line = match read_bounded_line(&mut reader) {
             Ok(Some(v)) => v,
@@ -583,6 +598,26 @@ fn stdin_reader<R: Read + Send + 'static>(
                 _ => Inbound::Invalid,
             }
         };
+        if let Inbound::Request(request, _) = &parsed {
+            let code = if seen.contains(&request.id) {
+                Some("duplicate_request_id")
+            } else if seen.len() >= MAX_IDS {
+                Some("request_id_budget_exhausted")
+            } else {
+                seen.insert(request.id.clone());
+                None
+            };
+            if let Some(code) = code {
+                let rejected = Inbound::Rejected {
+                    id: request.id.clone(),
+                    code,
+                };
+                if tx.send(rejected).is_err() || code == "request_id_budget_exhausted" {
+                    break;
+                }
+                continue;
+            }
+        }
         if let Inbound::Request(ref request, ref mut cancel_requested) = parsed {
             if request.method == "abort"
                 && validate_method_params(&request.method, &request.params).is_ok()
@@ -604,7 +639,33 @@ fn stdin_reader<R: Read + Send + 'static>(
         // from the current provider. Its reply is queued for orderly bounded
         // output after the original Turn reaches a factual state.
         if let Inbound::Request(request, _) = &parsed {
-            if request.method == "actor_op"
+            if request.method == "native_source_withdraw" {
+                if let Some(port) = &ports.source_withdrawal {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        let newly_withdrawn = port.request_withdrawal();
+                        let cancel_requested = if let Ok(guard) = active.lock() {
+                            if let Some((_, token)) = guard.as_ref() {
+                                token.cancel();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        Ok(json!({
+                            "admission":"withdrawn",
+                            "newly_withdrawn":newly_withdrawn,
+                            "cancel_requested":cancel_requested,
+                            "durable_grant":"unchanged",
+                            "note":"live authority withdrawn; admitted effects may settle; not proof of stop or reconciliation"
+                        }))
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
+            } else if request.method == "actor_op"
                 && request
                     .params
                     .get("operation")
@@ -797,6 +858,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     capabilities["agent_vault_list"] = json!(agent_vault.is_some());
     capabilities["agent_vault_set"] = json!(agent_vault.is_some());
     capabilities["signing_broker_sign"] = json!(driver.can_signing_broker());
+    capabilities["native_source_withdraw"] = json!(driver.live_source_withdrawal_port().is_some());
     out.emit("hello",None,json!({
         "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
         "capabilities":capabilities,
@@ -808,6 +870,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let guard = active.clone();
     let ports = ReaderPorts {
         live_control: driver.live_control_port(),
+        source_withdrawal: driver.live_source_withdrawal_port(),
         agent_create: driver.agent_create_port(),
         agent_close: driver.agent_close_port(),
         agent_state: driver.agent_state_port(),
@@ -816,7 +879,6 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
         checkpoint_read: driver.checkpoint_read_port(),
     };
     let read = thread::spawn(move || stdin_reader(reader, tx, guard, ports));
-    let mut seen = BTreeSet::<String>::new();
     while let Ok(message) = rx.recv() {
         let (request, abort_requested, live_result) = match message {
             Inbound::Invalid => {
@@ -827,27 +889,21 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
                 )?;
                 continue;
             }
+            Inbound::Rejected { id, code } => {
+                out.emit(
+                    "error",
+                    Some(&id),
+                    json!({
+                        "code":code,"status":"rejected",
+                        "note":"inspect durable Session; never resend uncertain prompt"
+                    }),
+                )?;
+                continue;
+            }
             Inbound::Request(r, requested) => (r, requested, None),
             Inbound::LiveResult(r, result) => (r, false, Some(result)),
         };
         let id = request.id.as_str();
-        if !seen.insert(request.id.clone()) {
-            out.emit(
-                "error",
-                Some(id),
-                json!({"code":"duplicate_request_id","status":"rejected",
-                "note":"inspect durable Session; never resend uncertain prompt"}),
-            )?;
-            continue;
-        }
-        if seen.len() > MAX_IDS {
-            out.emit(
-                "error",
-                Some(id),
-                json!({"code":"request_id_budget_exhausted","status":"rejected"}),
-            )?;
-            break;
-        }
         if let Some(result) = live_result {
             match result {
                 Ok(value) => out.emit("response", Some(id), value)?,
@@ -1601,6 +1657,7 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
             r#"{"v":1,"id":"raw-prompt","method":"prompt","params":{"text":"not an Actor Input"}}"#,
             r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
+            r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"duplicate","task":"do not dispatch"}}"#,
             r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
             r#"{"v":1,"id":"agents","method":"agent_list","params":{"limit":8}}"#,
             r#"{"v":1,"id":"agent-get","method":"agent_get","params":{"ref":"."}}"#,

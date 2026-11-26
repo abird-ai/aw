@@ -3339,6 +3339,21 @@ impl Service {
         self.run_once_inner(agent, None, None, on_event).await
     }
 
+    /// Cooperative host stop of the original owner Input, preserving
+    /// its journal/queue settlement instead of dropping the Actor future.
+    pub async fn run_once_with_cancel<F>(
+        &self,
+        agent: &mut Agent,
+        cancel: aw_agent_core::CancellationToken,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+    {
+        self.run_once_inner(agent, None, Some(cancel), on_event)
+            .await
+    }
+
     pub async fn run_once_selected_with_cancel<F>(
         &self,
         agent: &mut Agent,
@@ -3481,9 +3496,11 @@ impl Service {
                     .run_once_verified(agent, &proof, on_event)
                     .await
             }
-            (None, Some(_)) => Err(Error::Config(
-                "durable Agent cancellation requires an exact selected provider".into(),
-            )),
+            (None, Some(cancel)) => {
+                self.controller
+                    .run_once_verified_with_cancel(agent, cancel, &proof, on_event)
+                    .await
+            }
         };
         let turn = match result {
             Ok(Some(turn)) if turn.id == admission.turn_id => turn,

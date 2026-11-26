@@ -45,6 +45,17 @@ pub(crate) struct Activated {
     pub persistent: PersistentSession,
     pub agent: Agent,
     pub owner: aw::actor_owner::Service,
+    pub withdrawal: Arc<Withdrawal>,
+}
+
+/// The same live approval used by the native route and journal. Stdio
+/// authenticates the bound local host; it cannot name another authority.
+pub(crate) struct Withdrawal(GitNativeSourceHost);
+
+impl aw::headless::LiveSourceWithdrawalPort for Withdrawal {
+    fn request_withdrawal(&self) -> bool {
+        self.0.request_withdrawal()
+    }
 }
 
 pub(crate) fn require_native_tools(mode: ToolMode, names: &[String]) -> Result<()> {
@@ -244,6 +255,7 @@ impl Selection {
             persistent,
             agent,
             owner,
+            withdrawal: Arc::new(Withdrawal(host)),
         })
     }
 }

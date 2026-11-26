@@ -2129,6 +2129,9 @@ mod tests {
                         .acquire_source_mutation_barrier(&source, "host:detached-active")
                         .is_err());
                 }
+                assert!(approval.request_withdrawal());
+                assert!(!approval.request_withdrawal());
+                assert!(approval.read().is_err());
                 let revoke = approval.revoke();
                 tokio::pin!(revoke);
                 tokio::select! {

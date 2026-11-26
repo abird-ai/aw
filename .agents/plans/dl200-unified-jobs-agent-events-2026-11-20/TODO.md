@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: production configured native source-root stdio (this checkpoint; local parent `1215c2e3c7c9e63c475a271099f266f34714c59a`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: live native source withdrawal and cooperative Turn cancellation (this checkpoint; local parent `c963f43d4143b5a663cf9940f2e51269f3914b9f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Published AW remote main `7b92686` before this local slice. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1626,8 +1626,23 @@ Current implementation: production configured native source-root stdio (this che
       Agent lifecycle 3/3; strict CLI Clippy, durable/minimal all
       targets, full executable, actual version/help/required-flag
       smoke and scoped fmt/diff passed.
-      **Next:** live withdrawal/stop and original incomplete source
-      Turn restart reconciliation, including independent recovery proof;
+      **Live native source withdrawal landed:** permanent monotonic
+      request closes new actual policy admission immediately, original
+      read guards retained through factual effects; async revoke drains.
+      Exact configured local stdio owner only, no selector, signals
+      current cooperative cancellation via the original verified Actor
+      Turn rather than dropping future. Live withdrawal, stop evidence,
+      durable grant mutation and reconciliation remain distinct.
+      Connection ID/budget gate now precedes concurrent reader effects.
+      Actual executable regression covers active provider cancellation,
+      duplicate/malformed refusal, pending next Input, original
+      unverified attempt and unchanged durable grant/Git state.
+      Executable native RPC 1/1, headless 8/8, Actor 46/46,
+      Agent lifecycle 3/3, Host native/Process 2/2, prior stdio 3/3,
+      Core journal 14/14; strict affected Clippy, durable/minimal
+      targets, full executable/version and scoped fmt/diff passed.
+      **Next:** original incomplete source Turn restart reconciliation
+      and independent native artifact/Process recovery proof;
       separately qualify legacy participant Agent ACL/access_generation
       dispatch. No generic
       shared/forked/participant or non-native execution promotion.

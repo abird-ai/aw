@@ -19,7 +19,97 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: production configured native source-root stdio
+## Latest local implementation delta — 2026-11-26: live native source withdrawal and cooperative Turn cancellation
+
+Parent `c963f43d4143b5a663cf9940f2e51269f3914b9f` (production
+configured native source-root stdio). Published AW main `7b92686`.
+L5 only, clean at entry; no new durable schema or execution owner.
+
+- `NativeSourceApproval::request_withdrawal` is monotonic, nonblocking
+  withdrawal of this one independently selected live policy. The shared
+  atomic fence is checked after acquisition of the original read guard:
+  new admission fails immediately, already admitted guards retain the
+  actual decision/pins through the original factual worker settlement.
+  Existing async `revoke` first withdraws then drains those guards via
+  the original write lock. Neither operation claims physical Process
+  stop, and neither mutates durable SandboxGrant evidence. The revoked
+  in-process owner can never be reactivated. Nonblocking withdrawal may
+  retain the decision/pins until explicit drain or owner destruction.
+- The explicitly configured native root returns the same Git host
+  approval as a narrow `LiveSourceWithdrawalPort`. Only that bound
+  local stdio mode advertises `native_source_withdraw`; strict empty
+  object params, no target/ref/path/provider/revision/recovery selection.
+  Reader thread invokes the one live decision and signals the existing
+  active cancellation token, if any. Response states
+  `{admission:"withdrawn",newly_withdrawn:bool,cancel_requested:bool,
+  durable_grant:"unchanged",note:...}`. No "stopped" or "drained"
+  acknowledgement; no new persisted withdrawal receipt or grant/Agent
+  mutation. Repeated distinct-ID withdrawal is monotonic/idempotent;
+  duplicate frame identity rejected before the port. Existing queued
+  items are not deleted or requeued, no auto resume/renew. New custody
+  crossing during withdrawal can remain uncertain at its original
+  boundary; never assert such a race is a no-effect disposition.
+  Editing/removing private config alone remains insufficient to withdraw
+  an existing live decision; new process startup still needs fresh
+  independent approval and explicit grant CAS. This host control is
+  not available to model tools, shared participants or remote peers.
+- Move the original bounded connection-local request ID/budget check
+  from the response loop to the original stdio input reader, before all
+  concurrent live operations including abort. Single bounded identity
+  set; ordered Rejected response through the same channel. Previously
+  an invalid duplicate identity could reach a concurrent port even
+  though the response loop rejected its result. Existing strict
+  parameter validation and original durable operation receipts remain.
+  No new transport queue or durable request ledger. Live operations
+  still use the bounded reader lane; no claim of hard real-time stop or
+  bypass of reader backpressure.
+- `AgentSessionController::run_once_verified_with_cancel` and
+  `Service::run_once_with_cancel` pass the existing trusted host token
+  into the original default-provider/verified-Input Turn path. Existing
+  selected-provider/participant restrictions retained. Replace stdio
+  Actor step's outer select (which dropped the active future) with this
+  cooperative path. A signal is not a provider-side cancellation proof;
+  attempted paid work records its actual failed/cancelled attempt and
+  unverified usage. Already-started native blocking work retains its
+  original lease/guard until factual completion, or Unknown requiring
+  recovery. A cancelled Turn may still have original independent
+  hazards; protected-output disclosure validation is not weakened.
+- Extend actual executable/loopback fixture: rejected duplicate and
+  malformed withdraw, actual dispatched provider request, withdraw while
+  active, distinct-ID repeated withdrawal, factual cancelled Turn and
+  unverified original attempt, no more model dispatch, next Input
+  remains pending, durable grant still active at original revision,
+  unchanged original Git state. Extend existing detached native worker
+  test: immediate withdrawal denies new admission before drain,
+  existing worker still owns exact source mutation barrier/guard
+  through factual worker settlement; no synthetic ToolFinished.
+  Existing concurrent constructor test also verifies duplicate ID
+  cannot reach its actual port.
+
+Validation (L5, Rust 1.95.0): actual executable native source RPC
+1/1 (9.09s), including live withdrawal during actual seventh provider
+request, duplicate/malformed refusal, repeated withdrawal, cancelled
+original Turn with unverified provider usage, one pending Input left,
+no more dispatch and unchanged grant/Git state. Headless 8/8 (duplicate
+concurrent constructor blocked), Actor owner 46/46, Agent lifecycle
+3/3, Host native/Process 2/2 (immediate withdrawal + detached worker
+drain), prior stdio integration 3/3, Core journal 14/14 passed.
+All-feature/all-target type-check and strict affected Core/Host/CLI
+Clippy, durable-only/minimal all-target checks (existing feature-specific
+dead-code warnings), full all-feature binary build (51.06s incremental)
+and actual version smoke aw 0.15.0, scoped fmt/diff and signature.
+No complete workspace suite, pinned Nix or native-platform qualification
+claimed. No real provider or user source effects.
+
+Next: original incomplete-source Turn restart reconciliation and
+production independent native artifact/Process recovery proof
+acquisition. Live withdrawal is separate from durable grant CAS and
+does not give physical stop or recovery proof. Broader source-aware
+Process/Graph/Job, shared Agent/participant access-generation cutover
+and OS containment remain held. Store v60, Git recovery v4 unchanged.
+Frozen physical Sandbox unchanged.
+
+## Previous local implementation delta — 2026-11-26: production configured native source-root stdio
 
 Parent `1215c2e3c7c9e63c475a271099f266f34714c59a` (queue/history
 correction); published AW main remains `7b92686`. L5, clean at entry.

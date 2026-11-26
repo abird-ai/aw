@@ -763,6 +763,11 @@ impl GitNativeSourceHost {
         self.approval.publish_grant(manager, expected_revision)
     }
 
+    /// Close new live admission without waiting for admitted workers.
+    pub fn request_withdrawal(&self) -> bool {
+        self.approval.request_withdrawal()
+    }
+
     pub async fn revoke(&self) -> bool {
         self.approval.revoke().await
     }

@@ -485,6 +485,24 @@ impl AgentSessionController {
             .await
     }
 
+    /// Cooperative cancellation of the original default-provider claim.
+    /// Retain the same verification and factual Turn settlement; never
+    /// drop the owning future to signal cancellation.
+    pub async fn run_once_verified_with_cancel<F, V>(
+        &self,
+        agent: &mut Agent,
+        parent_cancel: CancellationToken,
+        verify: &V,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+        V: Fn(&ActorMessage, u64) -> Result<()> + Send + Sync,
+    {
+        self.run_once_inner(agent, None, Some(parent_cancel), Some(verify), on_event)
+            .await
+    }
+
     /// Exact selected-provider counterpart used by a durable owning host.
     /// Participant-shared Sessions use this with the participant's explicitly
     /// authorized provider selection and the same claimed Input/Turn writer.

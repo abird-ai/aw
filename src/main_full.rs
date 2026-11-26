@@ -2641,7 +2641,7 @@ fn run_agent_with_shell_containment(
                             pre_dispatch_retries: args.pre_dispatch_retries,
                         },
                     )?;
-                    native_actor = Some((activated.agent, activated.owner));
+                    native_actor = Some((activated.agent, activated.owner, activated.withdrawal));
                     persistent = Some(activated.persistent);
                     None
                 } else {
@@ -3300,11 +3300,12 @@ fn run_agent_with_shell_containment(
     }
     if args.rpc_stdio {
         #[cfg(feature = "workspace")]
-        if let Some((agent, owner)) = native_actor {
+        if let Some((agent, owner, withdrawal)) = native_actor {
             // The real source-aware Actor is already attached. Do not
             // configure ambient tools or allocate a second Runtime.
             host.agent = Some(agent);
             host.actor_owner = Some(owner);
+            host.native_source_withdrawal = Some(withdrawal);
             return aw::headless::serve_stdio(
                 &mut host,
                 io::stdin(),
@@ -3687,6 +3688,8 @@ struct Host {
     last_route_operation: Option<String>,
     agent: Option<Agent>,
     actor_owner: Option<aw::actor_owner::Service>,
+    #[cfg(feature = "workspace")]
+    native_source_withdrawal: Option<Arc<native_source_root::Withdrawal>>,
     agent_jobs_owner: Option<aw::actor_owner::Service>,
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentClose>>,
@@ -5458,6 +5461,8 @@ impl Host {
             last_route_operation: None,
             agent: None,
             actor_owner: None,
+            #[cfg(feature = "workspace")]
+            native_source_withdrawal: None,
             agent_jobs_owner: None,
             agent_job_runtime: None,
             agent_close_owner: None,
@@ -7083,6 +7088,14 @@ impl aw::headless::Driver for Host {
             std::sync::Arc::new(owner.clone()) as std::sync::Arc<dyn aw::headless::LiveControlPort>
         })
     }
+    #[cfg(feature = "workspace")]
+    fn live_source_withdrawal_port(
+        &self,
+    ) -> Option<Arc<dyn aw::headless::LiveSourceWithdrawalPort>> {
+        self.native_source_withdrawal
+            .as_ref()
+            .map(|owner| owner.clone() as Arc<dyn aw::headless::LiveSourceWithdrawalPort>)
+    }
     fn agent_create_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentCreatePort>> {
         self.agent_create_owner
             .as_ref()
@@ -7396,13 +7409,7 @@ impl aw::headless::Driver for Host {
         let canonical = agent
             .execution_binding()
             .map(|binding| binding.canonical_ref().to_owned());
-        let result = tokio.block_on(async {
-            tokio::select! {
-                biased;
-                _=cancel.cancelled()=>Err(Error::Cancelled),
-                result=owner.run_once(agent, |event| emit(event))=>result,
-            }
-        });
+        let result = tokio.block_on(owner.run_once_with_cancel(agent, cancel, |event| emit(event)));
         if let Some(canonical) = canonical.as_deref() {
             let _ = tokio.block_on(self.tools.agent_jobs.deliver_source_events(canonical));
         }

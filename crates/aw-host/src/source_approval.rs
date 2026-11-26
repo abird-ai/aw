@@ -15,7 +15,10 @@ use aw_tools_adapter::native_filesystem::{
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
@@ -97,6 +100,7 @@ struct Decision {
 pub struct NativeSourceApproval {
     store: SessionStore,
     current: Arc<RwLock<Option<Decision>>>,
+    withdrawn: Arc<AtomicBool>,
 }
 
 pub struct NativeSourceApprovalGuard(OwnedRwLockReadGuard<Option<Decision>>);
@@ -293,6 +297,7 @@ impl NativeSourceApproval {
                 tool_ceiling,
                 pin,
             }))),
+            withdrawn: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -307,7 +312,10 @@ impl NativeSourceApproval {
             .clone()
             .try_read_owned()
             .map_err(|_| Error::Denied("native source approval is changing"))?;
-        if guard.is_none() {
+        // Linearize new admission against permanent withdrawal while
+        // holding the real policy guard. A previously admitted guard
+        // retains its exact decision and pins through factual settlement.
+        if guard.is_none() || self.withdrawn.load(Ordering::Acquire) {
             return Err(Error::Denied("native source approval was revoked"));
         }
         Ok(NativeSourceApprovalGuard(guard))
@@ -329,11 +337,19 @@ impl NativeSourceApproval {
         )
     }
 
-    /// New effects fail closed. Admitted native workers may finish while
-    /// retaining their read guard; this is not a Process stop operation.
-    /// This withdraws live host authority only. The existing Store CAS
-    /// owner separately revokes durable grant evidence when requested.
+    /// Permanently close new admission immediately, without waiting for
+    /// any in-flight guard. Returns whether this is the first withdrawal.
+    /// This is a live policy decision, not a stop/drain acknowledgement or
+    /// a durable SandboxGrant mutation. No reactivation of this owner.
+    pub fn request_withdrawal(&self) -> bool {
+        !self.withdrawn.swap(true, Ordering::AcqRel)
+    }
+
+    /// Withdraw and drain the actual admitted policy guards. An admitted
+    /// native worker may settle; this is not a Process stop operation.
+    /// The existing Store CAS owner separately revokes durable evidence.
     pub async fn revoke(&self) -> bool {
+        self.request_withdrawal();
         self.current.write().await.take().is_some()
     }
 

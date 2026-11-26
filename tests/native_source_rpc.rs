@@ -65,7 +65,7 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let counter = calls.clone();
     let thread = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(180);
-        while counter.load(Ordering::SeqCst) < 6 {
+        while counter.load(Ordering::SeqCst) < 7 {
             assert!(Instant::now() < deadline, "provider fixture deadline");
             let (mut socket, _) = match listener.accept() {
                 Ok(value) => value,
@@ -112,6 +112,13 @@ fn fixture_provider() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
             names.sort_unstable();
             assert_eq!(names, ["read", "write"]);
             let ordinal = counter.fetch_add(1, Ordering::SeqCst);
+            if ordinal == 6 {
+                // The owning process has dispatched a real paid attempt.
+                // Withhold the reply until the original cancellation path
+                // drops the request; never invent provider-side stop proof.
+                let _ = socket.read(&mut [0u8; 1]);
+                break;
+            }
             let (delta, reason) = match ordinal % 3 {
                 0 => (
                     json!({"tool_calls":[{"index":0,"id":format!("read-{ordinal}"),"type":"function",
@@ -280,62 +287,61 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         .unwrap();
     drop(store);
 
-    let invoke = |native: bool,
-                  grant: Option<u64>,
-                  open: Option<u64>,
-                  tools: &str,
-                  extras: &[&str],
-                  input: &[Value]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_aw"));
-        command
-            .current_dir(&initial)
-            .env("AW_GIT", &executable)
-            .args(["rpc", "--agent-stdio", "--agent-actor-owner", "--state-dir"])
-            .arg(&state)
-            .args([
-                "--session-id",
-                &session,
-                "--session-branch",
-                &branch,
-                "--config-file",
-            ])
-            .arg(&config_path)
-            .args([
-                "--provider-profile",
-                "llama",
-                "--provider-base-url",
-                &url,
-                "--model-id",
-                "fixture",
-                "--security-allow-insecure-http",
-                "--provider-timeout",
-                "10",
-                "--provider-idle-timeout",
-                "10",
-            ]);
-        if native {
+    let spawn =
+        |native: bool, grant: Option<u64>, open: Option<u64>, tools: &str, extras: &[&str]| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_aw"));
             command
-                .arg("--agent-native-source-root")
-                .arg(&approvals)
-                .args(["--tools-mode", "rw", "--tools-allow", tools]);
-        }
-        if let Some(rev) = grant {
+                .current_dir(&initial)
+                .env("AW_GIT", &executable)
+                .args(["rpc", "--agent-stdio", "--agent-actor-owner", "--state-dir"])
+                .arg(&state)
+                .args([
+                    "--session-id",
+                    &session,
+                    "--session-branch",
+                    &branch,
+                    "--config-file",
+                ])
+                .arg(&config_path)
+                .args([
+                    "--provider-profile",
+                    "llama",
+                    "--provider-base-url",
+                    &url,
+                    "--model-id",
+                    "fixture",
+                    "--security-allow-insecure-http",
+                    "--provider-timeout",
+                    "10",
+                    "--provider-idle-timeout",
+                    "10",
+                ]);
+            if native {
+                command
+                    .arg("--agent-native-source-root")
+                    .arg(&approvals)
+                    .args(["--tools-mode", "rw", "--tools-allow", tools]);
+            }
+            if let Some(rev) = grant {
+                command
+                    .arg("--agent-native-source-grant-rev")
+                    .arg(rev.to_string());
+            }
+            if let Some(rev) = open {
+                command
+                    .arg("--agent-native-source-open-rev")
+                    .arg(rev.to_string());
+            }
+            command.args(extras);
             command
-                .arg("--agent-native-source-grant-rev")
-                .arg(rev.to_string());
-        }
-        if let Some(rev) = open {
-            command
-                .arg("--agent-native-source-open-rev")
-                .arg(rev.to_string());
-        }
-        command.args(extras);
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+    let invoke = |native, grant, open, tools: &str, extras: &[&str], input: &[Value]| {
+        let mut child = spawn(native, grant, open, tools, extras);
         let mut stdin = child.stdin.take().unwrap();
         for request in input {
             writeln!(stdin, "{request}").unwrap();
@@ -473,9 +479,9 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         "{second:?}"
     );
     assert_eq!(settled(&second, "idle")["status"], "idle");
-    provider.join().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 6);
-    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    let store =
+        SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
     let view = store
         .read_agent_branch_view(&owner, &session, &branch)
         .unwrap();
@@ -494,6 +500,135 @@ fn configured_native_root_stdio_uses_original_actor_and_current_grant() {
         2
     );
     assert!(store.activate(&owner, &session, &branch).is_err());
+    approval["sandbox_rev"] = json!(
+        store
+            .sandbox_get(&manager, &sandbox.canonical_ref)
+            .unwrap()
+            .rev
+    );
+    drop(store);
+    fs::write(&approval_path, serde_json::to_vec(&approval).unwrap()).unwrap();
+
+    // Keep the same real executable and provider fixture. A duplicate
+    // transport identity and malformed withdrawal must do nothing;
+    // then withdraw during the actual seventh, in-flight provider call.
+    let mut child = spawn(true, Some(2), None, "read,write", &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        frame("used-id", "get_state", json!({})),
+        frame("used-id", "native_source_withdraw", json!({})),
+        frame(
+            "bad-withdraw",
+            "native_source_withdraw",
+            json!({"ref":"another"}),
+        ),
+        frame(
+            "third",
+            "actor_enqueue",
+            json!({"request_id":"fixture-third","message_id":40,"text":"cancel active task"}),
+        ),
+        frame(
+            "fourth",
+            "actor_enqueue",
+            json!({"request_id":"fixture-fourth","message_id":50,"text":"keep pending task"}),
+        ),
+        frame("active-step", "actor_step", json!({})),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while calls.load(Ordering::SeqCst) != 7 {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            drop(stdin);
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "provider was not dispatched after rejected withdrawal: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for request in [
+        frame("withdraw", "native_source_withdraw", json!({})),
+        frame("withdraw-again", "native_source_withdraw", json!({})),
+        frame("blocked-step", "actor_step", json!({})),
+        frame(
+            "queue-state",
+            "actor_query",
+            json!({"operation":{"op":"list_queue"}}),
+        ),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let third = frames(&child.wait_with_output().unwrap());
+    provider.join().unwrap();
+    assert_eq!(
+        third[0]["data"]["capabilities"]["native_source_withdraw"],
+        true
+    );
+    assert!(third
+        .iter()
+        .any(|event| event["id"] == "used-id" && event["data"]["code"] == "duplicate_request_id"));
+    assert!(third
+        .iter()
+        .any(|event| event["id"] == "bad-withdraw" && event["type"] == "error"));
+    let withdrawn = third
+        .iter()
+        .find(|event| event["id"] == "withdraw" && event["type"] == "response")
+        .unwrap();
+    assert_eq!(withdrawn["data"]["admission"], "withdrawn");
+    assert_eq!(withdrawn["data"]["newly_withdrawn"], true);
+    assert_eq!(withdrawn["data"]["cancel_requested"], true);
+    assert_eq!(withdrawn["data"]["durable_grant"], "unchanged");
+    let repeated = third
+        .iter()
+        .find(|event| event["id"] == "withdraw-again" && event["type"] == "response")
+        .unwrap();
+    assert_eq!(repeated["data"]["newly_withdrawn"], false);
+    let cancelled = settled(&third, "active-step");
+    assert_eq!(cancelled["status"], "settled", "{third:?}");
+    assert_eq!(cancelled["result"]["outcome"], "cancelled", "{cancelled:?}");
+    assert_eq!(
+        cancelled["result"]["attempts"][0]["outcome"],
+        "failed_or_cancelled"
+    );
+    assert_eq!(cancelled["result"]["attempts"][0]["usage_verified"], false);
+    assert_eq!(
+        settled(&third, "blocked-step")["status"],
+        "unknown_or_rejected"
+    );
+    let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+    let view = store
+        .read_agent_branch_view(&owner, &session, &branch)
+        .unwrap();
+    assert_eq!(view.history.turns.len(), 3);
+    assert_eq!(
+        view.history.turns[2].outcome,
+        aw_agent_core::Outcome::Cancelled
+    );
+    assert!(view.branch.active_run.is_none());
+    let queue = store.actor_queue_list(&owner, &session).unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .filter(|fact| fact.state == aw_store::QueueState::Settled)
+            .count(),
+        3
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .filter(|fact| fact.state == aw_store::QueueState::Pending)
+            .count(),
+        1
+    );
+    let grant = store.sandbox_grant_status(&manager, &reference).unwrap();
+    assert_eq!(grant.revision, 3);
+    assert!(grant.active);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
     assert_eq!(git(&["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
     assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"fixture data");
