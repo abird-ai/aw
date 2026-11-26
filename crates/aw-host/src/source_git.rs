@@ -1061,7 +1061,7 @@ impl GitNativeSourceHost {
                 "select the explicit source Process Graph host",
             ));
         }
-        self.build_native_process(store, actor, execution, builder, options, process)
+        self.build_native_process(store, actor, execution, builder, options, (process, None))
     }
 
     /// Explicit fixed foreground native/Process Graph. Both use the
@@ -1084,7 +1084,33 @@ impl GitNativeSourceHost {
                 "source Process Graph requires explicit batch selection",
             ));
         }
-        self.build_native_process(store, actor, execution, builder, options, process)
+        self.build_native_process(store, actor, execution, builder, options, (process, None))
+    }
+
+    /// Explicit derived signing-proof consumer on the original native/
+    /// Process host. Select batch explicitly to include the same Process
+    /// in a foreground Graph. No raw credential or fallback execution.
+    pub fn build_execution_with_signing_process<D: crate::source_process::SourceProcessDriver>(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        execution: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+        process: crate::source_process::SigningSourceProcess<D>,
+    ) -> Result<(
+        Agent,
+        SandboxExecution,
+        Arc<aw_tools_adapter::job_runtime::JobRuntime>,
+    )> {
+        self.build_native_process(
+            store,
+            actor,
+            execution,
+            builder,
+            options,
+            (process.driver, Some(process.projection)),
+        )
     }
 
     fn build_native_process<D: crate::source_process::SourceProcessDriver>(
@@ -1094,7 +1120,10 @@ impl GitNativeSourceHost {
         execution: AgentExecutionBinding,
         builder: AgentBuilder,
         options: &LocalToolOptions,
-        process: SandboxDriverHandle<D>,
+        (process, signing): (
+            SandboxDriverHandle<D>,
+            Option<crate::source_process::SigningProcessProjection>,
+        ),
     ) -> Result<(
         Agent,
         SandboxExecution,
@@ -1119,6 +1148,10 @@ impl GitNativeSourceHost {
             process,
             move || host.execution_fence(&base_pin),
         )?;
+        let process = match signing {
+            Some(signing) => process.with_signing_projection(signing),
+            None => process,
+        };
         process.build_with_native(
             store,
             actor,

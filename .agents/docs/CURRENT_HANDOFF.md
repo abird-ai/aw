@@ -26,7 +26,93 @@ appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-26: registered foreground Process Graph nodes
+## Latest local implementation delta — 2026-11-26: provider-selected signing proof in original Process/Graph runtime
+
+Parent `0f9807f41456f9a29817de4a18fbf304da6417a5`, independently
+verified published AW main at preceding push. Dotlink main `85ceccc1`, frozen
+release `576d0a1a`; all clean at the preceding push. L5 only.
+Store v60, product 0.15.0 and Git recovery v4 unchanged.
+
+- Connect the existing concrete local SigningVaultProvider (dedicated
+  encrypted LocalSecretStore) derived Env proof to the registered
+  foreground Process driver/Job owner. New explicit host-only
+  `SigningProcessProjection::new` selects a typed live provider handle
+  and fixed named entry/scope/grant revision/challenge; validate bounds
+  and exact registry/Env kind. Selection does not confer authority.
+  `SourceProcessHost::with_signing_projection` and
+  `GitNativeSourceHost::build_execution_with_signing_process`
+  (`SigningSourceProcess` typed driver + projection) compose the
+  existing root-free original Agent and source-aware runtime. Batch
+  must be explicitly selected for Graph nodes; the same fixed route
+  also handles direct Process calls. Ordinary routes retain behavior.
+- Require driver opt-in via `prepare_with_signing_proof` (default
+  refusal). The registered driver must enforce its independent
+  physical policy and reviewed proof-consumer/result-disclosure
+  contract. Driver preparation receives only host-selected metadata/
+  challenge, never a derived proof or key. The selected provider
+  identity/revision/entry/scope/challenge/grant participate in the
+  existing in-memory sealed runtime binding, not a new receipt or
+  persisted secret. No model-provided entry/target/key/credential
+  selection, no raw secret export, no ordinary fallback on denial.
+- Reuse the original `signing_projection`, `run_fenced_source_process`,
+  actual one-shot SpawnOnce, original Process receipt, Job streams,
+  source lease and direct/Graph terminal callback. The concrete
+  provider guard and existing current Sandbox/Actor/ToolBinding/
+  Store writer/complete source claim + VaultGrant gate remain held
+  across derived HMAC and synchronous OS spawn. Only the provider
+  reserved AW_VAULT_SIGNING_PROOF value is inserted; collision or
+  stale/missing provider decision refuses before spawn. The Store
+  Vault projection seam now also requires actual Process peer
+  authority (not native or host-origin arbitrary effect). Selection
+  validation uses the existing exact opaque Vault identity rules.
+  No change to the existing effect-bound HMAC encoding, key custody,
+  source effect identity, recovery facts or durable schema.
+- Real Actor/Store/Job grouped regression adds three signed-projection
+  cuts: provider rotation after route installation/activation with
+  stale original grant, prepared reserved environment collision,
+  then valid proof-bearing direct Process and mixed native/Process
+  Graph in the same original Turn. The reviewed fixed Bash builtins
+  require a 64-character lowercase hex proof and emit/write only
+  approved nonsecret outputs. Each case uses actual separate
+  encrypted provider custody and explicit Agent attach. Wrong
+  provider registry refused. Denied projections never start and
+  have exact claimed no-start releases without writable revision
+  advance. Valid direct+Graph writes advance revision twice; actual
+  output metadata, original history, Git index, source/queue recovery
+  and later pending Input preserved. Original native, Process and
+  Graph physical recovery cases retained. Existing lower finite/
+  interactive signing tests remain unchanged. No new grant migration.
+
+Validation (L5, locked/offline final source): Actor lifecycle 3/3
+(40.88s; fifteen deliberate caught Actor losses in grouped fixture),
+Host source Process 2/2 (6.26s), standalone Vault signing 2/2 (1.24s),
+Sandbox owner 4/4 (2.15s), adapter library 259/259 (1.38s), native
+executable 1/1 (34.02s, ordinary and linked layouts). Strict affected
+all-feature/all-target Clippy, durable/minimal checks (existing profile
+dead-code warnings), actual version/help and scoped fmt/diff passed.
+271 distinct selected tests passed. Full workspace, pinned Nix and
+other native platforms not repeated.
+
+Scope: real local provider-specific derived Env proof on explicitly
+reviewed registered Process and serial foreground Graph embedding
+host. No arbitrary shell authorization, byte-level taint, raw secret
+file/env or socket capability, provider-wide mount, generic credential
+export or public default Graph activation. The proof is materialized
+in the reviewed child environment; no retroactive erasure/instant
+revocation or relying-service freshness claim. Fixed fixture asserts
+safe proof consumption, not arbitrary output declassification.
+Underlying general Unix descendant containment remains fail-closed.
+No publication, pin change or frozen release mutation.
+
+Next: qualify actual file/socket capability projection using a concrete
+provider and protected reserved integration point, with exact lifetime/
+retirement under the existing Process owner (no caller-supplied path,
+raw secret without disclosure ceiling, independent second lifecycle,
+or new mount convergence shortcut). Complete protected disclosure and
+provider-specific production dispatch, then remaining physical
+containment/extension, host RPC and retention gates. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-26: registered foreground Process Graph nodes
 
 Parent `148b127c1d18ac73805415d316c81882192b6c5d`; last verified
 published AW main `3eb2da22`, dotlink main `85ceccc1`, frozen release

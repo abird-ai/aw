@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: registered foreground Process Graph nodes (this checkpoint; local parent `148b127c1d18ac73805415d316c81882192b6c5d`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `3eb2da22` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: provider-selected signing proof in original Process/Graph runtime (this checkpoint; local parent `0f9807f41456f9a29817de4a18fbf304da6417a5`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `a747e78`, current owner map and historical design lineage are in the [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1815,9 +1815,23 @@ Current implementation: registered foreground Process Graph nodes (this checkpoi
       actual native executable 1/1, strict affected Clippy,
       durable/minimal, version/help and scoped fmt/diff passed.
       368 selected tests green.
-      **Next:** provider-specific Vault projection through original
-      source-aware Process/Graph owners, general reviewed physical
-      containment and extension dispatch, remaining host RPC/retention. No arbitrary shell CLI
+      **Provider-selected derived signing Env projection:** actual
+      local encrypted provider and host-only typed fixed selection in
+      registered direct/Graph Process route; reviewed driver opt-in,
+      sealed runtime identity, original one-shot spawn/source/Actor/
+      tool/provider/VaultGrant gate, no key or arbitrary target, no
+      unprojected fallback. Real grouped Actor cuts: stale rotation,
+      reserved-name collision and valid proof-bearing direct+mixed
+      Graph, exact no-start/release/revision, original history and
+      later pending Input; wrong registry refused. Actual Process
+      authority required at Vault launch. Actor lifecycle 3/3,
+      Host 2/2, Vault signing 2/2, Sandbox owner 4/4, adapter 259/259,
+      native executable 1/1, strict affected Clippy, durable/minimal,
+      actual version/help and scoped fmt/diff passed. 271 tests green.
+      **Next:** actual protected file/socket capability projection and
+      retirement through original Process owner, protected disclosure,
+      remaining provider-specific production dispatch, reviewed physical
+      containment/extension and host RPC/retention. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
       Separately qualify legacy participant
@@ -1842,7 +1856,7 @@ Current implementation: registered foreground Process Graph nodes (this checkpoi
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 26 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md) §5 for next cuts, limitations and acceptance. Schema v60.
-      Last independently verified published AW main `3eb2da22`, dotlink main
+      Last independently verified published AW main `0f9807f4`, dotlink main
       `85ceccc1`; this next local checkpoint not yet published.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.

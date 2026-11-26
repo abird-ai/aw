@@ -433,9 +433,14 @@ impl SandboxEffectLaunch {
         operation: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
         let target = &vault.policy().target;
-        if target.agent_ref != self.request.agent_ref || target.actor != self.request.actor {
+        if target.agent_ref != self.request.agent_ref
+            || target.actor != self.request.actor
+            || !source
+                .tool_binding()
+                .is_some_and(|binding| binding.effect == aw_agent_core::ToolEffect::Process)
+        {
             return Err(Error::Denied(
-                "Vault projection differs from original Process actor",
+                "Vault projection differs from original Process authority",
             ));
         }
         self.with_launch_in(source, |tx| {

@@ -332,6 +332,25 @@ pub struct SigningProcessProof {
     pub challenge: Vec<u8>,
 }
 
+impl SigningProcessProof {
+    /// The host owns this fixed selection; validate before installing a route
+    /// and again at the actual provider use. This is not grant authority.
+    pub fn validate(&self) -> Result<()> {
+        self.name.validate()?;
+        crate::vault_grants::opaque(&self.entry)?;
+        crate::vault_grants::opaque(&self.scope)?;
+        if self.grant_rev == 0 || self.grant_rev > i64::MAX as u64 {
+            return Err(Error::Conflict("invalid Vault Process grant revision"));
+        }
+        if self.challenge.len() > 64 * 1024 || self.challenge.is_empty() {
+            return Err(Error::Limit(
+                "Vault Process proof requires 1..65536 challenge bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Provider-owned integration point. Neither the Agent nor the grant may
 /// select another environment name or obtain the actual signing key.
 pub const SIGNING_PROOF_ENV: &str = "AW_VAULT_SIGNING_PROOF";
@@ -349,11 +368,7 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         selection: SigningProcessProof,
         project: impl FnOnce(&[u8; 32]) -> Result<R>,
     ) -> Result<R> {
-        if selection.challenge.len() > 64 * 1024 || selection.challenge.is_empty() {
-            return Err(Error::Limit(
-                "Vault Process proof requires 1..65536 challenge bytes",
-            ));
-        }
+        selection.validate()?;
         let provider = registry.get(handle)?;
         provider.with_entry(&selection.entry, |authority| {
             let target = &authority.policy().target;

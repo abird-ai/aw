@@ -1104,6 +1104,10 @@ mod tests {
         const GRAPH_DIRECT_COMMAND: &str =
             "printf graph-direct > graph-direct-created; printf graph-direct-stdout";
         const GRAPH_STRICT_COMMAND: &str = "printf must-not-start > graph-process-strict";
+        // Fixed proof consumers never emit or persist the derived proof,
+        // its challenge or key. No external process or network handoff.
+        const VAULT_GRAPH_COMMAND: &str = "[[ ${#AW_VAULT_SIGNING_PROOF} == 64 && $AW_VAULT_SIGNING_PROOF != *[!0-9a-f]* ]] || exit 41; printf graph-vault > graph-vault-created; printf graph-stdout; printf graph-stderr >&2";
+        const VAULT_DIRECT_COMMAND: &str = "[[ ${#AW_VAULT_SIGNING_PROOF} == 64 && $AW_VAULT_SIGNING_PROOF != *[!0-9a-f]* ]] || exit 41; printf vault-direct > graph-vault-direct; printf graph-direct-stdout";
 
         // A reviewed fixed builtin-only fixture, NOT a general shell
         // containment driver. It never interprets arbitrary model text.
@@ -1113,6 +1117,48 @@ mod tests {
             // Deliberately withhold proof AFTER actual reaping. The later
             // offline fixture can inspect this exact known builtin-only run.
             withheld_proof: Option<Arc<AtomicBool>>,
+            signing_collision: bool,
+        }
+        impl FixedProcessDriver {
+            fn prepare_fixed(
+                &self,
+                plan: &aw_store::SandboxEffectPlan,
+                command_text: &str,
+                collision: bool,
+            ) -> Result<(
+                aw_tools_adapter::process::PreparedPipeLaunch<aw_platform::DirectoryIdentity>,
+                aw_host::source_approval::NativeSourceApprovalGuard,
+            )> {
+                let guard = self.approval.read()?;
+                assert_eq!(plan.grant.sources.len(), 1);
+                assert_eq!(guard.roots().len(), 1);
+                assert_eq!(plan.grant.sources[0], guard.roots()[0].source);
+                assert_eq!(plan.sandbox.tool_root, guard.base());
+                let pin = aw_platform::DirectoryIdentity::open(guard.base())?;
+                assert_eq!(
+                    pin.identity()?,
+                    (
+                        guard.roots()[0].physical.volume,
+                        guard.roots()[0].physical.object
+                    )
+                );
+                let mut command = Command::new(&self.bash);
+                command.env_clear().current_dir(guard.base()).args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    command_text,
+                ]);
+                if collision {
+                    command.env(aw_store::SIGNING_PROOF_ENV, "untrusted-reserved-value");
+                }
+                Ok((
+                    aw_tools_adapter::process::PreparedPipeLaunch::from_trusted_command(
+                        command, false, pin,
+                    ),
+                    guard,
+                ))
+            }
         }
         impl aw_host::source_process::SourceProcessDriver for FixedProcessDriver {
             type Pins = aw_platform::DirectoryIdentity;
@@ -1148,32 +1194,36 @@ mod tests {
                         "fixture driver admits only reviewed fixed commands",
                     ));
                 };
-                let guard = self.approval.read()?;
-                assert_eq!(plan.grant.sources.len(), 1);
-                assert_eq!(guard.roots().len(), 1);
-                assert_eq!(plan.grant.sources[0], guard.roots()[0].source);
-                assert_eq!(plan.sandbox.tool_root, guard.base());
-                let pin = aw_platform::DirectoryIdentity::open(guard.base())?;
-                assert_eq!(
-                    pin.identity()?,
-                    (
-                        guard.roots()[0].physical.volume,
-                        guard.roots()[0].physical.object
-                    )
-                );
-                let mut command = Command::new(&self.bash);
-                command.env_clear().current_dir(guard.base()).args([
-                    "--noprofile",
-                    "--norc",
-                    "-c",
-                    command_text,
-                ]);
-                Ok((
-                    aw_tools_adapter::process::PreparedPipeLaunch::from_trusted_command(
-                        command, false, pin,
-                    ),
-                    guard,
-                ))
+                self.prepare_fixed(plan, command_text, false)
+            }
+            fn prepare_with_signing_proof(
+                &self,
+                plan: &aw_store::SandboxEffectPlan,
+                arguments: &serde_json::Value,
+                selection: &aw_store::SigningProcessProof,
+            ) -> Result<(
+                aw_tools_adapter::process::PreparedPipeLaunch<Self::Pins>,
+                Self::Witness,
+            )> {
+                if selection.name.as_str() != "signing"
+                    || selection.entry != "fixture"
+                    || selection.scope != "fixture-graph-signing"
+                    || selection.challenge != b"reviewed fixture challenge"
+                {
+                    return Err(Error::Denied(
+                        "fixture signing consumer requires its fixed profile",
+                    ));
+                }
+                let command = if arguments == &json!({"command":VAULT_GRAPH_COMMAND}) {
+                    VAULT_GRAPH_COMMAND
+                } else if arguments == &json!({"command":VAULT_DIRECT_COMMAND}) {
+                    VAULT_DIRECT_COMMAND
+                } else {
+                    return Err(Error::Denied(
+                        "fixture admits only reviewed proof consumers",
+                    ));
+                };
+                self.prepare_fixed(plan, command, self.signing_collision)
             }
             fn prove_quiescent(
                 &self,
@@ -1310,17 +1360,28 @@ mod tests {
                         assert_eq!(tools.len(), 2);
                     }
                     let call = match (prompt, results.len()) {
-                        ("interrupt-process-graph-success", 0) => Some(ToolCall {
+                        (
+                            "interrupt-process-graph-success"
+                            | "interrupt-process-graph-vault-success",
+                            0,
+                        ) => Some(ToolCall {
                             id: "graph-direct-process".into(),
                             name: "bash".into(),
-                            arguments: json!({"command":GRAPH_DIRECT_COMMAND}),
+                            arguments: json!({"command":if prompt.ends_with("vault-success") { VAULT_DIRECT_COMMAND } else { GRAPH_DIRECT_COMMAND }}),
                         }),
-                        ("interrupt-process-graph-success", 1)
+                        (
+                            "interrupt-process-graph-success"
+                            | "interrupt-process-graph-vault-success",
+                            1,
+                        )
                         | (
-                            "interrupt-process-graph-recovery" | "interrupt-process-graph-strict",
+                            "interrupt-process-graph-recovery"
+                            | "interrupt-process-graph-strict"
+                            | "interrupt-process-graph-vault-stale"
+                            | "interrupt-process-graph-vault-collision",
                             0,
                         ) => {
-                            if prompt == "interrupt-process-graph-success" {
+                            if prompt.ends_with("success") {
                                 assert!(
                                     results[0].content.contains("graph-direct-stdout"),
                                     "{:?}",
@@ -1334,7 +1395,10 @@ mod tests {
                                 "interrupt-process-graph-recovery" => {
                                     (GRAPH_RECOVERY_COMMAND, "graph-process-recovery")
                                 }
-                                _ => (GRAPH_STRICT_COMMAND, "graph-process-strict"),
+                                "interrupt-process-graph-strict" => {
+                                    (GRAPH_STRICT_COMMAND, "graph-process-strict")
+                                }
+                                _ => (VAULT_GRAPH_COMMAND, "graph-vault-created"),
                             };
                             Some(ToolCall {
                                 id: "source-process-graph".into(),
@@ -1943,6 +2007,7 @@ mod tests {
                         approval: approval.clone(),
                         bash,
                         withheld_proof: None,
+                        signing_collision: false,
                     },
                 )
                 .unwrap();
@@ -2865,10 +2930,27 @@ mod tests {
                 "interrupt-process-graph-recovery",
                 "graph-process-recovery",
             ),
+            (
+                17,
+                "interrupt-process-graph-vault-stale",
+                "graph-vault-created",
+            ),
+            (
+                18,
+                "interrupt-process-graph-vault-collision",
+                "graph-vault-created",
+            ),
+            (
+                19,
+                "interrupt-process-graph-vault-success",
+                "graph-vault-created",
+            ),
         ] {
             let strict = message_id == 15;
             let inspect = message_id == 16;
-            let mixed = message_id == 14;
+            let vault_case = message_id >= 17;
+            let refused = strict || matches!(message_id, 17 | 18);
+            let mixed = matches!(message_id, 14 | 19);
             let observed_terminal = Arc::new(AtomicBool::new(false));
             let bash = std::env::var_os("AW_BASH")
                 .map(PathBuf::from)
@@ -2878,6 +2960,61 @@ mod tests {
                 SessionStore::open_with_sources(&state, registry.clone(), Default::default())
                     .unwrap();
             let before = store.sandbox_get(&manager, &sandbox.canonical_ref).unwrap();
+            let vault = if vault_case {
+                let root = temp.0.join(format!("vault-provider-{message_id}"));
+                aw_platform::ensure_private_dir(&root).unwrap();
+                let provider_key = DriverKey::builtin("fixture-graph-signing").unwrap();
+                let vault_registry = aw_agent_core::VaultProviderRegistry::new();
+                let vault_handle = aw_store::SigningVaultProvider::new(
+                    provider_key.clone(),
+                    aw_store::LocalSecretStore::open(&root).unwrap(),
+                )
+                .unwrap()
+                .register(&vault_registry)
+                .unwrap();
+                let provider = vault_registry.reader().unwrap().get(&vault_handle).unwrap();
+                let target = aw_store::VaultGrantTarget {
+                    agent_ref: reference.clone(),
+                    actor: owner.clone(),
+                    name: SourceName::new("signing").unwrap(),
+                    entry: aw_agent_core::VaultEntryRef {
+                        provider: provider_key,
+                        entry: "fixture".into(),
+                    },
+                    projection: aw_agent_core::VaultProjection::Env,
+                    scope: "fixture-graph-signing".into(),
+                };
+                provider
+                    .provision(&store, &manager, target.clone(), &[71; 32])
+                    .unwrap();
+                let revision = store
+                    .agent_vault_attach_signing(
+                        &manager,
+                        &reference,
+                        &target.name,
+                        store.agent_get(&manager, &reference).unwrap().rev,
+                        &vault_registry.reader().unwrap(),
+                        &vault_handle,
+                        &target.entry.entry,
+                    )
+                    .unwrap();
+                let proof = aw_store::SigningProcessProof {
+                    name: target.name.clone(),
+                    entry: target.entry.entry.clone(),
+                    scope: target.scope.clone(),
+                    grant_rev: revision,
+                    challenge: b"reviewed fixture challenge".to_vec(),
+                };
+                assert!(aw_host::source_process::SigningProcessProjection::new(
+                    aw_agent_core::VaultProviderRegistry::new(),
+                    vault_handle.clone(),
+                    proof.clone(),
+                )
+                .is_err());
+                Some((vault_registry, vault_handle, provider, target, proof))
+            } else {
+                None
+            };
             drop(refresh(&store));
             let resolver = GitNativeSourceResolver::new(store.clone(), handle.clone()).unwrap();
             let approval = resolver
@@ -2899,6 +3036,7 @@ mod tests {
                         approval: approval.clone(),
                         bash: bash.clone(),
                         withheld_proof: inspect.then(|| observed_terminal.clone()),
+                        signing_collision: message_id == 18,
                     },
                 )
                 .unwrap();
@@ -2923,6 +3061,24 @@ mod tests {
                 )
             };
             let build_graph = |options: &aw_tools_adapter::LocalToolOptions| {
+                if let Some((registry, handle, _, _, proof)) = &vault {
+                    let projection = aw_host::source_process::SigningProcessProjection::new(
+                        registry.clone(),
+                        handle.clone(),
+                        proof.clone(),
+                    )?;
+                    return host.build_execution_with_signing_process(
+                        &store,
+                        owner.clone(),
+                        execution.clone(),
+                        builder(),
+                        options,
+                        aw_host::source_process::SigningSourceProcess {
+                            driver: driver.clone(),
+                            projection,
+                        },
+                    );
+                }
                 host.build_execution_with_process_graph(
                     &store,
                     owner.clone(),
@@ -2950,6 +3106,14 @@ mod tests {
                 ["bash", "batch", "read", "write"]
             );
             let (view, journal) = store.activate_with_source(&source).unwrap();
+            if message_id == 17 {
+                let (_, _, provider, target, _) = vault.as_ref().unwrap();
+                // Rotate after the original route was installed and
+                // activated, without reattaching the old Agent grant.
+                provider
+                    .provision(&store, &manager, target.clone(), &[72; 32])
+                    .unwrap();
+            }
             let turn_id = view.history.next_turn_id;
             agent
                 .load_history(view.history, Some(Arc::new(journal)))
@@ -2989,7 +3153,7 @@ mod tests {
                                     record.status,
                                     if inspect {
                                         aw_agent_core::ToolStatus::Interrupted
-                                    } else if strict {
+                                    } else if refused {
                                         aw_agent_core::ToolStatus::Failed
                                     } else {
                                         aw_agent_core::ToolStatus::Succeeded
@@ -2997,10 +3161,24 @@ mod tests {
                                 );
                                 if mixed {
                                     let output = record.output.as_ref().unwrap();
-                                    assert!(output.content.contains("graph-process"), "{output:?}");
+                                    assert!(
+                                        output.content.contains(if vault_case {
+                                            "graph-vault"
+                                        } else {
+                                            "graph-process"
+                                        }),
+                                        "{output:?}"
+                                    );
                                     assert!(output.content.contains("exit=0"), "{output:?}");
                                     assert!(output.content.contains("stdout=12"), "{output:?}");
                                     assert!(output.content.contains("stderr=12"), "{output:?}");
+                                    if vault_case {
+                                        assert!(!output
+                                            .content
+                                            .contains("reviewed fixture challenge"));
+                                        assert!(!output.content.contains("AW_VAULT_SIGNING_PROOF"));
+                                        assert!(!output.content.contains("G".repeat(32).as_str()));
+                                    }
                                 }
                                 panic!("fixture lost original Process Graph Actor");
                             }
@@ -3025,12 +3203,14 @@ mod tests {
                     .rev,
                 before.rev + if mixed { 2 } else { 0 }
             );
-            if strict {
+            if refused {
                 assert!(!repo.join(path).exists());
             } else {
                 assert_eq!(
                     fs::read(repo.join(path)).unwrap(),
-                    if mixed {
+                    if vault_case {
+                        &b"graph-vault"[..]
+                    } else if mixed {
                         &b"graph-process"[..]
                     } else {
                         &b"graph-recovered"[..]
@@ -3038,6 +3218,16 @@ mod tests {
                 );
             }
             assert!(!repo.join("process-graph-skipped").exists());
+            if vault_case {
+                if mixed {
+                    assert_eq!(
+                        fs::read(repo.join("graph-vault-direct")).unwrap(),
+                        b"vault-direct"
+                    );
+                } else {
+                    assert!(!repo.join("graph-vault-direct").exists());
+                }
+            }
             drop(source);
             drop(jobs);
             assert!(jobs_weak.upgrade().is_none());
@@ -3129,6 +3319,7 @@ mod tests {
                             approval: approval.clone(),
                             bash,
                             withheld_proof: None,
+                            signing_collision: false,
                         },
                     )
                     .unwrap();
@@ -3174,7 +3365,7 @@ mod tests {
                 drop(approval);
                 drop(resolver);
             }
-            let expected = if strict {
+            let expected = if refused {
                 aw_store::SandboxEffectOutcome::NotStarted
             } else {
                 aw_store::SandboxEffectOutcome::Settled
@@ -3252,7 +3443,7 @@ mod tests {
             );
             assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 22);
+        assert_eq!(calls.load(Ordering::SeqCst), 26);
         let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
         let host = refresh(&store);
         assert!(build(&store, &host).is_err());
@@ -3274,8 +3465,8 @@ mod tests {
                 if store
                     .read_agent_branch_view(&owner, &session, &branch)
                     .is_ok_and(|v| {
-                        v.history.turns.len() == 16
-                            && v.history.turns[15].outcome == aw_agent_core::Outcome::Completed
+                        v.history.turns.len() == 19
+                            && v.history.turns[18].outcome == aw_agent_core::Outcome::Completed
                     })
                 {
                     break;
@@ -3285,7 +3476,7 @@ mod tests {
         })
         .await
         .expect("original queued source input did not settle");
-        assert_eq!(calls.load(Ordering::SeqCst), 25);
+        assert_eq!(calls.load(Ordering::SeqCst), 29);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         activated.close().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

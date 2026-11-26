@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_GRANTS: usize = 128;
 
-fn opaque(value: &str) -> Result<()> {
+pub(crate) fn opaque(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 512
         || !value

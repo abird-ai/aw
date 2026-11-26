@@ -21,7 +21,9 @@ use aw_tools_adapter::process::{
 use tokio::time::Instant;
 
 mod job;
-pub use job::{SourceProcessDriver, SourceProcessHost};
+pub use job::{
+    SigningProcessProjection, SigningSourceProcess, SourceProcessDriver, SourceProcessHost,
+};
 
 /// Existing Process consumers use the same source/tool authority composition.
 pub type ProcessToolAuthority<A> = SourceToolAuthority<A>;
