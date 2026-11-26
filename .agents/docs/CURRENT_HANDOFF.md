@@ -1,12 +1,14 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md).
 
 Previous Phase-3, Phase-1 and R6 comprehensive handoffs remain historical design/implementation provenance:
+- [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md)
+- [November 26 next-agent prompt](AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md)
@@ -25,6 +27,13 @@ handoff preserves all 24 subsequent signed checkpoints and the prior historical
 appendix. Independent L5 rerun on that implementation: `cargo test --locked
 --offline --all-features --test native_source_rpc -- --nocapture` passed 1/1
 (19.82s). No source change or broader phase qualification in this documentation cut.
+
+November 27 documentation refresh: recovered registry work landed at signed
+`3c67319` with 116 selected tests passed and strict affected checks green.
+The comprehensive handoff preserves all 16 subsequent signed implementation
+records since `7ea0980`, the entire preceding handoff verbatim, and the
+exact signed implementation TODO. Current pointers only; no new source
+change or broader phase qualification in this documentation cut.
 
 ## Latest local implementation delta — 2026-11-27: quiescent SourceDriver and VaultProvider maintenance
 
