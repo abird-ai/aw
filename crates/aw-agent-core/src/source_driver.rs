@@ -704,6 +704,57 @@ pub struct NamedPreparedSource {
     pub prepared: PreparedSourceOperation,
 }
 
+/// Original input to a retained construction recipe.
+#[derive(Clone, Copy)]
+pub enum SourceRecoveryInput<'a> {
+    Binding(&'a SourceBinding),
+    Anchor(&'a SourceAnchor),
+}
+
+impl SourceRecoveryInput<'_> {
+    pub fn pin(self) -> Result<DriverSchemaPin> {
+        match self {
+            Self::Binding(binding) => binding.pin(),
+            Self::Anchor(anchor) => anchor.pin(),
+        }
+    }
+}
+
+/// Exact durable records, borrowed from their original owners during
+/// exclusive registry maintenance. Never a physical or disclosure grant.
+#[derive(Clone, Copy)]
+pub enum RetainedSourceArtifact<'a> {
+    Binding(&'a SourceBinding),
+    Anchor {
+        checkpoint: &'a str,
+        anchor: &'a SourceAnchor,
+    },
+    Materialization {
+        binding: &'a SourceBinding,
+        source: &'a NamedPreparedSource,
+    },
+    Recovery {
+        source: &'a NamedPreparedSource,
+        input: Option<SourceRecoveryInput<'a>>,
+    },
+}
+
+/// Trusted native implementation's explicit, effect-free replacement
+/// contract. No blanket implementation or schema-only default. Validate
+/// the exact candidate configuration and each original retained artifact,
+/// including its recovery/cleanup identity. No probing persisted locators,
+/// mutation, authorization or assumption of current physical availability.
+pub trait SourceDriverCompatibility: Send + Sync + 'static {
+    fn validate_replacement(
+        &self,
+        previous: &Self,
+        driver: &DriverKey,
+        schemas: SourceDriverSchemas,
+    ) -> Result<()>;
+
+    fn validate_retained(&self, artifact: RetainedSourceArtifact<'_>) -> Result<()>;
+}
+
 /// One operation-owned identity and bounded set of per-source descriptors.
 /// All entries describe the same capture or restore. No saved evidence is a
 /// live fence, and none of these fields is credential custody.
@@ -1011,12 +1062,37 @@ impl SourceDriverRegistry {
         implementation: U,
         expected_revision: Option<u64>,
     ) -> Result<SourceDriverHandle<U>> {
+        self.replace_validated(
+            handle,
+            schemas,
+            implementation,
+            expected_revision,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Validate the exact candidate under the same exclusive staged CAS as
+    /// replacement. The attached Store supplies its original custody scan;
+    /// no reader or implementation user can enter between scan and publish.
+    pub fn replace_validated<T: Send + Sync + 'static, U: Send + Sync + 'static>(
+        &mut self,
+        handle: &SourceDriverHandle<T>,
+        schemas: SourceDriverSchemas,
+        implementation: U,
+        expected_revision: Option<u64>,
+        validate: impl FnOnce(&T, &U) -> Result<()>,
+    ) -> Result<SourceDriverHandle<U>> {
         validate_schemas(schemas)?;
         self.require_exclusive()?;
         let stage = self.owner.stage(
             expected_revision,
             |current, revision| {
                 let entry = self.require_current(current, handle)?;
+                entry.implementation.require_idle()?;
+                {
+                    let previous = entry.implementation.get::<T>()?;
+                    validate(&previous, &implementation)?;
+                }
                 entry.implementation.require_idle()?;
                 let driver = handle.driver.clone();
                 let descriptor = SourceDriverDescriptor {

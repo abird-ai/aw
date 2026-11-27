@@ -207,8 +207,14 @@ impl SandboxCreateBoundary {
         }
     }
 
-    pub(crate) fn source_pin(&self, index: usize) -> Result<DriverSchemaPin> {
-        self.input().pin(index)
+    pub(crate) fn source_input(&self, index: usize) -> aw_agent_core::SourceRecoveryInput<'_> {
+        use aw_agent_core::SourceRecoveryInput;
+        match self.input() {
+            SandboxCreateSources::Baseline(set) => SourceRecoveryInput::Anchor(&set.anchors[index]),
+            SandboxCreateSources::Parent(bindings) => {
+                SourceRecoveryInput::Binding(&bindings[index].binding)
+            }
+        }
     }
 
     pub(crate) fn require_compatible(&self, registry: &SourceDriverRegistryReader) -> Result<()> {

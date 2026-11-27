@@ -13,9 +13,10 @@ use crate::{valid_object_id, Error as GitError, Repository};
 use aw_agent_core::{
     CheckpointPolicy, DriverArtifact, DriverKey, DriverNamespace, DriverSchemaPin, Error,
     ExternalEvidence, PreparedSourceOperation, RecoveryDescriptor, RecoveryField,
-    RecoveryFieldKind, RecoveryInspection, Result, SchemaSupport, SourceAccess, SourceAnchor,
-    SourceBinding, SourceDriverHandle, SourceDriverRegistry, SourceDriverSchemas,
-    SourceIdentityField, SourceIdentityFieldKind, SourceName, SourceOperationKind,
+    RecoveryFieldKind, RecoveryInspection, Result, RetainedSourceArtifact, SchemaSupport,
+    SourceAccess, SourceAnchor, SourceBinding, SourceDriverCompatibility, SourceDriverHandle,
+    SourceDriverRegistry, SourceDriverSchemas, SourceIdentityField, SourceIdentityFieldKind,
+    SourceName, SourceOperationKind, SourceRecoveryInput,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +43,14 @@ fn schema(current: u32) -> SchemaSupport {
     SchemaSupport {
         compatible_from: 1,
         current,
+    }
+}
+
+fn schemas() -> SourceDriverSchemas {
+    SourceDriverSchemas {
+        binding: schema(BINDING_SCHEMA),
+        anchor: schema(ANCHOR_SCHEMA),
+        recovery: schema(DERIVE_RECOVERY_SCHEMA),
     }
 }
 
@@ -842,6 +851,75 @@ pub struct GitSourceDriver {
     git: PathBuf,
 }
 
+impl SourceDriverCompatibility for GitSourceDriver {
+    fn validate_replacement(
+        &self,
+        previous: &Self,
+        driver: &DriverKey,
+        declared: SourceDriverSchemas,
+    ) -> Result<()> {
+        // Both definitions are this exact compiled native implementation.
+        // Git executable selection is its only configuration. A different
+        // executable is not evidence of equivalent recovery semantics.
+        if driver != &key() || declared != schemas() || self.git != previous.git {
+            return Err(Error::Conflict(
+                "Git SourceDriver replacement configuration differs",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_retained(&self, artifact: RetainedSourceArtifact<'_>) -> Result<()> {
+        match artifact {
+            RetainedSourceArtifact::Binding(binding) => {
+                materialization_parts(binding)?;
+            }
+            RetainedSourceArtifact::Anchor { checkpoint, anchor } => {
+                let decoded = GitSourceAnchor::try_from(anchor)?;
+                if decoded.checkpoint_id != checkpoint
+                    || SourceAnchor::try_from(&decoded)? != *anchor
+                {
+                    return Err(Error::Conflict(
+                        "Git retained anchor differs from checkpoint identity",
+                    ));
+                }
+            }
+            RetainedSourceArtifact::Materialization { binding, source } => {
+                if source.name != binding.name {
+                    return Err(Error::Conflict("Git retained materialization name differs"));
+                }
+                restore::validate_retained_materialization(&source.prepared, binding)?;
+            }
+            RetainedSourceArtifact::Recovery { source, input } => {
+                let input = input.ok_or(Error::Conflict(
+                    "Git recovery replacement requires original typed input",
+                ))?;
+                match input {
+                    SourceRecoveryInput::Binding(binding) if source.name == binding.name => {
+                        if source.prepared.operation == SourceOperationKind::Capture {
+                            let plan = CapturePlan::decode(&source.prepared)?;
+                            if plan.binding != *binding
+                                || plan.checkpoint_id != source.prepared.descriptor.prepare_id
+                            {
+                                return Err(Error::Conflict(
+                                    "Git capture descriptor differs from original input",
+                                ));
+                            }
+                        } else {
+                            restore::validate_derive_input(&source.prepared, binding)?;
+                        }
+                    }
+                    SourceRecoveryInput::Anchor(anchor) if source.name == anchor.name => {
+                        restore::validate_restore_input(&source.prepared, anchor)?;
+                    }
+                    _ => return Err(Error::Conflict("Git recovery input name differs")),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl GitSourceDriver {
     pub fn new(git: impl AsRef<Path>) -> Result<Self> {
         let git = git.as_ref();
@@ -858,15 +936,7 @@ impl GitSourceDriver {
     }
 
     pub fn register(self, registry: &SourceDriverRegistry) -> Result<SourceDriverHandle<Self>> {
-        registry.register(
-            key(),
-            SourceDriverSchemas {
-                binding: schema(BINDING_SCHEMA),
-                anchor: schema(ANCHOR_SCHEMA),
-                recovery: schema(DERIVE_RECOVERY_SCHEMA),
-            },
-            self,
-        )
+        registry.register(key(), schemas(), self)
     }
 
     fn repository(&self, path: &Path) -> Result<Repository> {

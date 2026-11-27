@@ -1009,14 +1009,14 @@ impl SessionStore {
     }
 }
 
-/// Visit the exact retained binding and managed recovery-schema pins.
+/// Visit exact retained bindings and managed recovery recipes.
 /// Closed retained rows count too. Do not require a current implementation.
-pub(crate) fn visit_driver_pins(
+pub(crate) fn visit_driver_artifacts(
     connection: &Connection,
     driver: &DriverKey,
-    mut visit: impl FnMut(crate::SourceDependencyKind, aw_agent_core::DriverSchemaPin) -> Result<()>,
+    mut visit: impl FnMut(aw_agent_core::RetainedSourceArtifact<'_>) -> Result<()>,
 ) -> Result<()> {
-    use crate::SourceDependencyKind;
+    use aw_agent_core::RetainedSourceArtifact;
     let driver_key = crate::json(driver)?;
     let mut query = db(connection.prepare(
         "SELECT DISTINCT sandbox_id FROM sandbox_source_bindings_current WHERE driver_key=?1 ORDER BY sandbox_id",
@@ -1027,7 +1027,7 @@ pub(crate) fn visit_driver_pins(
         let bindings = versioned_bindings_in(connection, &sandbox)?;
         for binding in &bindings {
             if &binding.binding.driver == driver {
-                visit(SourceDependencyKind::Binding, binding.binding.pin()?)?;
+                visit(RetainedSourceArtifact::Binding(&binding.binding))?;
             }
         }
         // Only genuinely managed layouts have release recipes. Ambiguous
@@ -1036,10 +1036,13 @@ pub(crate) fn visit_driver_pins(
             .is_some()
             || attachment::has_attachment_in(connection, &sandbox)?
         {
-            for source in release::retained_preparations_in(connection, &sandbox, &bindings)? {
-                let pin = source.prepared.descriptor.pin()?;
-                if &pin.driver == driver {
-                    visit(SourceDependencyKind::RetainedMaterialization, pin)?;
+            let preparations = release::retained_preparations_in(connection, &sandbox, &bindings)?;
+            for (binding, source) in bindings.iter().zip(&preparations) {
+                if &source.prepared.descriptor.driver == driver {
+                    visit(RetainedSourceArtifact::Materialization {
+                        binding: &binding.binding,
+                        source,
+                    })?;
                 }
             }
         }

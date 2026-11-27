@@ -94,12 +94,12 @@ pub use source_driver::{
     validate_source_set_hard_limit, CheckpointPolicy, DriverArtifact, DriverKey, DriverNamespace,
     DriverSchemaPin, ExternalEvidence, NamedPreparedSource, NamedSourceAccess,
     PreparedSourceOperation, PreparedSourceSet, RecoveryDescriptor, RecoveryField,
-    RecoveryFieldKind, RecoveryInspection, SchemaSupport, SourceAccess, SourceAnchor,
-    SourceBinding, SourceCoverage, SourceDriverDescriptor, SourceDriverHandle,
-    SourceDriverRegistry, SourceDriverRegistryReader, SourceDriverSchemas, SourceIdentityField,
-    SourceIdentityFieldKind, SourceName, SourceOperationKind, SourcePublicationFence,
-    SourcePublicationProof, SourceSet, SourceSetLimit, DEFAULT_MAX_SOURCES_PER_SANDBOX,
-    HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
+    RecoveryFieldKind, RecoveryInspection, RetainedSourceArtifact, SchemaSupport, SourceAccess,
+    SourceAnchor, SourceBinding, SourceCoverage, SourceDriverCompatibility, SourceDriverDescriptor,
+    SourceDriverHandle, SourceDriverRegistry, SourceDriverRegistryReader, SourceDriverSchemas,
+    SourceIdentityField, SourceIdentityFieldKind, SourceName, SourceOperationKind,
+    SourcePublicationFence, SourcePublicationProof, SourceRecoveryInput, SourceSet, SourceSetLimit,
+    DEFAULT_MAX_SOURCES_PER_SANDBOX, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
 pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,

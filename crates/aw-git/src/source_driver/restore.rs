@@ -65,6 +65,46 @@ impl GitRestoreLocation {
     }
 }
 
+// Reuse the exact decoders and original cleanup/inspection identity checks.
+// No Git invocation, directory discovery or physical authority at registry
+// replacement time. Those checks still belong to the actual effect owner.
+pub(super) fn validate_retained_materialization(
+    prepared: &PreparedSourceOperation,
+    binding: &SourceBinding,
+) -> Result<()> {
+    match prepared.operation {
+        SourceOperationKind::Derive => DerivePlan::decode(prepared)?.require_binding(binding),
+        SourceOperationKind::Restore => RestorePlan::decode(prepared)?.require_binding(binding),
+        SourceOperationKind::Capture => Err(Error::Conflict(
+            "Git capture is not a materialization recipe",
+        )),
+    }
+}
+
+pub(super) fn validate_restore_input(
+    prepared: &PreparedSourceOperation,
+    anchor: &aw_agent_core::SourceAnchor,
+) -> Result<()> {
+    if RestorePlan::decode(prepared)?.anchor != GitSourceAnchor::try_from(anchor)? {
+        return Err(Error::Conflict(
+            "Git restore descriptor differs from original anchor",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_derive_input(
+    prepared: &PreparedSourceOperation,
+    binding: &SourceBinding,
+) -> Result<()> {
+    if DerivePlan::decode(prepared)?.capture.binding != *binding {
+        return Err(Error::Conflict(
+            "Git derive descriptor differs from original binding",
+        ));
+    }
+    Ok(())
+}
+
 fn target_text(path: &Path) -> Result<&str> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(Error::Denied(

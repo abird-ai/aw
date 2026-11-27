@@ -1426,6 +1426,25 @@ pub(crate) fn visit_unresolved_source_pins(
         &[aw_agent_core::DriverSchemaPin],
     ) -> Result<()>,
 ) -> Result<()> {
+    visit_unresolved_source_inputs(connection, |receipt, source, input| {
+        let mut pins = vec![source.prepared.descriptor.pin()?];
+        if let Some(input) = input {
+            pins.push(input.pin()?);
+        }
+        visit(receipt, source, &pins)
+    })
+}
+
+/// Read the original typed input as well as the immutable recovery recipe.
+pub(crate) fn visit_unresolved_source_inputs(
+    connection: &Connection,
+    mut visit: impl FnMut(
+        &ConstructionPreparation,
+        &NamedPreparedSource,
+        Option<aw_agent_core::SourceRecoveryInput<'_>>,
+    ) -> Result<()>,
+) -> Result<()> {
+    use aw_agent_core::SourceRecoveryInput;
     // The initial Prepared claim owns the dependency, even if a later
     // current receipt is malformed. The unique preparation index bounds
     // this scan to source-bearing claims, not the Session audit history.
@@ -1452,25 +1471,22 @@ pub(crate) fn visit_unresolved_source_pins(
             .map(|boundary| boundary.materialization_sources_in(connection, &receipt))
             .transpose()?;
         for (index, source) in sources.sources.iter().enumerate() {
-            let mut pins = vec![source.prepared.descriptor.pin()?];
-            if let Some(boundary) = &receipt.capture_boundary {
-                pins.push(boundary.bindings[index].binding.pin()?);
-            }
-            let input_pin = if let Some(set) = &restore_set {
-                Some(set.anchors[index].pin()?)
+            let input = if let Some(boundary) = &receipt.capture_boundary {
+                Some(SourceRecoveryInput::Binding(
+                    &boundary.bindings[index].binding,
+                ))
+            } else if let Some(set) = &restore_set {
+                Some(SourceRecoveryInput::Anchor(&set.anchors[index]))
             } else if let Some(boundary) = &receipt.sandbox_boundary {
-                Some(boundary.source_pin(index)?)
+                Some(boundary.source_input(index))
             } else if let ConstructionCandidate::SandboxAttachment { boundary, .. } =
                 &receipt.candidate
             {
-                Some(boundary.anchor().pin()?)
+                Some(SourceRecoveryInput::Anchor(boundary.anchor()))
             } else {
                 None
             };
-            if let Some(pin) = input_pin {
-                pins.push(pin);
-            }
-            visit(&receipt, source, &pins)?;
+            visit(&receipt, source, input)?;
         }
     }
     Ok(())

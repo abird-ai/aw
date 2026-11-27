@@ -39,7 +39,84 @@ change or broader phase qualification in this documentation cut.
 
 November 27 late documentation refresh: all nine first-parent implementation signatures, parent links and exact trees after e56cd92 verified on L5; implementation tip 38c4775, Store v62. The new comprehensive handoff preserves all nine exact deltas, the complete previous comprehensive handoff byte-for-byte and the exact signed active TODO. Non-reserved entry clean; no source change or product test rerun in this documentation cut. Next: semantic dependency-bearing registry compatibility; physical containment/ambient authority remain held.
 
-## Latest local implementation delta — 2026-11-27: manifest-preserving private manual context transfer
+## Latest local implementation delta — 2026-11-27: semantic dependency-bearing SourceDriver replacement
+
+Parent `06d3d99aa9b49b835c3fb4fb1f849e5adf2fe57b` (late
+comprehensive documentation); previous implementation `38c4775`.
+Both entry signatures independently verified, non-reserved entry clean.
+L5 only. Product 0.15.0, Store v62, Git derive recovery v4 unchanged.
+SPEC §§25.6–25.7 and the quiescent registry cut at `3c67319`.
+
+- Existing binding, checkpoint and construction owners now visit borrowed
+  exact retained artifacts; diagnostics aggregate the same schema pins,
+  including closed/retired-but-retained records. Managed materialization
+  scans use the original Applied/attachment descriptor and binding,
+  checking existing release evidence. Unresolved construction visits
+  original typed capture/restore/derive/attachment inputs alongside the
+  immutable named recipe, not a guessed current source or path.
+- `SourceDriverCompatibility` is an explicit trusted native contract:
+  candidate validates previous implementation/configuration and every
+  retained artifact. `SessionStore::replace_compatible_source_driver`
+  accepts only the same concrete native type, exact driver identity and
+  schemas covering each retained pin in both implementations. The scan
+  runs under the existing sole Store owner, process/maintenance and
+  immediate SQL fence, inside the original staged registry CAS after
+  exact current handle/revision and implementation-idle checks. The
+  exact validated candidate is the one published. Failure leaves
+  registration unchanged; no durable writes, new authority, receipt
+  conversion, external effects or recovery-required status clearing.
+  Original generic replacement and removal remain dependency-free;
+  any active/hazard source mutation custody still refuses maintenance.
+- First actual consumer: GitSourceDriver with the same compiled native
+  type and same canonical configured trusted Git executable path,
+  exact supported schemas, and real retained semantics. Reuse
+  materialization identity parser, canonical anchor roundtrip plus
+  owning checkpoint ID, original capture v1/v2, restore v3 and derive
+  v4 recipe decoders (prepared identity/fields checked), exact original
+  input and managed target/cleanup binding checks. No Git execution
+  or discovery of persisted locators during validation. Existing live
+  physical proof/approval at effect owners and Store-open schema
+  recovery-required gate remain unchanged. Same path is configuration
+  equivalence, not a new executable integrity or physical availability
+  proof.
+- Extend existing actual Git fixtures and original Host lifecycle,
+  including failed publication/hazard refusal, explicit recovery, live
+  and weak user/stale revision refusals, different configured executable
+  and malformed same-schema artifact rejection, unchanged original
+  registration after refusal, then one-revision replacement while real
+  bindings, anchors and restore cleanup custody remain. Exact replay
+  and subsequent restore/cleanup still use original owners. Git decoder
+  checks include legacy v1 capture, v2 capture, v3 restore and v4 derive;
+  missing input, altered prepared identity, mismatched anchor/input and
+  cleanup target are refused.
+
+Validation: L5 locked/offline Core all-feature library 103/103 (+1
+ignored benchmark), Git repository 33/33, Store maintenance 1/1,
+checkpoint 4/4, construction receipt 1/1, exact source-binding
+restart 1/1, Host Git lifecycle 1/1 (167.31s), actual native-source
+executable integration 2/2 (46.95s; one opt-in fault fixture ignored).
+Total 146 distinct selected tests passed, zero failures, two ignored.
+The initial source-binding module filter matched zero tests and is
+not counted; exact restart test subsequently passed. Strict core/Git/
+Store/Host all-feature/all-target Clippy passed; durable and minimal
+all-target checks passed with existing profile-specific dead-code
+warnings. Scoped rustfmt/diff passed. Five historical broad Store
+failures and full workspace/other-platform/pinned Nix suites not rerun.
+
+Scope/next: no cross-type/ABI/hot reload or changed Git executable
+compatibility claim. No dependency-bearing removal. Active/hazard
+unresolved custody stays held even when its recipe can be decoded;
+legacy missing typed input or ambiguous semantics remain refused.
+No general cross-version startup semantic upgrade proof; retain
+existing Store-open behavior. Next substantial independent Phase-3
+gate from late comprehensive §5: legacy participant ACL/access_generation
+dispatch or broader independently authorized protected View/provider
+or context transfer; final atomic ExtensionRegistry remains Phase 5.
+Physical Process containment and never-managed ambient first-source
+authority retirement remain blocked; no new environmental evidence.
+No UX/frozen changes, push or repin. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: manifest-preserving private manual context transfer
 
 Parent `ff12f14cbd429b6fc3c5713df3e3eaf7ec0c1c10` (typed protected
 Views); resumed eight retained interrupted owned files. Completed

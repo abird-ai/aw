@@ -2,8 +2,8 @@
 //! Diagnostics are not driver authority or proof of external materialization.
 use crate::{db, Error, Inner, Result, SessionStore, StoreMode};
 use aw_agent_core::{
-    DriverArtifact, DriverKey, DriverSchemaPin, SourceDriverHandle, SourceDriverRegistry,
-    SourceDriverRegistryReader, SourceDriverSchemas,
+    DriverArtifact, DriverKey, DriverSchemaPin, RetainedSourceArtifact, SourceDriverCompatibility,
+    SourceDriverHandle, SourceDriverRegistry, SourceDriverRegistryReader, SourceDriverSchemas,
 };
 use rusqlite::{Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,47 @@ pub struct SourceDriverDependency {
     pub compatibility: SourceCompatibility,
 }
 
+fn visit_artifacts_in(
+    connection: &Connection,
+    driver: &DriverKey,
+    mut visit: impl FnMut(RetainedSourceArtifact<'_>) -> Result<()>,
+) -> Result<()> {
+    crate::sandbox_owner::source_bindings::visit_driver_artifacts(connection, driver, &mut visit)?;
+    crate::checkpoint_owner::visit_driver_artifacts(connection, driver, &mut visit)?;
+    crate::construction_receipt::visit_unresolved_source_inputs(connection, |_, source, input| {
+        if &source.prepared.descriptor.driver == driver
+            || input
+                .map(|input| input.pin())
+                .transpose()?
+                .is_some_and(|pin| &pin.driver == driver)
+        {
+            visit(RetainedSourceArtifact::Recovery { source, input })?;
+        }
+        Ok(())
+    })
+}
+
+fn visit_pins(
+    artifact: RetainedSourceArtifact<'_>,
+    mut visit: impl FnMut(SourceDependencyKind, DriverSchemaPin) -> Result<()>,
+) -> Result<()> {
+    use SourceDependencyKind::*;
+    match artifact {
+        RetainedSourceArtifact::Binding(binding) => visit(Binding, binding.pin()?),
+        RetainedSourceArtifact::Anchor { anchor, .. } => visit(CheckpointAnchor, anchor.pin()?),
+        RetainedSourceArtifact::Materialization { source, .. } => {
+            visit(RetainedMaterialization, source.prepared.descriptor.pin()?)
+        }
+        RetainedSourceArtifact::Recovery { source, input } => {
+            visit(UnresolvedConstruction, source.prepared.descriptor.pin()?)?;
+            if let Some(input) = input {
+                visit(UnresolvedConstruction, input.pin()?)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn dependencies_in(
     connection: &Connection,
     registry: &SourceDriverRegistryReader,
@@ -102,15 +143,8 @@ fn dependencies_in(
         }
         Ok(())
     };
-    crate::sandbox_owner::source_bindings::visit_driver_pins(connection, driver, &mut add)?;
-    crate::checkpoint_owner::visit_driver_pins(connection, driver, |pin| {
-        add(SourceDependencyKind::CheckpointAnchor, pin)
-    })?;
-    crate::construction_receipt::visit_unresolved_source_pins(connection, |_, _, pins| {
-        for pin in pins {
-            add(SourceDependencyKind::UnresolvedConstruction, pin.clone())?;
-        }
-        Ok(())
+    visit_artifacts_in(connection, driver, |artifact| {
+        visit_pins(artifact, &mut add)
     })?;
     counts
         .into_iter()
@@ -136,6 +170,10 @@ fn require_unused_in(
             "SourceDriver has retained durable dependencies",
         ));
     }
+    require_no_unresolved_mutation(connection)
+}
+
+fn require_no_unresolved_mutation(connection: &Connection) -> Result<()> {
     // Source mutation scopes intentionally hash their identity; do not
     // infer a driver from a hash or from missing bindings. Until every
     // unresolved effect is attributed, any such custody holds retirement.
@@ -175,7 +213,8 @@ impl SessionStore {
         handle: &SourceDriverHandle<T>,
         expected_revision: Option<u64>,
     ) -> Result<u64> {
-        self.with_unused_source_driver(handle.driver(), |registry| {
+        self.with_source_driver_maintenance(|tx, registry| {
+            require_unused_in(tx, registry, handle.driver())?;
             registry.remove(handle, expected_revision)
         })
     }
@@ -189,15 +228,54 @@ impl SessionStore {
         implementation: U,
         expected_revision: Option<u64>,
     ) -> Result<SourceDriverHandle<U>> {
-        self.with_unused_source_driver(handle.driver(), |registry| {
+        self.with_source_driver_maintenance(|tx, registry| {
+            require_unused_in(tx, registry, handle.driver())?;
             registry.replace(handle, schemas, implementation, expected_revision)
         })
     }
 
-    fn with_unused_source_driver<R>(
+    /// Explicit semantic replacement for a trusted native implementation of
+    /// the same concrete type. Neither a schema declaration nor a caller
+    /// supplied success flag can admit retained custody. No durable writes
+    /// or source effects, and no recovery-required status is cleared here.
+    pub fn replace_compatible_source_driver<T: SourceDriverCompatibility>(
         &mut self,
-        driver: &DriverKey,
-        operation: impl FnOnce(&mut SourceDriverRegistry) -> Result<R>,
+        handle: &SourceDriverHandle<T>,
+        schemas: SourceDriverSchemas,
+        implementation: T,
+        expected_revision: Option<u64>,
+    ) -> Result<SourceDriverHandle<T>> {
+        self.with_source_driver_maintenance(|tx, registry| {
+            require_no_unresolved_mutation(tx)?;
+            registry.replace_validated(
+                handle,
+                schemas,
+                implementation,
+                expected_revision,
+                |previous, candidate| {
+                    candidate.validate_replacement(previous, handle.driver(), schemas)?;
+                    visit_artifacts_in(tx, handle.driver(), |artifact| {
+                        visit_pins(artifact, |_, pin| {
+                            if &pin.driver != handle.driver()
+                                || !handle.schemas().supports(&pin)
+                                || !schemas.supports(&pin)
+                            {
+                                return Err(Error::Conflict(
+                                    "SourceDriver replacement cannot cover retained artifact schema",
+                                ));
+                            }
+                            Ok(())
+                        })?;
+                        candidate.validate_retained(artifact)
+                    })
+                },
+            )
+        })
+    }
+
+    fn with_source_driver_maintenance<R>(
+        &mut self,
+        operation: impl FnOnce(&Connection, &mut SourceDriverRegistry) -> Result<R>,
     ) -> Result<R> {
         let inner = Arc::get_mut(&mut self.inner).ok_or(Error::Conflict(
             "SourceDriver maintenance requires quiescent Store ownership",
@@ -230,9 +308,8 @@ impl SessionStore {
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         crate::coordination::validate_process(&tx, process)?;
         crate::coordination::validate_ordinary_access(&tx)?;
-        require_unused_in(&tx, source_drivers, driver)?;
         // No durable writes; hold the SQL fence through publication.
-        operation(source_drivers)
+        operation(&tx, source_drivers)
     }
 }
 

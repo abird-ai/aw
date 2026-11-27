@@ -100,7 +100,9 @@ impl Drop for Fixture {
 #[test]
 fn prepared_git_derive_reconciles_capture_only_without_retry() {
     use aw_agent_core::{
-        CheckpointPolicy, RecoveryInspection, SourceAccess, SourceName, SourceOperationKind,
+        CheckpointPolicy, NamedPreparedSource, RecoveryInspection, RetainedSourceArtifact,
+        SourceAccess, SourceDriverCompatibility, SourceName, SourceOperationKind,
+        SourceRecoveryInput,
     };
     use aw_git::source_driver::{GitRestoreLocation, GitSourceDriver};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -133,6 +135,29 @@ fn prepared_git_derive_reconciles_capture_only_without_retry() {
         .unwrap();
     assert_eq!(prepared.operation, SourceOperationKind::Derive);
     assert_eq!(prepared.descriptor.recovery_schema, 4);
+    let mut recipe = NamedPreparedSource {
+        name: binding.name.clone(),
+        prepared: prepared.clone(),
+    };
+    driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &recipe,
+            input: Some(SourceRecoveryInput::Binding(&binding)),
+        })
+        .unwrap();
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &recipe,
+            input: None,
+        })
+        .is_err());
+    recipe.prepared.descriptor.prepared_identity.push('x');
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &recipe,
+            input: Some(SourceRecoveryInput::Binding(&binding)),
+        })
+        .is_err());
     assert!(matches!(
         driver.inspect_derive(&prepared).unwrap(),
         RecoveryInspection::Unknown
@@ -180,9 +205,9 @@ fn prepared_git_derive_reconciles_capture_only_without_retry() {
 #[test]
 fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     use aw_agent_core::{
-        CheckpointPolicy, DriverKey, Error as SourceError, ExternalEvidence,
-        PreparedSourceOperation, RecoveryInspection, SourceAccess, SourceDriverRegistry,
-        SourceName,
+        CheckpointPolicy, DriverKey, Error as SourceError, ExternalEvidence, NamedPreparedSource,
+        PreparedSourceOperation, RecoveryInspection, RetainedSourceArtifact, SourceAccess,
+        SourceDriverCompatibility, SourceDriverRegistry, SourceName, SourceRecoveryInput,
     };
     use aw_git::source_driver::GitSourceDriver;
 
@@ -214,9 +239,27 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     let index = std::fs::read(f.root.join(".git/index")).unwrap();
     let head = f.run(&["rev-parse", "HEAD"]).stdout;
     let prepared = driver
-        .plan_capture(&binding, "cp_clean", "op_clean")
+        .plan_capture(&binding, "cp_clean", "cp_clean")
         .unwrap();
     let descriptor = serde_json::to_vec(&prepared).unwrap();
+    let named = NamedPreparedSource {
+        name: binding.name.clone(),
+        prepared: prepared.clone(),
+    };
+    driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &named,
+            input: Some(SourceRecoveryInput::Binding(&binding)),
+        })
+        .unwrap();
+    let mut wrong_binding = binding.clone();
+    wrong_binding.access = SourceAccess::ReadOnly;
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &named,
+            input: Some(SourceRecoveryInput::Binding(&wrong_binding)),
+        })
+        .is_err());
     let private_ref = "refs/aw/checkpoints/cp_clean/code";
     assert!(f.run(&["for-each-ref", private_ref]).stdout.is_empty());
     assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
@@ -254,7 +297,7 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     // A schema-1 descriptor from the clean-only implementation is still
     // executable/inspectable under the new registry, with its original pin.
     let mut legacy = driver
-        .plan_capture(&binding, "cp_legacy", "op_legacy")
+        .plan_capture(&binding, "cp_legacy", "cp_legacy")
         .unwrap();
     let d = &mut legacy.descriptor;
     d.recovery_schema = 1;
@@ -276,7 +319,22 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
         d.prepared_identity = format!("{:x}", hash.finalize());
     }
     assert!(reader.resolve(&legacy.descriptor.pin().unwrap()).is_ok());
+    driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &NamedPreparedSource {
+                name: binding.name.clone(),
+                prepared: legacy.clone(),
+            },
+            input: Some(SourceRecoveryInput::Binding(&binding)),
+        })
+        .unwrap();
     let legacy_anchor = driver.execute_capture(&legacy).unwrap();
+    driver
+        .validate_retained(RetainedSourceArtifact::Anchor {
+            checkpoint: "cp_legacy",
+            anchor: &aw_agent_core::SourceAnchor::try_from(&legacy_anchor).unwrap(),
+        })
+        .unwrap();
     assert_eq!(legacy_anchor.anchor_schema, 1);
     assert_eq!(legacy_anchor.captured_commit, anchor.captured_commit);
     driver.revalidate_capture(&legacy, &legacy_anchor).unwrap();
@@ -780,8 +838,9 @@ fn prepared_git_capture_preserves_final_dirty_tree_and_exact_gitlinks() {
 #[test]
 fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head() {
     use aw_agent_core::{
-        CheckpointPolicy, ExternalEvidence, PreparedSourceOperation, RecoveryInspection,
-        SourceAccess, SourceDriverRegistry, SourceName,
+        CheckpointPolicy, ExternalEvidence, NamedPreparedSource, PreparedSourceOperation,
+        RecoveryInspection, RetainedSourceArtifact, SourceAccess, SourceDriverCompatibility,
+        SourceDriverRegistry, SourceName, SourceRecoveryInput,
     };
     use aw_git::source_driver::GitSourceDriver;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -872,6 +931,30 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .plan_restore(&f.root, &dirty, &dirty_path, "op_restore_dirty")
         .unwrap();
     assert_eq!(dirty_plan.descriptor.recovery_schema, 3);
+    let recipe = NamedPreparedSource {
+        name: source.name.clone(),
+        prepared: dirty_plan.clone(),
+    };
+    let dirty_anchor = aw_agent_core::SourceAnchor::try_from(&dirty).unwrap();
+    let clean_anchor = aw_agent_core::SourceAnchor::try_from(&clean).unwrap();
+    driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &recipe,
+            input: Some(SourceRecoveryInput::Anchor(&dirty_anchor)),
+        })
+        .unwrap();
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Recovery {
+            source: &recipe,
+            input: Some(SourceRecoveryInput::Anchor(&clean_anchor)),
+        })
+        .is_err());
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Anchor {
+            checkpoint: "wrong-checkpoint",
+            anchor: &dirty_anchor,
+        })
+        .is_err());
     assert!(reader
         .resolve(&dirty_plan.descriptor.pin().unwrap())
         .is_ok());
@@ -887,6 +970,18 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
 
     let restored_clean = driver.execute_restore(&clean_plan).unwrap();
     let restored_dirty = driver.execute_restore(&dirty_plan).unwrap();
+    driver
+        .validate_retained(RetainedSourceArtifact::Materialization {
+            binding: &restored_dirty,
+            source: &recipe,
+        })
+        .unwrap();
+    assert!(driver
+        .validate_retained(RetainedSourceArtifact::Materialization {
+            binding: &restored_clean,
+            source: &recipe,
+        })
+        .is_err());
     assert_eq!(restored_dirty.source_ref, source.source_ref);
     assert_ne!(restored_dirty.materialization, source.materialization);
     assert_ne!(

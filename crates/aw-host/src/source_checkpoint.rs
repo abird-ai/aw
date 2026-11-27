@@ -2370,8 +2370,28 @@ mod tests {
             .is_err());
         drop(store);
         clear_failure();
-        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
-        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        // Reopen with a solely owned typed registry. The actual failed
+        // publication retains its original source mutation hazard.
+        let replacement_registry = SourceDriverRegistry::new();
+        let previous = GitSourceDriver::new(&executable)
+            .unwrap()
+            .register(&replacement_registry)
+            .unwrap();
+        let mut store =
+            SessionStore::open_with_sources(&state, replacement_registry, limit).unwrap();
+        let replacement = || GitSourceDriver::new(&executable).unwrap();
+        assert!(matches!(
+            store.replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(previous.registration_revision())
+            ),
+            Err(aw_agent_core::Error::Conflict(
+                "unresolved source mutation custody prevents registry maintenance"
+            ))
+        ));
+        let host = GitCheckpointRestoreHost::new(&store, &previous);
         let other = root.join("wrong");
         private_dir(&other);
         assert!(host
@@ -2409,6 +2429,136 @@ mod tests {
                 "applied result cleanup authorized"
             ))
             .is_err());
+
+        // Exact original recovery is now terminal. Live bindings, dirty
+        // checkpoint anchors and the Applied restore's cleanup recipe all
+        // remain. A matching version range alone is not compatibility.
+        let deps = store.source_driver_dependencies(previous.driver()).unwrap();
+        for kind in [
+            aw_store::SourceDependencyKind::Binding,
+            aw_store::SourceDependencyKind::CheckpointAnchor,
+            aw_store::SourceDependencyKind::RetainedMaterialization,
+        ] {
+            assert!(deps.iter().any(|dep| dep.kind == kind));
+        }
+        let revision = previous.registration_revision();
+        assert!(store
+            .replace_source_driver(&previous, previous.schemas(), replacement(), Some(revision))
+            .is_err());
+        assert!(store
+            .remove_source_driver(&previous, Some(revision))
+            .is_err());
+        assert!(store
+            .replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(revision - 1)
+            )
+            .is_err());
+        let live = store.source_driver(&previous).unwrap();
+        let weak = std::sync::Arc::downgrade(&live);
+        assert!(store
+            .replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(revision)
+            )
+            .is_err());
+        drop(live);
+        assert!(store
+            .replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(revision)
+            )
+            .is_err());
+        drop(weak);
+        let other_executable = root.join("other-git-executable");
+        fs::write(&other_executable, b"must never be invoked").unwrap();
+        assert!(store
+            .replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                GitSourceDriver::new(&other_executable).unwrap(),
+                Some(revision)
+            )
+            .is_err());
+
+        // The original Store owner also rejects a structurally valid but
+        // semantically invalid Git locator at the very same schema version.
+        let source_sandbox = source.agent.sandbox_ref.as_deref().unwrap();
+        let conn = Connection::open(&database).unwrap();
+        let change_materialization = |value: &str| {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE sandbox_source_bindings_current SET materialization=?1
+                 WHERE sandbox_id=?2 AND source_name=?3",
+                    [value, source_sandbox, bindings[0].name.as_str()],
+                )
+                .unwrap(),
+                1
+            );
+        };
+        change_materialization("invalid-git-materialization");
+        assert!(matches!(
+            store.replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(revision)
+            ),
+            Err(aw_agent_core::Error::Denied(
+                "invalid Git materialization identity"
+            ))
+        ));
+        change_materialization(&bindings[0].materialization);
+        drop(conn);
+        assert_eq!(
+            store.source_driver_dependencies(previous.driver()).unwrap(),
+            deps
+        );
+        assert!(store.source_driver(&previous).is_ok());
+        let before = store
+            .sandbox_get(&actor, restored.agent.sandbox_ref.as_deref().unwrap())
+            .unwrap();
+        let replacement_driver = store
+            .replace_compatible_source_driver(
+                &previous,
+                previous.schemas(),
+                replacement(),
+                Some(revision),
+            )
+            .unwrap();
+        assert_eq!(replacement_driver.registration_revision(), revision + 1);
+        assert!(store.source_driver(&previous).is_err());
+        assert_eq!(
+            store
+                .source_driver_dependencies(replacement_driver.driver())
+                .unwrap(),
+            deps
+        );
+        assert_eq!(
+            store
+                .sandbox_get(&actor, restored.agent.sandbox_ref.as_deref().unwrap())
+                .unwrap(),
+            before
+        );
+        let host = GitCheckpointRestoreHost::new(&store, &replacement_driver);
+        assert_eq!(
+            host.restore::<Fence<'_>>(
+                &actor,
+                &request,
+                "fixture:restore",
+                "local",
+                || panic!("replacement replay selected layout"),
+                |_, _| panic!("replacement replay authorized"),
+            )
+            .unwrap(),
+            restored
+        );
 
         let abandoned = root.join("abandoned");
         private_dir(&abandoned);

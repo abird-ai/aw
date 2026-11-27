@@ -666,10 +666,10 @@ impl SessionStore {
 
 /// Include live and retired-but-retained checkpoint anchors, not only
 /// those visible through the public live checkpoint list.
-pub(crate) fn visit_driver_pins(
+pub(crate) fn visit_driver_artifacts(
     connection: &Connection,
     driver: &aw_agent_core::DriverKey,
-    mut visit: impl FnMut(aw_agent_core::DriverSchemaPin) -> Result<()>,
+    mut visit: impl FnMut(aw_agent_core::RetainedSourceArtifact<'_>) -> Result<()>,
 ) -> Result<()> {
     let driver_key = crate::json(driver)?;
     let mut query = db(connection.prepare(
@@ -684,7 +684,10 @@ pub(crate) fn visit_driver_pins(
         let (set, _) = sources_in(connection, &checkpoint, coverage)?;
         for anchor in set.anchors {
             if &anchor.driver == driver {
-                visit(anchor.pin()?)?;
+                visit(aw_agent_core::RetainedSourceArtifact::Anchor {
+                    checkpoint: &checkpoint,
+                    anchor: &anchor,
+                })?;
             }
         }
     }

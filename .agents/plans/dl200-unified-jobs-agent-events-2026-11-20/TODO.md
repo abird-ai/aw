@@ -2078,11 +2078,32 @@ Current implementation: manifest-preserving private manual context transfer (thi
       Vault grant 1: all 47 passed. Strict Store/CLI Clippy,
       durable/minimal all-target and scoped fmt/diff passed.
       Historical Store failures not rerun.
+      **Semantic dependency-bearing SourceDriver replacement:** original
+      exclusive Store/process/SQL and staged registry CAS fences; exact
+      typed native candidate validation of actual retained bindings,
+      checkpoint anchors, managed release recipes and unresolved original
+      typed inputs. Both registrations must cover retained schema pins.
+      Git first consumer: same compiled type and canonical trusted
+      executable configuration; canonical actual v1/v2 capture, v3
+      restore, v4 derive identity/cleanup decoders. No schema-only
+      acceptance, source probes, durable rewrites or authority expansion.
+      Generic replacement/removal remain dependency-free; live/weak users,
+      stale handles/revisions, changed configuration, invalid retained
+      semantics and active/hazard source mutation custody refuse.
+      Actual Host lifecycle preserves recovery/replay and subsequent cleanup.
+      Validation: locked/offline Core 103 (+1 ignored benchmark), Git 33,
+      Store maintenance 1, checkpoint 4, construction 1, exact binding
+      restart 1, Host lifecycle 1, native executable 2 (+1 ignored
+      opt-in fault fixture): all 146 selected tests passed. Strict affected
+      all-target Clippy, durable/minimal all-target and scoped fmt/diff
+      passed. Existing profile warnings and historical Store failures
+      remain separate; no schema bump or full suite claim.
       **Next:** production reviewed physical Process containment/dispatch,
-      never-managed ambient first-source authority retirement, semantic
-      registry compatibility and other independent host gates.
-      Explicit dependency-bearing replacement compatibility, final atomic
-      ExtensionRegistry and protected broader metadata/Views, manifest-
+      never-managed ambient first-source authority retirement and other
+      independent host gates. Both physical/ambient cases remain held.
+      Broader cross-type/changed implementation semantics, attribution of
+      unresolved source mutation custody and startup semantic upgrade proof,
+      final atomic ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
       remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
@@ -2109,7 +2130,7 @@ Current implementation: manifest-preserving private manual context transfer (thi
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       cross-Domain and cross-Project empty-baseline restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
-      See [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md) §5 for next cuts, limitations and acceptance. Schema v60.
+      See [November 27 late comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27-LATE.md) §5 and CURRENT_HANDOFF for next cuts, limitations and acceptance. Schema v62.
       Last independently verified published AW main `0f9807f4`, dotlink main
       `85ceccc1`; this next local checkpoint not yet published.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
