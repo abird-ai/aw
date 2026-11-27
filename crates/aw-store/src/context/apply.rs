@@ -94,7 +94,33 @@ impl SessionStore {
             _ => audience(&tx, &anchor.id)?,
         };
         private_audience(&tx, &a, &viewers)?;
-        disclosure(&tx, &refs, &viewers)?;
+        let manifest = artifact_manifest(&tx, &a.id)?;
+        if manifest.is_some() {
+            if !matches!(request.mode, ApplyMode::Append)
+                || !matches!(a.plan.kind, PlanKind::Import)
+                || request.target != a.plan.target
+                || !matches!(a.method.as_str(), "human" | "human_edited")
+                || a.imported_unverified
+            {
+                return Err(Error::Denied(
+                    "protected context requires the original private manual append",
+                ));
+            }
+            require_private_transfer(&tx, actor, &anchor.id)?;
+            // No existing run on a sibling branch may retain an ambient
+            // execution path while this whole-Session ceiling is added.
+            let busy: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status='running')",
+                [&anchor.id],
+                |row| row.get(0),
+            ))?;
+            if busy {
+                return Err(Error::Conflict(
+                    "settle destination Runs before protected context transfer",
+                ));
+            }
+        }
+        disclosure(&tx, &refs, &viewers, manifest.as_deref())?;
         if matches!(a.plan.kind, PlanKind::MaterializedFacts) && request.target != a.plan.target {
             return Err(Error::Conflict(
                 "materialized-fact context applies only to the exact target head/revision it was projected for",
@@ -222,6 +248,10 @@ impl SessionStore {
                     serde_json::to_value(payload).map_err(|_| Error::Storage("bad import"))?,
                 )?;
                 super::materialized::link_artifact_facts_to_node(&tx, &a.id, &node)?;
+                if let Some(manifest) = &manifest {
+                    db(tx.execute("INSERT INTO node_context_disclosure(node_id,manifest_digest) VALUES(?1,?2)",
+                        params![node, manifest]))?;
+                }
                 add_dependencies(&tx, &node, &refs)?;
                 add_derivations(&tx, &node, actor, &refs, &a.plan.release_versions)?;
                 let changed=db(tx.execute("UPDATE branches SET head=?1,revision=revision+1 WHERE id=?2 AND head=?3 AND revision=?4 AND active_run IS NULL",params![node,branch.id,branch.head,branch.revision]))?;
@@ -367,7 +397,9 @@ pub(crate) fn pending_context(
         super::materialized::authorize_artifact_for_session(c, actor, &artifact, session)?;
         let viewers = audience(c, session)?;
         private_audience(c, &a, &viewers)?;
-        disclosure(c, &artifact_refs(c, &artifact)?, &viewers)?;
+        // Protected plans cannot be scheduled as one-prompt context.
+        // Recheck on consumption even for older pending attachments.
+        disclosure(c, &artifact_refs(c, &artifact)?, &viewers, None)?;
         out.push(ContextBlock {
             before_turn: 0,
             node_id: id,

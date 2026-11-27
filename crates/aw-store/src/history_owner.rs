@@ -432,6 +432,30 @@ fn dependency_manifest(connection: &Connection, head: &str) -> Result<String> {
     for legacy in legacy {
         manifest = union_manifests(connection, &manifest, &legacy)?;
     }
+    // Keep the original protected context provenance through all causal
+    // ancestors, including blocks hidden by a later compaction.
+    let mut query = db(connection.prepare_cached(
+        "WITH RECURSIVE ancestry(id,parent_id) AS (
+             SELECT id,parent_id FROM nodes WHERE id=?1
+             UNION ALL SELECT n.id,n.parent_id FROM nodes n
+             JOIN ancestry a ON a.parent_id=n.id
+         )
+         SELECT DISTINCT d.manifest_digest FROM ancestry a
+         JOIN node_context_disclosure d ON d.node_id=a.id
+         ORDER BY d.manifest_digest LIMIT ?2",
+    ))?;
+    let carried = db(db(
+        query.query_map(params![head, MAX_MANIFEST_INPUTS + 1], |row| {
+            row.get::<_, String>(0)
+        }),
+    )?
+    .collect::<rusqlite::Result<Vec<_>>>())?;
+    if carried.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit("context disclosure manifest bound exceeded"));
+    }
+    for carried in carried {
+        manifest = union_manifests(connection, &manifest, &carried)?;
+    }
     source::add_history_claims(connection, head, manifest)
 }
 
@@ -1445,7 +1469,7 @@ fn validate_manifest_expansion(
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
     for (_root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
-            source::KIND => {
+            source::KIND | source::CONTEXT_KIND => {
                 source::require_principal(connection, &evidence, principal_kind, principal_handle)?
             }
             "agent_source" => validate_agent_source_expansion(
@@ -1593,7 +1617,7 @@ pub(crate) fn authorize_event_manifest_reader(
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
     for (_root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
-            source::KIND => {
+            source::KIND | source::CONTEXT_KIND => {
                 if let Some(decision) = classify_disclosure_check(source::require_principal(
                     connection, &evidence, "user", &user,
                 ))? {
@@ -1706,7 +1730,7 @@ pub(crate) fn authorize_event_delivery(
         let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
         for (_root, kind, stable_key, evidence) in roots {
             match kind.as_str() {
-                source::KIND => {
+                source::KIND | source::CONTEXT_KIND => {
                     for (principal_kind, principal_handle) in &recipient_audience {
                         if let Some(decision) = classify_disclosure_check(
                             source::require_principal(
@@ -1825,7 +1849,7 @@ fn validate_fork_manifest_for_principal(
     let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
     for (root, kind, stable_key, evidence) in roots {
         match kind.as_str() {
-            source::KIND => {
+            source::KIND | source::CONTEXT_KIND => {
                 source::require_principal(connection, &evidence, principal_kind, principal_handle)?
             }
             "agent_source" => validate_agent_source_expansion(

@@ -35,7 +35,89 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: typed protected View leaf and resilient resource reads
+## Latest local implementation delta — 2026-11-27: manifest-preserving private manual context transfer
+
+Parent `ff12f14cbd429b6fc3c5713df3e3eaf7ec0c1c10` (typed protected
+Views); resumed eight retained interrupted owned files. Completed
+the original context/history owner path, not a new context service.
+Published AW main `0f9807f4`, dotlink `85ceccc1`, frozen
+`576d0a1a` unchanged. L5 only; Store **v62**, product 0.15.0,
+Git recovery v4 unchanged.
+
+- Migration 062 adds immutable FK links from context plan and
+  committed context node to the original disclosure DAG. Artifact
+  provenance follows its actual stored plan FK, never JSON-supplied
+  IDs. Existing schema/migration lease blocks older binaries from
+  treating newly transferred data as ordinary unprotected context.
+  No new grant, fact store, history executor or duplicated manifest.
+- Exact selected local evidence of protected source custody:
+  same stable active user, same Workspace, private destination
+  including legacy/Agent ACL and draft readers. Verify evidence
+  hashes/current reads and source-use releases at existing context
+  owner; union original causal source/legacy/Event/materialized
+  manifests and exact selected facts in history owner; original
+  source_actor_v1 ceiling retained. Require actual protected
+  provenance from each protected source Session, not an inferred
+  grant or a new root from mere ownership. Restored source Agent
+  with an empty inherited manifest is eligible for local evidence;
+  nonempty base dependencies remain conservatively refused.
+- Add manual-only source_context_manual_v1 root in that same DAG,
+  enforcing original actor-private read/share ceiling and separately
+  holding model/provider dispatch. Manual import/edited artifact,
+  exact original target append only, no active sibling Runs, atomic
+  node link with existing dependency/head/publication transaction.
+  No next-prompt, rebase, new-Session/fork application, compaction or
+  model generation from protected plans. Exact applied replay inert.
+  Old unlinked plans/artifacts cannot acquire permission retroactively
+  when their source Session becomes protected.
+- Session ceiling includes carried context nodes; history sealing and
+  Event publication union linked manifests over exact ancestry,
+  preserving protection through compaction/descendant history and
+  exact history fork. History/share/legacy/participant/draft gates
+  use original current stable principal checks. Existing portable
+  archive/workspace export gates still deny protected content.
+  Model/summary admission checks manual-only marker in local,
+  inherited and Event-carried roots. No independent provider
+  release inferred; no new model execution or redaction.
+- Actual native-source executable fixture produces real protected
+  Git/native Turns through original Tool/Run custody; ordinary
+  checkout additionally qualifies private plan/manual edit/append,
+  shared-destination refusal, no paid summary journal, exact replay,
+  protected read and fresh exact history fork, refused expansion/
+  export and journal begin before any new Turn is recorded.
+  Linked checkout's original recovery still executes. No fake
+  source claim inserted for the positive transfer. Dedicated helper
+  reuses existing fixture instead of a second native setup.
+- Existing synthetic pre-v62 downgrade fixtures drop the two new
+  empty tables before rebuilding their old epochs; do not weaken
+  production CREATE/epoch checks.
+
+Validation: L5 locked/offline: actual native executable source
+fixture including new transfer and linked checkout recovery 1/1
+(62.44s), context_flow 29/29 (22.55s), history owner 5/5 (3.48s),
+v60-to-v62 ordinary migration 1/1 (1.15s), context/materialized
+2/2 (1.17s), exact application CAS 1/1 (0.74s), source binding
+restart 1/1, checkpoint owner 4/4 (3.80s), construction receipt
+1/1, Sandbox grant restart 1/1, Vault grant restart 1/1.
+All 47 distinct selected tests passed. Strict Store/CLI all-feature/
+all-target Clippy, durable/minimal all-target checks (existing
+profile-specific dead-code warnings) and scoped fmt/diff passed.
+Five historical Store failures and other executable suites not
+rerun. No previous-binary downgrade runtime test for v62; the
+existing exclusive migration lease and exact version gate remain.
+
+Scope/next: same-Workspace actor-private manual append and exact
+history reuse only. Protected inherited-prefix selection, generalized
+model/provider release, cross-Workspace context sharing, portable
+manifest-preserving archive/replica transfer and independently
+approved redaction remain gated. No full workspace/Nix/other-platform
+qualification. Physical Process containment and never-managed ambient
+authority retirement remain blocked. Next substantial independent
+gate: semantic dependency-bearing registry compatibility or the
+remaining extension composition. No push/repin/UX/frozen changes.
+Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: typed protected View leaf and resilient resource reads
 
 Parent `386d8772cc1d42241ca5ad3a222fd8528fbc5821` (configured
 empty-baseline tasks); clean non-reserved entry. Published AW main

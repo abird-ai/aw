@@ -352,7 +352,8 @@ const PROJECT_CONSTRUCTION_ORIGIN_SCHEMA: &str =
     include_str!("../migrations/060_project_construction_origin.sql");
 const HELD_SOURCE_BOUNDARY_SCHEMA: &str =
     include_str!("../migrations/061_held_source_boundary.sql");
-const LATEST_SCHEMA_VERSION: i64 = 61;
+const CONTEXT_DISCLOSURE_SCHEMA: &str = include_str!("../migrations/062_context_disclosure.sql");
+const LATEST_SCHEMA_VERSION: i64 = 62;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -3161,6 +3162,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 60 {
         migrate_source_schema(c, 61, "held-source-boundary", HELD_SOURCE_BOUNDARY_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 61 {
+        migrate_source_schema(c, 62, "context-disclosure", CONTEXT_DISCLOSURE_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {

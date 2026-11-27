@@ -1208,7 +1208,9 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP INDEX sandbox_held_source_boundary;
+                    "DROP TABLE node_context_disclosure;
+                 DROP TABLE context_plan_disclosure;
+                 DROP INDEX sandbox_held_source_boundary;
                  UPDATE store_meta SET value='60' WHERE key='schema_epoch';
                  UPDATE schema_meta SET schema_epoch=60,activation_epoch=60 WHERE singleton=1;
                  UPDATE migration_lease SET current_epoch=60 WHERE singleton=1;
@@ -1223,7 +1225,7 @@ mod tests {
                 connection
                     .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                     .unwrap(),
-                61
+                62
             );
             assert!(connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='sandbox_held_source_boundary')",
@@ -1275,7 +1277,9 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE agent_vault_grants_current;
+                    "DROP TABLE node_context_disclosure;
+                 DROP TABLE context_plan_disclosure;
+                 DROP TABLE agent_vault_grants_current;
                  DROP TABLE agent_sandbox_grants_current;
                  DROP INDEX construction_legacy_actor;
                  DROP INDEX construction_source_prepare_id;

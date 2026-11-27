@@ -152,23 +152,68 @@ pub(crate) fn check_sources(
     }
     Ok(())
 }
+fn plan_manifest(c: &Connection, plan_id: &str) -> Result<Option<String>> {
+    db(c.query_row(
+        "SELECT manifest_digest FROM context_plan_disclosure WHERE plan_id=?1",
+        [plan_id],
+        |row| row.get(0),
+    )
+    .optional())
+}
+
+fn artifact_manifest(c: &Connection, artifact_id: &str) -> Result<Option<String>> {
+    // The original FK, not a caller-supplied or imported JSON plan ID.
+    db(c.query_row(
+        "SELECT d.manifest_digest FROM context_artifacts a
+         JOIN context_plan_disclosure d ON d.plan_id=a.plan_id
+         WHERE a.id=?1",
+        [artifact_id],
+        |row| row.get(0),
+    )
+    .optional())
+}
+
+fn require_summary_dispatch(c: &Connection, plan: &ContextPlan) -> Result<()> {
+    if plan_manifest(c, &plan.id)?.is_some() {
+        return Err(Error::Denied(
+            "protected context plan permits manual artifacts only",
+        ));
+    }
+    crate::history_owner::source::require_context_dispatch(c, &plan.target.session_id)
+}
+
+fn require_private_transfer(c: &Connection, actor: &PrincipalId, session: &str) -> Result<()> {
+    let user =
+        user_for_principal(c, actor)?.ok_or(Error::Denied("context transfer actor unavailable"))?;
+    crate::history_owner::source::require_private_audience(c, session, &user)
+}
+
 pub(crate) fn disclosure(
     c: &Connection,
     refs: &[EvidenceRef],
     viewers: &BTreeSet<PrincipalId>,
+    manifest: Option<&str>,
 ) -> Result<()> {
-    // The legacy context artifact path has no exact protected-source
-    // manifest transfer into its resulting Session. Do not silently
-    // declassify or retain only the old Session membership dependency.
-    for source in refs {
-        if crate::history_owner::source::session_ceiling(c, &source.session_id)?.is_some() {
-            return Err(Error::Denied(
-                "protected source context transfer requires an exact history or Event manifest",
-            ));
+    // A previously ordinary plan/artifact may become protected later.
+    // Never acquire authority by recomputing a missing immutable link.
+    if manifest.is_none() {
+        for session in refs
+            .iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            if crate::history_owner::source::session_ceiling(c, session)?.is_some() {
+                return Err(Error::Denied(
+                    "protected context requires original disclosure provenance",
+                ));
+            }
         }
     }
     for viewer in viewers {
         check_sources(c, viewer, refs)?;
+        if let Some(manifest) = manifest {
+            crate::history_owner::source::validate_context_manifest(c, viewer, manifest)?;
+        }
     }
     Ok(())
 }
@@ -280,7 +325,13 @@ pub(crate) fn check_artifact(
         ));
     }
     let refs = artifact_refs(c, id)?;
-    check_sources(c, actor, &refs)?;
+    let manifest = artifact_manifest(c, id)?;
+    disclosure(
+        c,
+        &refs,
+        &BTreeSet::from([actor.clone()]),
+        manifest.as_deref(),
+    )?;
     let owner = artifact_owner_principal(c, id, &a.owner)?;
     source_use(
         c,
@@ -651,12 +702,23 @@ impl SessionStore {
         let dependencies = refs_for(&tx, &selected_once)?;
         check_sources(&tx, actor, &dependencies)?;
         source_use(&tx, actor, &dependencies, None)?;
-        // Candidate stays private; the destination audience must already be a
-        // subset before any model call is offered, and is checked again on apply.
+        // Exact local provenance, never an inferred provider release.
+        let manifest = crate::history_owner::source::context_manifest(
+            &tx,
+            actor,
+            &dependencies,
+            &request.target.session_id,
+        )?;
+        if manifest.is_some() && !matches!(request.kind, PlanKind::Import) {
+            return Err(Error::Denied(
+                "protected context currently permits private manual import only",
+            ));
+        }
         disclosure(
             &tx,
             &dependencies,
             &audience(&tx, &request.target.session_id)?,
+            manifest.as_deref(),
         )?;
         let mut ev = Vec::new();
         let mut evidence_bytes = 0usize;
@@ -704,6 +766,12 @@ impl SessionStore {
         let digest = input.digest()?;
         let actor_user = ensure_user_for_principal(&tx, actor)?;
         db(tx.execute("INSERT INTO context_plans(id,actor,target_session,body,digest,created_at,actor_user_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![plan.id,actor.as_str(),plan.target.session_id,json(&plan)?,digest,now(),actor_user]))?;
+        if let Some(manifest) = manifest {
+            db(tx.execute(
+                "INSERT INTO context_plan_disclosure(plan_id,manifest_digest) VALUES(?1,?2)",
+                params![plan.id, manifest],
+            ))?;
+        }
         db(tx.commit())?;
         Ok(plan)
     }
@@ -743,10 +811,15 @@ pub(crate) fn plan_in(c: &Connection, actor: &PrincipalId, id: &str) -> Result<C
     source_use(c, actor, &plan.dependencies, None)?;
     check_release_versions(c, actor, &plan.release_versions)?;
     target(c, actor, &plan.target, false)?;
+    let manifest = plan_manifest(c, id)?;
+    if manifest.is_some() {
+        require_private_transfer(c, actor, &plan.target.session_id)?;
+    }
     disclosure(
         c,
         &plan.dependencies,
         &audience(c, &plan.target.session_id)?,
+        manifest.as_deref(),
     )?;
     Ok(plan)
 }
@@ -1035,6 +1108,7 @@ fn authorize_model_context_after_append_authorized(
         Some(source) => source.require_in(c, &identity.actor, session, &branch.id, false)?,
         None => crate::sandbox_owner::require_execution_in(c, session)?,
     }
+    crate::history_owner::source::require_context_dispatch(c, session)?;
     authorize_node(c, session, &branch.head, &identity.actor)?;
     materialized::authorize_projected_for_model(c, &identity.actor, session, branch)?;
     let mut refs = Vec::new();

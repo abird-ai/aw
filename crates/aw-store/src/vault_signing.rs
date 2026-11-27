@@ -1240,7 +1240,9 @@ mod tests {
         Connection::open(&database)
             .unwrap()
             .execute_batch(
-                "DROP TABLE agent_vault_grants_current;
+                "DROP TABLE node_context_disclosure;
+             DROP TABLE context_plan_disclosure;
+             DROP TABLE agent_vault_grants_current;
              UPDATE store_meta SET value='58' WHERE key='schema_epoch';
              UPDATE schema_meta SET schema_epoch=58,activation_epoch=58 WHERE singleton=1;
              UPDATE migration_lease SET current_epoch=58 WHERE singleton=1;

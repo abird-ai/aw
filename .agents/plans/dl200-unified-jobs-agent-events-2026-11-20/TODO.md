@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: typed protected View leaf and resilient resource reads (this checkpoint; local parent `386d8772cc1d42241ca5ad3a222fd8528fbc5821`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: manifest-preserving private manual context transfer (this checkpoint; local parent `ff12f14cbd429b6fc3c5713df3e3eaf7ec0c1c10`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v62 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -2061,9 +2061,26 @@ Current implementation: typed protected View leaf and resilient resource reads (
       all six passed. Strict core/CLI Clippy, durable/minimal
       all-target, scoped fmt/diff passed. Prior opt-in fault test and
       historical Store failures not rerun.
+      **Manifest-preserving private manual context transfer:** Store v62
+      immutable plan/node manifest links; original artifact-plan FK,
+      exact selected local source provenance and original source
+      ceiling plus manual-only marker in same DAG. Same stable user/
+      Workspace, private exact target append; original evidence and
+      share checks. History/Event inheritance preserves restriction;
+      no paid summary, provider dispatch, audience expansion or
+      legacy protected export. Actual native Git fixture reuses
+      real protected Turns, validates manual edit, exact replay,
+      shared destination refusal and protected exact history fork.
+      Older synthetic migration fixtures remove v62 empty tables.
+      Locked/offline native executable 1, context flow 29, history 5,
+      ordinary migration 1, context 2, application CAS 1, source
+      binding 1, checkpoint 4, construction 1, Sandbox grant 1,
+      Vault grant 1: all 47 passed. Strict Store/CLI Clippy,
+      durable/minimal all-target and scoped fmt/diff passed.
+      Historical Store failures not rerun.
       **Next:** production reviewed physical Process containment/dispatch,
-      never-managed ambient first-source authority retirement, manifest-
-      preserving transfer or other independent host gates.
+      never-managed ambient first-source authority retirement, semantic
+      registry compatibility and other independent host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure

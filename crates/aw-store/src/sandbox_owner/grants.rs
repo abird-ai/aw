@@ -646,7 +646,9 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE agent_vault_grants_current;
+                    "DROP TABLE node_context_disclosure;
+                 DROP TABLE context_plan_disclosure;
+                 DROP TABLE agent_vault_grants_current;
                  DROP TABLE agent_sandbox_grants_current;
                  UPDATE store_meta SET value='57' WHERE key='schema_epoch';
                  UPDATE schema_meta SET schema_epoch=57,activation_epoch=57 WHERE singleton=1;

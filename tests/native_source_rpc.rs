@@ -1243,6 +1243,12 @@ fn exercise_native_root_stdio(linked: bool) {
     assert_eq!(view.history.turns.len(), 6);
     assert_eq!(view.history.turns[5].prompt, "next input only");
     assert_eq!(json!(view.history.turns[..5]), json!(original.turns));
+    // The ordinary checkout already exercises a real durable source
+    // claim. Reuse it to qualify private context transfer; linked Git
+    // recovery has its own existing coverage.
+    if !linked {
+        context_transfer::exercise(&store, &owner, &session, &branch, &parent.id, &root);
+    }
     assert_eq!(git(&["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(git_dir.join("index")).unwrap(), index);
     assert_eq!(fs::read(common_dir.join("index")).unwrap(), backing_index);
@@ -1257,6 +1263,8 @@ fn exercise_native_root_stdio(linked: bool) {
     }
 }
 
+#[path = "native_source_rpc/context_transfer.rs"]
+mod context_transfer;
 #[path = "native_source_rpc/empty_baseline.rs"]
 mod empty_baseline;
 #[path = "native_source_rpc/maintenance.rs"]

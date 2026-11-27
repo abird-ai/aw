@@ -107,7 +107,11 @@ impl SessionStore {
         request: &str,
     ) -> Result<ContextJournal> {
         request_id(request)?;
-        self.context_plan(actor, plan_id)?;
+        {
+            let c = self.connection()?;
+            let plan = plan_in(&c, actor, plan_id)?;
+            require_summary_dispatch(&c, &plan)?;
+        }
         Ok(ContextJournal {
             store: self.clone(),
             actor: actor.clone(),
@@ -259,6 +263,7 @@ impl ContextJournal {
             return Err(Error::Denied("summary caller/plan mismatch"));
         }
         let p = plan_in(&c, &self.actor, &self.plan_id)?;
+        require_summary_dispatch(&c, &p)?;
         source_use(&c, &self.actor, &p.dependencies, Some(&identity.account_id))?;
         ensure_reviewed_sources(&c, &p.dependencies)?;
         if json(&p.input()?)? != json(input)? {
@@ -285,6 +290,7 @@ impl ContextJournal {
         let mut c = self.store.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let p = plan_in(&tx, &self.actor, &self.plan_id)?;
+        require_summary_dispatch(&tx, &p)?;
         source_use(
             &tx,
             &self.actor,

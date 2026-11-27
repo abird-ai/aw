@@ -5,6 +5,9 @@ use super::*;
 use crate::sandbox_owner::history_disclosure_manifests;
 
 pub(super) const KIND: &str = "source_actor_v1";
+// Private manual context reuse does not authorize a new inference
+// destination. Carry that stronger ceiling in the same immutable DAG.
+pub(super) const CONTEXT_KIND: &str = "source_context_manual_v1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +174,19 @@ pub(crate) fn session_ceiling(connection: &Connection, session: &str) -> Result<
         merge_ceiling(&mut ceiling, &db(row.get::<_, String>(0))?)?;
     }
 
+    // Traverse shared DAG nodes once, even across many carried manifests.
+    for (_, root_kind, _, evidence) in session_manifest_roots(connection, session)? {
+        if matches!(root_kind.as_str(), KIND | CONTEXT_KIND) {
+            merge_ceiling(&mut ceiling, &evidence)?;
+        }
+    }
+    Ok(ceiling)
+}
+
+fn session_manifest_roots(
+    connection: &Connection,
+    session: &str,
+) -> Result<Vec<(String, String, String, String)>> {
     let mut query = db(connection.prepare_cached(
         "SELECT b.manifest_digest
          FROM agent_state_current a JOIN history_bases b ON b.base_id=a.history_base_id
@@ -180,6 +196,9 @@ pub(crate) fn session_ceiling(connection: &Connection, session: &str) -> Result<
          WHERE recipient_session_id=?1 AND disclosure_manifest IS NOT NULL
          UNION
          SELECT manifest_digest FROM legacy_event_input_compat WHERE session_id=?1
+         UNION
+         SELECT d.manifest_digest FROM node_context_disclosure d
+         JOIN nodes n ON n.id=d.node_id WHERE n.session_id=?1
          LIMIT ?2",
     ))?;
     let manifests = db(db(
@@ -191,13 +210,7 @@ pub(crate) fn session_ceiling(connection: &Connection, session: &str) -> Result<
     if manifests.len() > MAX_MANIFEST_INPUTS {
         return Err(Error::Limit("protected inherited history bound exceeded"));
     }
-    // Traverse shared DAG nodes once, even across many carried manifests.
-    for (_, root_kind, _, evidence) in manifest_authority_roots_from(connection, manifests)? {
-        if root_kind == KIND {
-            merge_ceiling(&mut ceiling, &evidence)?;
-        }
-    }
-    Ok(ceiling)
+    manifest_authority_roots_from(connection, manifests)
 }
 
 pub(crate) fn require_session_reader(
@@ -211,6 +224,143 @@ pub(crate) fn require_session_reader(
                 "protected source disclosure is actor-private",
             ));
         }
+    }
+    Ok(())
+}
+
+/// The legacy selector identifies local nodes, not inherited base spans.
+/// Build a private manual-transfer manifest only for exact local evidence.
+/// Session-wide ceilings are conservative; at least one selected node in
+/// every protected source Session must actually carry original provenance.
+pub(crate) fn context_manifest(
+    connection: &Connection,
+    actor: &PrincipalId,
+    refs: &[aw_agent_core::EvidenceRef],
+    target_session: &str,
+) -> Result<Option<String>> {
+    let mut sessions = BTreeMap::new();
+    for reference in refs {
+        if !sessions.contains_key(reference.session_id.as_str()) {
+            sessions.insert(
+                reference.session_id.as_str(),
+                session_ceiling(connection, &reference.session_id)?,
+            );
+        }
+    }
+    if sessions.values().all(Option::is_none) {
+        return Ok(None);
+    }
+    let user = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("context transfer actor unavailable"))?;
+    require_private_audience(connection, target_session, &user)?;
+    let workspace = session_in(connection, target_session)?.workspace_id;
+    for (session, ceiling) in &sessions {
+        if ceiling.as_ref().is_some_and(|ceiling| ceiling != &user)
+            || session_in(connection, session)?.workspace_id != workspace
+            || crate::session_owner_user(connection, session)? != user
+        {
+            return Err(Error::Denied(
+                "protected context requires the same private actor and Workspace",
+            ));
+        }
+        // The legacy selection only names local nodes. A restored
+        // history base with no disclosure dependencies is fine; a
+        // protected inherited prefix needs its own exact selector.
+        let inherited: bool = db(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_state_current a
+             JOIN history_bases b ON b.base_id=a.history_base_id
+             JOIN disclosure_manifest_nodes m ON m.node_digest=b.manifest_digest
+             WHERE a.session_id=?1 AND m.item_count<>0)",
+            [session],
+            |row| row.get(0),
+        ))?;
+        if inherited {
+            return Err(Error::Denied(
+                "protected inherited context requires exact history transfer",
+            ));
+        }
+    }
+    let mut observed = BTreeSet::new();
+    let mut selected = BTreeSet::new();
+    let mut entries = BTreeSet::new();
+    for reference in refs {
+        let manifest = dependency_manifest(connection, &reference.node_id)?;
+        let roots = manifest_authority_roots(connection, &manifest)?;
+        if roots.iter().any(|(_, kind, _, _)| kind == KIND) {
+            observed.insert(reference.session_id.as_str());
+        }
+        selected.insert(manifest);
+        entries.insert(ManifestEntry {
+            kind: "fact",
+            reference: format!(
+                "legacy-node:{}:{}:{}",
+                reference.session_id,
+                reference.node_id,
+                raw_node_digest(connection, &reference.session_id, &reference.node_id)?
+            ),
+        });
+    }
+    if sessions
+        .iter()
+        .any(|(session, ceiling)| ceiling.is_some() && !observed.contains(session))
+    {
+        return Err(Error::Denied(
+            "selected context lacks exact protected provenance",
+        ));
+    }
+    let root = authority_root(
+        connection,
+        CONTEXT_KIND,
+        &user,
+        &json(&Ceiling { user: user.clone() })?,
+    )?;
+    entries.insert(ManifestEntry {
+        kind: "authority_root",
+        reference: root,
+    });
+    let mut manifest = manifest_from_entries(connection, &entries)?;
+    for next in selected {
+        manifest = union_manifests(connection, &manifest, &next)?;
+    }
+    validate_manifest_expansion(connection, actor, &manifest, "user", &user)?;
+    Ok(Some(manifest))
+}
+
+pub(crate) fn validate_context_manifest(
+    connection: &Connection,
+    actor: &PrincipalId,
+    manifest: &str,
+) -> Result<()> {
+    let user = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("context transfer actor unavailable"))?;
+    let roots = manifest_authority_roots(connection, manifest)?;
+    if !roots.iter().any(|(_, kind, _, _)| kind == CONTEXT_KIND)
+        || !roots.iter().any(|(_, kind, _, _)| kind == KIND)
+    {
+        return Err(Error::Storage(
+            "protected context manifest lacks original authority",
+        ));
+    }
+    validate_manifest_expansion(connection, actor, manifest, "user", &user)
+}
+
+/// Hold model/provider admission for manual-only context, including
+/// inherited and Event-carried manifests. No new provider release policy
+/// is inferred from the already-authorized local actor read.
+pub(crate) fn require_context_dispatch(connection: &Connection, session: &str) -> Result<()> {
+    let exists: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM disclosure_authority_roots WHERE kind=?1)",
+        [CONTEXT_KIND],
+        |row| row.get(0),
+    ))?;
+    if exists
+        && session_manifest_roots(connection, session)?
+            .iter()
+            .any(|(_, kind, _, _)| kind == CONTEXT_KIND)
+    {
+        return Err(Error::Denied(
+            "protected manual context requires independent provider disclosure authority",
+        ));
     }
     Ok(())
 }
