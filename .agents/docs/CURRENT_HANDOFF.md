@@ -35,7 +35,99 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: held source-only empty Sandbox and first reattachment
+## Latest local implementation delta — 2026-11-27: actual construction and maintenance stdio executable gate
+
+Parent `26e1d8ed010095adde4318a853fa722db20e45fd` (held
+source-only empty Sandbox); independently verified signature and
+clean non-reserved entry. Last published AW main `0f9807f4`
+(origin/main unchanged), dotlink `85ceccc1`, frozen `576d0a1a`.
+L5 only. Store v61, product 0.15.0 and Git recovery v4 unchanged.
+
+- Close the previously pending real maintenance/constructor stdio
+  subprocess gate. Extend the existing native executable integration
+  target with one grouped lifecycle in
+  `tests/native_source_rpc/maintenance.rs`; leave the original native
+  direct/linked source execution fixture unchanged. One independently
+  selected ordinary local controller, actual compiled AW executable,
+  private isolated Git fixture, real SQLite owner lock, private
+  versioned approval files, real stdio JSONL transport and no model
+  call. The ephemeral loopback listener receives no connection.
+- Verify constructor/retention/source setter capability advertisement
+  is off by default, enabled only by the relevant flags; reject path
+  parameters, duplicate connection IDs, foreign Project selection,
+  task-bearing captured restore and semantic request-ID reuse.
+  Actual RPC capture of a separate held source Agent, retained
+  captured restore, standalone versioned baseline and mutable-parent
+  derivation publish exact owners and distinct expected Git contents.
+  Capture/restore/create/derive replay across cold subprocesses with
+  absent approval paths returns the original authorized result.
+  Offline capture replay requires explicit recovery-only RPC namespace.
+- Qualify actual offline constructor recovery: original Store
+  Prepared baseline candidate executes a real Git restore, deliberately
+  marks Unknown before publication, then ordinary fresh stdio retry
+  refuses and `aw sandbox-create --agent-rpc-request --agent-recover`
+  inspects/publishes that exact candidate. Subsequent RPC replay returns
+  its single revision. The interruption is staged through the original
+  Store/driver owner; no subprocess kill/fault-injection hook claimed.
+- Real configured source setter removes final binding of the restored
+  held Agent and reattaches through the v61 protected-empty gate.
+  Legacy activation remains denied while empty. Original offline
+  attachment replay and stale final-release replay preserve the new
+  checkout/revision. Update stale `--agent-sandbox-source-approval`
+  help to describe isolated unused or managed held-Agent layouts.
+- Real retention capability cannot retire a live checkpoint or close
+  a live Sandbox; explicit logical retirement/closure does not remove
+  Git retention. Wrong checkpoint/revision refuses. Actual closed
+  Sandbox maintenance subprocess sees independently edited checkout,
+  returns needs_inspection, preserves contents, old source binding and
+  unresolved source barrier, and denies same-layout Agent creation.
+  After independently restoring exact original contents and reopening
+  the owner, reconcile original closed revision before checkpoint
+  retention. Prove both cleanup effects and terminal replay across
+  subsequent subprocesses, including unchanged sibling worktrees,
+  original source Agent and controller, held restored Agent and no
+  grant. Actual responses redact origin/layout paths, source identities,
+  materialization, captured commit and retention ref. Original repository
+  HEAD/index and live dirty contents survive.
+- No new production owner, durable fact, schema, provider or Process
+  runtime behavior. Existing sealed authority/recovery semantics stand;
+  this is executable transport qualification, not a new containment
+  proof or general shared/participant activation promotion.
+
+- The full headless protocol group exposed a pre-existing flaky
+  cross-lane assertion: live reader queries can interleave with the
+  serialized constructor lane. Preserve exact dispatch count and order
+  within each lane, without imposing a false inter-thread ordering.
+  No dispatch code changed.
+
+Validation: L5 locked/offline headless protocol 8/8 (0.02s),
+recovery namespace 1/1, configured setter owner 1/1 (17.92s),
+actual executable integration 2/2 (62.99s final run). All 12
+distinct selected tests passed. Initial standalone maintenance
+fixture passed (23.54s); module move needed the SessionBackend
+trait import, strict Clippy identified two avoidable clones and
+initial broad headless run exposed the scheduling assertion;
+corrected and reran final affected integration/protocol and strict
+aw-cli all-feature/all-target Clippy successfully. Durable/minimal
+all-target checks passed (existing profile-specific dead-code
+warnings). Scoped fmt/diff checks passed. Prior five historical
+Store failures and full workspace/pinned Nix/other platforms not
+rerun.
+
+Scope/next: L5 still has no effective capabilities or writable
+delegated cgroup; production reviewed physical Process containment/
+dispatch remains priority when a real backend becomes available.
+Otherwise select a substantive remaining independent gate (e.g.
+never-managed ambient first-source transition needs proof of retirement
+of every existing live legacy execution authority, or task-bearing
+captured restore). Broader protected Views/manifest transfer,
+cross-Project restore, shared/participant source execution, semantic
+dependency-bearing registry replacement, physical cleanup and
+extension gates remain. No full maintenance process-kill proof, no
+arbitrary shell, no thaw of frozen launcher. Phase 3 underway.
+No push, repin, UX or frozen Sandbox changes.
+
+## Previous local implementation delta — 2026-11-27: held source-only empty Sandbox and first reattachment
 
 Parent `d027435a048ec0fcfa1117304780f2ea3db2692c` (held-Agent
 attachment/partial release), independently verified signature and

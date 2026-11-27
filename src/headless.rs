@@ -1867,16 +1867,30 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(input_calls[0].0, "inputs-list");
         assert_eq!(input_calls[0].1, "agent_inputs_list");
         let sandbox_calls = sandbox.calls.lock().unwrap();
+        // Live reads and serialized constructors have independent lanes.
+        // Require exact dispatch and order within each, not a scheduling
+        // dependency between the input-reader and dispatch threads.
+        let (live, serial): (Vec<_>, Vec<_>) = sandbox_calls
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .partition(|method| {
+                matches!(
+                    *method,
+                    "sandbox_list" | "sandbox_sources_list" | "checkpoint_list" | "checkpoint_get"
+                )
+            });
         assert_eq!(
-            sandbox_calls
-                .iter()
-                .map(|(method, _)| method.as_str())
-                .collect::<Vec<_>>(),
+            live,
             [
                 "sandbox_list",
                 "sandbox_sources_list",
                 "checkpoint_list",
-                "checkpoint_get",
+                "checkpoint_get"
+            ]
+        );
+        assert_eq!(
+            serial,
+            [
                 "sandbox_create:sandbox-new",
                 "checkpoint_restore:checkpoint-restore",
                 "checkpoint_delete:cp-delete",

@@ -1013,8 +1013,9 @@ struct RpcCommandCliArgs {
     /// Never authorizes materialization, capture, restore or execution.
     #[arg(long = "source-metadata-approval", requires = "rpc_actor_owner")]
     rpc_source_metadata_approval: Option<PathBuf>,
-    /// Independently approved exact source mutation for an unused same-
-    /// Project Sandbox. No caller-selected paths or recovery modes.
+    /// Independently approved exact source mutation in an isolated same-
+    /// Project Sandbox (unused or managed with a held Agent).
+    /// No caller-selected paths or recovery modes.
     #[cfg(feature = "workspace")]
     #[arg(long = "sandbox-source-approval", requires = "rpc_actor_owner")]
     rpc_sandbox_source_approval: Option<PathBuf>,

@@ -1256,3 +1256,6 @@ fn exercise_native_root_stdio(linked: bool) {
         assert!(!backing.join("created").exists());
     }
 }
+
+#[path = "native_source_rpc/maintenance.rs"]
+mod maintenance;

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: held source-only empty Sandbox and first reattachment (this checkpoint; local parent `d027435a048ec0fcfa1117304780f2ea3db2692c`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: actual construction and maintenance stdio executable gate (this checkpoint; local parent `26e1d8ed010095adde4318a853fa722db20e45fd`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1905,7 +1905,8 @@ Current implementation: held source-only empty Sandbox and first reattachment (t
       native executable 1); strict Clippy, durable/minimal, help/flag
       conflicts, scoped formatting/diff passed. Separate flattened
       retention approval group and fixture lifetime corrections verified.
-      Real maintenance stdio subprocess qualification remains pending.
+      Real maintenance stdio subprocess qualification is completed in
+      the later executable gate below.
       **Quiescent registry maintenance:** existing staged typed leaves
       and exact registration handles, exclusive registry/Store owner,
       reader and native Arc/Weak user fences. Aggregate exact retained
@@ -1981,8 +1982,26 @@ Current implementation: held source-only empty Sandbox and first reattachment (t
       fmt/diff passed. Five historical Store failures not rerun.
       Never-managed ambient bound first attach, implicit source-free
       opening and shared/participant source execution remain held.
+      **Actual maintenance/construction executable gate:** grouped
+      real native integration target covers configured capture, captured
+      restore, baseline, derive, held final release/reattachment and both
+      retention methods through the compiled AW stdio process. Explicit
+      capability/parameter/duplicate/Project/task gates, absent-approval
+      applied replay, recovery-only original RPC namespace, actual
+      offline Prepared baseline inspection after original effect/Unknown,
+      retained edited checkout/Unknown cleanup and exact restart settlement,
+      redacted responses, unchanged unrelated materializations/Agent
+      authority, no model call. Correct stale source setter help. No new
+      behavior owner, receipt/schema or actual strong Process proof.
+      Fix obsolete cross-lane total-order assertion, preserving each
+      lane's exact dispatch count/order (no dispatch change).
+      Locked/offline headless 8, namespace 1, configured setter 1,
+      executable 2: all 12 selected tests passed. Strict aw-cli
+      Clippy, durable/minimal all-target, scoped fmt/diff passed.
+      Five historical Store failures not rerun.
       **Next:** production reviewed physical Process containment/dispatch,
-      actual host gates and remaining never-managed ambient first-source transition.
+      never-managed ambient first-source authority retirement, task-bearing
+      captured restore or other remaining independent host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
