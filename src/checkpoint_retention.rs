@@ -2818,12 +2818,10 @@ mod tests {
                 &bound.canonical_ref,
                 &location.name,
                 bound.rev,
-                |_| -> Result<()> { panic!("bound release reached approval") },
-                |_, _| panic!("bound release reached physical owner"),
+                |_| -> Result<()> { Err(Error::Denied("fixture: no final-release approval")) },
+                |_, _| panic!("unapproved final release reached physical owner"),
             ),
-            Err(Error::Conflict(
-                "managed mutation requires an unused isolated Sandbox"
-            ))
+            Err(Error::Denied("fixture: no final-release approval"))
         ));
         interrupt_replacement(&store, &bound, bound_id, true);
         assert!(!bound.tool_root.join("code").exists());
@@ -3156,7 +3154,8 @@ mod tests {
             .is_err());
         fs::write(&data_file, b"dirty checkpoint").unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let reduced = apply(&store, "fixture-bound-release-reconcile", &remove_params).unwrap();
         assert_eq!(reduced.rev, added.rev + 1);
         assert_eq!(reduced.sources, bound_replaced.sources);
@@ -3189,30 +3188,146 @@ mod tests {
                 Some(bound_agent.rev)
             )
             .is_err());
-        assert!(matches!(
-            store.sandbox_release_source(
+        // The exact original final removal leaves an empty *source-only*
+        // Sandbox, not a new ambient execution capability. Restore the
+        // selected checkout's original contents before approving release.
+        fs::write(&retained_file, b"replacement version").unwrap();
+        let mut final_config = remove_config.clone();
+        final_config["sandbox_rev"] = json!(reduced.rev);
+        final_config["source"] = json!(location.name);
+        final_config["repositories"] = json!([replacement_location]);
+        let final_params = json!({
+            "ref":bound.canonical_ref,"rev":reduced.rev,"name":location.name,"binding":null
+        });
+        fs::write(&setter_path, serde_json::to_vec(&final_config).unwrap()).unwrap();
+        let blocked = store
+            .acquire_source_mutation_barrier(
+                &SourceMutationSet::from_bindings(&[all_bindings[0].binding.clone()]).unwrap(),
+                "fixture:bound-final-release-busy",
+            )
+            .unwrap();
+        assert!(apply(&store, "fixture-bound-final-release", &final_params).is_err());
+        blocked.settle(SourceMutationOutcome::Settled).unwrap();
+        let held_empty = apply(&store, "fixture-bound-final-release", &final_params).unwrap();
+        assert!(held_empty.sources.is_empty());
+        assert_eq!(held_empty.rev, reduced.rev + 1);
+        assert_eq!(held_empty.layout_digest, reduced.layout_digest);
+        assert_eq!(fs::read_dir(&bound.tool_root).unwrap().count(), 0);
+        let assert_held_empty = |store: &SessionStore| {
+            assert_eq!(
+                store.sandbox_get(&actor, &bound.canonical_ref).unwrap(),
+                held_empty
+            );
+            assert_eq!(store.agent_get(&actor, bound_ref).unwrap(), bound_agent);
+            assert_eq!(
+                store
+                    .actor_queue_list(&actor, bound_execution.session_id())
+                    .unwrap(),
+                queue_before
+            );
+            assert!(matches!(
+                store.agent_admission(
+                    &actor,
+                    bound_ref,
+                    AgentAdmission::Open,
+                    Some(bound_agent.rev)
+                ),
+                Err(Error::Denied(
+                    "source-bearing Agent Sandbox realization is unavailable"
+                ))
+            ));
+            assert!(matches!(
+                store.activate(
+                    &actor,
+                    bound_execution.session_id(),
+                    bound_execution.branch_id()
+                ),
+                Err(Error::Denied(
+                    "source-bearing Agent Sandbox realization is unavailable"
+                ))
+            ));
+            // A new Session cannot select the protected empty layout
+            // through the automatic legacy binding path, either.
+            assert!(store
+                .create(
+                    &actor,
+                    "fixture:empty-source-alias",
+                    layout(&bound.tool_root)
+                )
+                .is_err());
+            assert!(store
+                .sandbox_grant_preflight(&actor, bound_ref, &expanded, &both_ceilings)
+                .is_err());
+        };
+        assert_held_empty(&store);
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        assert_held_empty(&store);
+        assert_eq!(
+            apply(&store, "fixture-bound-final-replay", &final_params).unwrap(),
+            held_empty
+        );
+
+        // The same original first-source layout reservation now supports
+        // reattachment to this protected empty bound layout. The ordinary
+        // ambient gate is never released, even between physical effect
+        // and original receipt settlement or when that receipt is Unknown.
+        let mut readd_config = setter_config;
+        readd_config["sandbox_rev"] = json!(held_empty.rev);
+        readd_config["repositories"] = json!([data_location]);
+        let mut readd_params = add_params;
+        readd_params["rev"] = json!(held_empty.rev);
+        fs::write(&setter_path, serde_json::to_vec(&readd_config).unwrap()).unwrap();
+        let readd_id =
+            crate::sandbox_source_attach::rpc_invocation_id("fixture-bound-reattach").unwrap();
+        let prepared = store
+            .sandbox_prepare_attachment(
                 &actor,
                 &bound.canonical_ref,
-                &location.name,
-                reduced.rev,
-                |_| -> Result<()> { panic!("bound final release reached approval") },
-                |_, _| panic!("bound final release reached physical owner"),
-            ),
-            Err(Error::Conflict(
-                "managed mutation requires an unused isolated Sandbox"
-            ))
-        ));
-        // A fresh configured attachment at the same name has a new pin.
-        // Replaying the previous release must not remove the new checkout.
-        let mut readd_config = setter_config;
-        readd_config["sandbox_rev"] = json!(reduced.rev);
-        let mut readd_params = add_params;
-        readd_params["rev"] = json!(reduced.rev);
-        fs::write(&setter_path, serde_json::to_vec(&readd_config).unwrap()).unwrap();
-        let readded = apply(&store, "fixture-bound-reattach", &readd_params).unwrap();
-        assert_eq!(readded.rev, reduced.rev + 1);
-        assert_eq!(readded.sources[0], reduced.sources[0]);
-        assert_eq!(readded.sources[1].binding_rev, readded.rev);
+                held_empty.rev,
+                &readd_id,
+                data_anchor.clone(),
+                |_, prepare_id| {
+                    driver.plan_restore_approved(
+                        &GitRestoreLocation {
+                            name: data_name.clone(),
+                            repository: repo.clone(),
+                            repository_identity: data_location.repository_identity,
+                            target: target.clone(),
+                            parent_identity,
+                        },
+                        &data_version,
+                        prepare_id,
+                    )
+                },
+            )
+            .unwrap();
+        prepared.revalidate().unwrap();
+        driver.execute_restore(prepared.source()).unwrap();
+        prepared.mark_unknown().unwrap();
+        assert_held_empty(&store);
+        assert!(apply(&store, "fixture-bound-reattach", &readd_params).is_err());
+        assert!(store
+            .sandbox_close(&actor, &bound.canonical_ref, None)
+            .is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        assert_held_empty(&store);
+        let readded = attach(&store, &setter_path, &bound.canonical_ref, &readd_id, true).unwrap();
+        assert_eq!(readded.rev, held_empty.rev + 1);
+        assert_eq!(readded.sources.len(), 1);
+        assert_eq!(readded.sources[0].name, data_name);
+        assert_eq!(readded.sources[0].binding_rev, readded.rev);
+        assert_eq!(
+            apply(&store, "fixture-bound-reattach", &readd_params).unwrap(),
+            readded
+        );
+        fs::write(&setter_path, serde_json::to_vec(&final_config).unwrap()).unwrap();
+        assert_eq!(
+            apply(&store, "fixture-bound-final-old-replay", &final_params).unwrap(),
+            readded
+        );
         fs::write(&setter_path, serde_json::to_vec(&remove_config).unwrap()).unwrap();
         assert_eq!(
             apply(&store, "fixture-bound-release-old-replay", &remove_params).unwrap(),

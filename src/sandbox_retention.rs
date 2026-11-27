@@ -22,7 +22,7 @@ pub(crate) struct ReleaseArgs {
     state_dir: PathBuf,
     /// Private approval of exact removal and the entire retained layout.
     approval: PathBuf,
-    /// Exact canonical open Sandbox (bound layouts must retain another source).
+    /// Exact canonical open Sandbox (bound layouts require one isolated held Agent).
     sandbox: String,
     /// Named original source to remove; revision is in the approval.
     source: String,

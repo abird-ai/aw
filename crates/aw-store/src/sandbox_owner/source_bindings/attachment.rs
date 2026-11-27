@@ -2,7 +2,7 @@
 //! Same Project receipt, source coordinator and binding publication owner.
 use super::{
     insert_at_revision, next_source_rev, publish_source_change_in,
-    release::{observe_managed_in, release_event_id, ManagedChange, ManagedMutation},
+    release::{observe_managed_in, release_event_id, ManagedMutation},
     remove_binding_in, retained_in, SourceChange, VersionedSourceBinding,
 };
 use crate::{
@@ -434,14 +434,8 @@ impl<'a> PreparedSandboxAttachment<'a> {
         )?;
         let boundary = self.boundary();
         let sandbox = &self.observation.snapshot().canonical_ref;
-        let current = observe_managed_in(
-            self.store,
-            tx,
-            &self.actor,
-            sandbox,
-            boundary.expected_rev,
-            ManagedChange::Materialize,
-        )?;
+        let current =
+            observe_managed_in(self.store, tx, &self.actor, sandbox, boundary.expected_rev)?;
         if current != self.observation.layout
             || (publication && current.writer_epoch != boundary.writer_epoch)
         {
@@ -688,8 +682,9 @@ impl SessionStore {
         Ok(result)
     }
 
-    /// Attach one absent name to an unused isolated layout or an existing
-    /// managed layout with one held, quiescent Agent. Read-only plan under
+    /// Attach one absent name to an unused isolated layout or a managed
+    /// layout (including held source-only empty) with one quiescent held
+    /// Agent. Read-only plan under
     /// independent authority; persist Prepared and the complete source claim
     /// (plus exact layout reservation for an empty Sandbox) together.
     pub fn sandbox_prepare_attachment(
@@ -750,14 +745,7 @@ impl SessionStore {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let creator = new_request(&tx, actor, sandbox, request_id)?;
-            let layout = observe_managed_in(
-                self,
-                &tx,
-                actor,
-                sandbox,
-                expected_rev,
-                ManagedChange::Materialize,
-            )?;
+            let layout = observe_managed_in(self, &tx, actor, sandbox, expected_rev)?;
             self.source_set_limit()
                 .admit(layout.bindings.len() + usize::from(!replace))?;
             if layout
@@ -831,14 +819,7 @@ impl SessionStore {
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if StoreScope::load(&tx)? != scope
             || new_request(&tx, actor, sandbox, request_id)? != receipt.creator
-            || observe_managed_in(
-                self,
-                &tx,
-                actor,
-                sandbox,
-                expected_rev,
-                ManagedChange::Materialize,
-            )? != observation.layout
+            || observe_managed_in(self, &tx, actor, sandbox, expected_rev)? != observation.layout
         {
             return Err(Error::Conflict("attachment changed during planning"));
         }
@@ -909,14 +890,7 @@ impl SessionStore {
             return Err(Error::Storage("attachment boundary unavailable"));
         };
         receipt.candidate.require_absent_in(&tx)?;
-        let layout = observe_managed_in(
-            self,
-            &tx,
-            actor,
-            sandbox,
-            boundary.expected_rev,
-            ManagedChange::Materialize,
-        )?;
+        let layout = observe_managed_in(self, &tx, actor, sandbox, boundary.expected_rev)?;
         let registry = self.inner.source_drivers.reader()?;
         boundary.require_compatible(&registry)?;
         let sources = receipt

@@ -350,7 +350,9 @@ pub const VAULT_GRANT_SCHEMA: &str = include_str!("../migrations/059_vault_grant
 const APPLICATION_ID: i64 = 0x41575333;
 const PROJECT_CONSTRUCTION_ORIGIN_SCHEMA: &str =
     include_str!("../migrations/060_project_construction_origin.sql");
-const LATEST_SCHEMA_VERSION: i64 = 60;
+const HELD_SOURCE_BOUNDARY_SCHEMA: &str =
+    include_str!("../migrations/061_held_source_boundary.sql");
+const LATEST_SCHEMA_VERSION: i64 = 61;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -3155,6 +3157,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
             "project-construction-origin",
             PROJECT_CONSTRUCTION_ORIGIN_SCHEMA,
         )?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 60 {
+        migrate_source_schema(c, 61, "held-source-boundary", HELD_SOURCE_BOUNDARY_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {

@@ -178,7 +178,7 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_source_attach::ReplaceArgs,
     },
-    /// Release one managed Git source (a bound Sandbox must retain another source).
+    /// Release one managed Git source (a bound empty Sandbox remains source-only).
     #[cfg(feature = "workspace")]
     SandboxSourceRelease {
         #[command(flatten)]

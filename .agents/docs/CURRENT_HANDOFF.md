@@ -35,7 +35,107 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: held-Agent managed attachment and partial source release
+## Latest local implementation delta — 2026-11-27: held source-only empty Sandbox and first reattachment
+
+Parent `d027435a048ec0fcfa1117304780f2ea3db2692c` (held-Agent
+attachment/partial release), independently verified signature and
+non-reserved clean starting tree. Last independently verified
+published AW main `0f9807f4` (origin/main unchanged), dotlink
+`85ceccc1`, frozen `576d0a1a`. L5 only; product 0.15.0 and Git
+recovery v4 unchanged. Store v61 (see migration below).
+
+- Complete the previously managed isolated held-Agent final-source
+  removal and source-free reattachment boundary in SPEC §25.4.
+  Existing Project-owned observation accepts a bound managed
+  source-bearing layout or an already protected empty layout with
+  the original held-source fact. Remove the now-unnecessary
+  Materialize/Release observer distinction; attachment still checks
+  exact absent/occupied name and release still selects an actual
+  retained binding. Exact held Agent/Session/layout/writer/aliases,
+  retained child/backing, Run/hazard/Input/Control/queue quiescence,
+  and complete source claim checks are unchanged. First attachment
+  to a never-managed bound ambient Agent remains refused.
+- The original managed final release under a live whole-layout
+  physical approval proves the actual named checkout and layout
+  released; atomically publishes the original release event with
+  `held_source_boundary: true` only for the final binding of a bound
+  Agent. The flag is immutable provenance for that Sandbox identity,
+  not a source binding, grant or another state/receipt owner.
+  An unused Sandbox's original final release does not mint it.
+  Old grant pins become unusable; no automatic admission or source
+  authority. Pending Input, history and Agent revision are unchanged.
+- Original Store legacy execution gate denies both the exact
+  bound Agent (including after closure) and any known exact-path
+  open source-only layout alias even with no rows. Legacy ambient
+  selection, bind_auto and closure share the same boundary; close
+  checks original source-protected quiescence and owner mode.
+  Native/Process source execution already requires the nonempty
+  exact approved set. No source-unaware fallback. Closed empty
+  Sandbox does not reserve an unrelated new layout indefinitely,
+  but its original bound Agent stays protected.
+- Reuse the existing attachment receipt and first-source layout
+  reservation for reattachment from protected empty. Unknown
+  reattachment cannot release ambient admission, close the Sandbox,
+  or replan; exact original recovery can publish a new pin. Neither
+  old partial/final release replay nor old source grants follow the
+  reattached name. Independent configured Git and separate-controller
+  source setter retain their whole physical layout approval, origin,
+  store generation and exact revision fencing. CLI help reflects
+  final removal without implying ambient reactivation.
+- Security compatibility: a v60 writer cannot understand this
+  authority fact. Advance Store epoch to 61 through the existing
+  transactional source-schema migration/lease with one partial
+  `commit_log` index for the immutable flag. No new table, altered
+  receipt schema or synthetic source row. Prior releases and
+  ordinary source-free layouts remain unchanged; do not manually
+  downgrade the epoch. Existing exact-version direct open and
+  backup-restore admission continues to apply.
+- Grouped real Git lifecycle extends the prior attachment/partial
+  release test. Retain Pending Input; refuse active final-release
+  claim; physically release last managed code checkout with exact
+  independent approval and empty parent proof. Observe source-only
+  empty Sandbox and deny ordinary Agent opening, legacy activation,
+  new same-layout Session, and old source grant. Restart and replay
+  original final removal. Prepare/execute first-source reattachment
+  using exact RPC invocation, mark Unknown, prove protected empty
+  remains inert and close/fresh retry refused, restart and inspect
+  original candidate. New pin publishes once; both prior removal
+  replays preserve newly restored checkout. Existing Store migration
+  regression reconstructs v60 without new fact and verifies ordinary
+  source-free creation/activation and unchanged snapshots across
+  v61. Actual previous executable migration/refusal verification is
+  separate from the Rust fixture.
+
+Validation: L5 locked/offline: Store Sandbox owner 5/5 (2.93s),
+checkpoint owner 4/4 (2.76s); expanded configured CLI Git lifecycle
+1/1 (104.01s); Host real Git lifecycle 1/1 (167.67s); configured setter
+1/1 (17.31s); Actor lifecycle 3/3 (56.66s); actual native executable
+1/1 (34.87s). All 16 distinct selected tests passed. Separately, the
+actual prior signed-checkpoint AW executable created a disposable
+v60 Store, rebuilt current executable migrated it to v61, and old
+executable refused the upgraded database with the expected unsupported
+schema/application-ID error; v61 unchanged after refusal. Actual
+release CLI help, strict affected all-feature/all-target Clippy,
+durable/minimal all-target checks (existing profile-specific dead-code
+warnings), and scoped rustfmt/diff checks passed. The historical five
+Store failures, full workspace, pinned Nix and other native platforms
+were not rerun.
+
+Scope/next: final removal + first reattachment of an already managed
+isolated held-Agent named-child Git layout, not a retrofit of a
+never-managed ambient bound Agent, automatic source-free opening or
+new public Sandbox mode field. Shared/participant execution and
+partial/scratch/non-exact physical cleanup remain held. L5 still has
+no effective capabilities/writable delegated cgroup; prioritize real
+production-reviewed physical Process containment/dispatch when
+available, otherwise qualify actual maintenance/constructor stdio
+subprocess or another independent gate. Never-managed first-source
+transition requires separate live legacy authority retirement proof.
+Dependency-bearing registry replacement, task/cross-Project restore,
+wider protected Views/manifest transfer and extension gates remain.
+Phase 3 underway; no push, repin, UX or frozen Sandbox changes.
+
+## Previous local implementation delta — 2026-11-27: held-Agent managed attachment and partial source release
 
 Parent `5d879ab4a6721eb332de567567427732723c1a0f` (held isolated
 Agent managed replacement), independently signature/parent verified.

@@ -131,6 +131,19 @@ pub(super) fn has_sources(connection: &Connection, sandbox: &str) -> Result<bool
     ))
 }
 
+/// A factual final release from a held bound Agent does not grant ambient
+/// execution, even when no binding remains. The original release fact is
+/// immutable; this lookup uses the partial v61 index.
+pub(super) fn has_held_source_boundary_in(c: &Connection, sandbox: &str) -> Result<bool> {
+    db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commit_log WHERE entity_type='sandbox'
+         AND entity_id=?1 AND kind='sandbox.sources.changed'
+         AND json_type(payload_json,'$.held_source_boundary')='true')",
+        [sandbox],
+        |row| row.get(0),
+    ))
+}
+
 fn bindings_in(connection: &Connection, sandbox: &str) -> Result<Vec<StoredBinding>> {
     let mut query = db(connection.prepare(
         "SELECT source_name,driver_key,binding_schema,source_ref,materialization,
@@ -349,7 +362,10 @@ fn remove_binding_in(
 // physical release additionally names its original descriptor's fact ID.
 enum SourceChange<'a> {
     Metadata,
-    Released(&'a str),
+    Released {
+        event_id: &'a str,
+        held_source_boundary: bool,
+    },
     Attached {
         event_id: &'a str,
         prepare_id: &'a str,
@@ -382,8 +398,14 @@ fn publish_source_change_in(
     let transaction = durability::tx_id()?;
     let event_id = match change {
         SourceChange::Metadata => None,
-        SourceChange::Released(event_id) => {
+        SourceChange::Released {
+            event_id,
+            held_source_boundary,
+        } => {
             payload["released"] = true.into();
+            if held_source_boundary {
+                payload["held_source_boundary"] = true.into();
+            }
             Some(event_id)
         }
         SourceChange::Attached {

@@ -402,8 +402,9 @@ fn require_no_closed_retained_layout_in(
     Ok(())
 }
 
-/// Ambient Agent selection must not reinterpret a reserved layout or
-/// any known source-bearing layout, even across Project identities.
+/// Ambient Agent selection must not reinterpret a reserved layout, a
+/// source-bearing layout or a held source-only empty layout, even across
+/// Project identities. The last case survives removal of every binding.
 fn require_ambient_layout_in(connection: &Connection, root: &str, cwd: &str) -> Result<()> {
     if !source_bindings::available(connection)? {
         return Ok(());
@@ -412,7 +413,11 @@ fn require_ambient_layout_in(connection: &Connection, root: &str, cwd: &str) -> 
     let source_layout: bool = db(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandboxes_current s
          WHERE s.lifecycle='open' AND (s.tool_root IN (?1,?2) OR s.working_directory IN (?1,?2))
-         AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b WHERE b.sandbox_id=s.sandbox_id))",
+         AND (EXISTS(SELECT 1 FROM sandbox_source_bindings_current b WHERE b.sandbox_id=s.sandbox_id)
+           OR EXISTS(SELECT 1 FROM commit_log l
+              WHERE l.entity_type='sandbox' AND l.entity_id=s.sandbox_id
+                AND l.kind='sandbox.sources.changed'
+                AND json_type(l.payload_json,'$.held_source_boundary')='true')))",
         params![root, cwd], |row| row.get(0),
     ))?;
     if source_layout {
@@ -564,6 +569,10 @@ pub(crate) fn require_execution_in(connection: &Connection, session: &str) -> Re
              WHERE a.session_id=?1 AND (
                  EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
                         WHERE b.sandbox_id=s.sandbox_id)
+                 OR EXISTS(SELECT 1 FROM commit_log l
+                     WHERE l.entity_type='sandbox' AND l.entity_id=s.sandbox_id
+                       AND l.kind='sandbox.sources.changed'
+                       AND json_type(l.payload_json,'$.held_source_boundary')='true')
                  OR (s.lifecycle='closed' AND EXISTS(
                      SELECT 1 FROM commit_log l
                      WHERE l.entity_type='sandbox' AND l.entity_id=s.sandbox_id
@@ -576,8 +585,12 @@ pub(crate) fn require_execution_in(connection: &Connection, session: &str) -> Re
                                     json_extract(r.binding_json,'$.working_directory'))
                OR s.working_directory IN (json_extract(r.binding_json,'$.tool_root'),
                                           json_extract(r.binding_json,'$.working_directory')))
-               AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
+               AND (EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
                           WHERE b.sandbox_id=s.sandbox_id)
+                    OR (s.lifecycle='open' AND EXISTS(SELECT 1 FROM commit_log l
+                         WHERE l.entity_type='sandbox' AND l.entity_id=s.sandbox_id
+                           AND l.kind='sandbox.sources.changed'
+                           AND json_type(l.payload_json,'$.held_source_boundary')='true')))
          ) FROM sessions r WHERE r.id=?1",
         [session],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -776,7 +789,9 @@ fn bind_auto(
         agent_project_and_layout(connection, session, branch)?;
     if let Some(current) = current {
         let sandbox = snapshot_row(connection, &current)?;
-        if source_bindings::has_sources(connection, &current)? {
+        if source_bindings::has_sources(connection, &current)?
+            || source_bindings::has_held_source_boundary_in(connection, &current)?
+        {
             return Err(Error::Denied(
                 "source-bearing Agent Sandbox realization is unavailable",
             ));
@@ -1107,9 +1122,10 @@ impl SessionStore {
             .to_str()
             .ok_or(Error::Storage("invalid Sandbox working directory"))?;
         crate::source_barrier::require_unleased_layout_in(&tx, root, cwd)?;
-        let source_bearing = source_bindings::has_sources(&tx, &current.canonical_ref)?;
-        require_close_quiescent_in(&tx, &current, source_bearing)?;
-        if source_bearing {
+        let source_protected = source_bindings::has_sources(&tx, &current.canonical_ref)?
+            || source_bindings::has_held_source_boundary_in(&tx, &current.canonical_ref)?;
+        require_close_quiescent_in(&tx, &current, source_protected)?;
+        if source_protected {
             if self.inner.mode != crate::StoreMode::OwnerLock {
                 return Err(Error::Denied(
                     "source Sandbox close requires the exclusive Store owner",
@@ -1157,6 +1173,70 @@ mod tests {
             model_hint: "model".into(),
             destination_fingerprint: "0".repeat(64),
         }
+    }
+
+    #[test]
+    fn v60_migration_preserves_ordinary_source_free_admission() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(std::env::temp_dir().join(id("aw-held-source-migration").unwrap()));
+        let actor = PrincipalId::new("internal:fixture:held-source-migration").unwrap();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let (session, branch) = store.create(&actor, "ambient", binding("/tmp")).unwrap();
+        let agent = store
+            .agent_binding(&actor, &session.id, &branch.id)
+            .unwrap();
+        let project = format!(
+            "/d:{}/i:{}/p:{}",
+            agent.domain_handle, agent.identity_handle, agent.project_handle
+        );
+        let reference = format!("{project}/a:{}", agent.agent_handle);
+        let before = store.agent_get(&actor, &reference).unwrap();
+        let sandbox = before.sandbox_ref.as_deref().unwrap();
+        let snapshot = store.sandbox_get(&actor, sandbox).unwrap();
+        assert!(snapshot.sources.is_empty());
+        assert!(store.activate(&actor, &session.id, &branch.id).is_ok());
+        drop(store);
+
+        // Reconstruct the actual pre-boundary schema; v61 adds only the
+        // partial index, with no new facts for ordinary ambient layouts.
+        {
+            let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            connection
+                .execute_batch(
+                    "DROP INDEX sandbox_held_source_boundary;
+                 UPDATE store_meta SET value='60' WHERE key='schema_epoch';
+                 UPDATE schema_meta SET schema_epoch=60,activation_epoch=60 WHERE singleton=1;
+                 UPDATE migration_lease SET current_epoch=60 WHERE singleton=1;
+                 PRAGMA user_version=60;",
+                )
+                .unwrap();
+        }
+        let store = SessionStore::open(&temp.0).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                61
+            );
+            assert!(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='sandbox_held_source_boundary')",
+                [], |r| r.get::<_, bool>(0),
+            ).unwrap());
+            assert!(!source_bindings::has_held_source_boundary_in(&connection, sandbox).unwrap());
+        }
+        assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
+        assert_eq!(store.sandbox_get(&actor, sandbox).unwrap(), snapshot);
+        assert!(store.activate(&actor, &session.id, &branch.id).is_ok());
+        assert!(store
+            .create(&actor, "same ambient layout", binding("/tmp"))
+            .is_ok());
     }
 
     #[test]

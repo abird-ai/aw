@@ -1585,8 +1585,8 @@ impl<'a> GitCheckpointRestoreHost<'a> {
     }
 
     /// Remove one original managed source from an open Sandbox. A bound
-    /// layout requires one isolated held Agent and at least one remaining
-    /// source. The independently protected named parent remains the same layout
+    /// layout requires one isolated held Agent; final removal keeps the
+    /// source-only boundary. The protected named parent remains the same layout
     /// after removal, including final-source removal. The fence covers
     /// every retained source and its backing, never just a target path.
     pub fn release_sandbox_source<F: GitRestoreFence>(
