@@ -166,7 +166,7 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_derive::Args,
     },
-    /// Attach an exact retained Git version to an unused Sandbox.
+    /// Attach an exact retained Git version to an unused or isolated held-Agent Sandbox.
     #[cfg(feature = "workspace")]
     SandboxSourceAttach {
         #[command(flatten)]
@@ -178,7 +178,7 @@ enum TopCommand {
         #[command(flatten)]
         args: sandbox_source_attach::ReplaceArgs,
     },
-    /// Release one exact managed Git source from an unused Sandbox.
+    /// Release one managed Git source (a bound Sandbox must retain another source).
     #[cfg(feature = "workspace")]
     SandboxSourceRelease {
         #[command(flatten)]

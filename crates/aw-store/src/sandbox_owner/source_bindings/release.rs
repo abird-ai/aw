@@ -149,13 +149,20 @@ impl SandboxSourceRelease {
     }
 }
 
+/// Bound Agents may mutate an already managed source-bearing layout, but
+/// must not cross the source-free/ambient execution boundary.
+pub(super) enum ManagedChange {
+    Materialize,
+    Release,
+}
+
 pub(super) fn observe_managed_in(
     store: &SessionStore,
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     sandbox: &str,
     rev: u64,
-    replacement: bool,
+    change: ManagedChange,
 ) -> Result<ManagedMutation> {
     let key = sandbox_owner::parse_sandbox_ref(sandbox)?;
     sandbox_owner::authorize_project(tx, actor, &key.project, true)?;
@@ -176,9 +183,13 @@ pub(super) fn observe_managed_in(
     // Recovery must observe its own reserved first-source layout.
     // The caller separately claims or revalidates that exact barrier.
     sandbox_owner::require_no_closed_retained_layout_in(tx, root, cwd)?;
-    // First/last source transitions and attachment remain unused-only.
-    // Replacement can preserve an existing, exclusively bound Agent's
-    // source-bearing layout, but never reinterpret an ambient or shared one.
+    // First/last source transitions remain unused-only. Other managed
+    // mutations can preserve an exclusively bound Agent's source-bearing
+    // layout, but never reinterpret an ambient or shared one.
+    let stays_source_bearing = match change {
+        ManagedChange::Materialize => !bindings.is_empty(),
+        ManagedChange::Release => bindings.len() > 1,
+    };
     let used: bool = db(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id<>?1 AND lifecycle='open'
                    AND (tool_root IN (?2,?3) OR working_directory IN (?2,?3)))
@@ -204,13 +215,13 @@ pub(super) fn observe_managed_in(
         let agents = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
         match agents.as_slice() {
             [] => None,
-            [(session, branch)] if replacement && !bindings.is_empty() => {
+            [(session, branch)] if stays_source_bearing => {
                 let key = crate::agent_owner::AgentKey::new(session, branch);
                 let (lifecycle, admission) = crate::agent_owner::lifecycle(tx, key)?;
                 let (project, layout, current, _, _) =
                     sandbox_owner::agent_project_and_layout(tx, session, branch)?;
                 // A close request never reopens admission. Do not strand an
-                // original Prepared replacement if that Agent closes while
+                // original managed mutation if that Agent closes while
                 // physical reconciliation is in flight.
                 if !matches!(lifecycle.as_str(), "open" | "closing" | "closed")
                     || admission != "held"
@@ -221,7 +232,7 @@ pub(super) fn observe_managed_in(
                     || layout.working_directory != cwd
                 {
                     return Err(Error::Conflict(
-                        "bound replacement requires an exact Agent with held admission",
+                        "bound source mutation requires an exact Agent with held admission",
                     ));
                 }
                 let shared: bool = db(tx.query_row(
@@ -235,7 +246,7 @@ pub(super) fn observe_managed_in(
                 ))?;
                 if shared {
                     return Err(Error::Conflict(
-                        "bound replacement requires an isolated Agent Session",
+                        "bound source mutation requires an isolated Agent Session",
                     ));
                 }
                 crate::actor_queue::require_structural_quiescence_in(tx, session, branch)?;
@@ -280,7 +291,7 @@ fn observe_in(
     name: &SourceName,
     rev: u64,
 ) -> Result<SandboxSourceRelease> {
-    let layout = observe_managed_in(store, tx, actor, sandbox, rev, false)?;
+    let layout = observe_managed_in(store, tx, actor, sandbox, rev, ManagedChange::Release)?;
     let selected = layout
         .bindings
         .iter()
@@ -350,8 +361,9 @@ impl SessionStore {
     }
 
     /// Trusted effectful realization of sources.set(name, null) for an
-    /// original managed materialization. Independent authorization and
-    /// read-only preflight precede the durable exact-revision release
+    /// original managed materialization. Bound layouts must retain a source
+    /// and have one isolated held, quiescent Agent. Independent authorization
+    /// and read-only preflight precede the durable exact-revision release
     /// claim. The caller reconciles only the original descriptor, with
     /// its physical/provider fence held through commit. Failed effects
     /// or publication retain the whole old binding set and hazard.

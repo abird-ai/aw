@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: quiescent held-Agent managed source replacement (this checkpoint; local parent `e56cd92bed01f75e0f7f4469a8bc2533a7eb6d47`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: held-Agent managed attachment and partial source release (this checkpoint; local parent `5d879ab4a6721eb332de567567427732723c1a0f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1939,10 +1939,30 @@ Current implementation: quiescent held-Agent managed source replacement (this ch
       Actor 3, native executable 1: 15 selected tests passed; strict
       affected Clippy, durable/minimal all-target and scoped fmt/diff
       checks passed. Prior five historical Store failures not rerun.
-      Bound attachment/partial/final release and shared/participant
-      source execution remain held.
+      First cut restricted to replacement; subsequent managed attachment
+      and partial release are qualified below.
+      **Held isolated Agent managed attachment and partial release:**
+      one original Project-owned observation distinguishes materialize
+      (existing nonempty set) from remove (at least two original names).
+      Same exact held Agent/immutable layout/queue/Run/hazard/alias and
+      source-custody checks at planning, Prepared, recovery and commit.
+      Original old+incoming claim and original release descriptor/CAS
+      reused; no new receipt, schema or Agent owner. Configured offline
+      and separate-controller authenticated setter use existing physical
+      approval. Preserve Pending work, sibling edits and unaffected
+      pins; old grant does not expand, removed/re-added pin refuses.
+      Actual Git interrupted attachment and partial-release recovery,
+      fresh reattachment and old release replay qualified.
+      Locked/offline Store 8, Host Git 1, configured setter 1,
+      expanded CLI Git 1, Actor 3, native executable 1: all 15
+      selected tests passed. Strict affected Clippy, durable/minimal
+      all-target checks, executable help and scoped fmt/diff passed.
+      Five historical Store failures not rerun.
+      Bound first-source and final-source transitions remain held to
+      prevent ambient authority reinterpretation; shared/participant
+      source execution remains held.
       **Next:** production reviewed physical Process containment/dispatch,
-      remaining bound-Agent attachment/release and actual host gates.
+      remaining bound-Agent source-free transitions and actual host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
@@ -1954,8 +1974,8 @@ Current implementation: quiescent held-Agent managed source replacement (this ch
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and
-      non-exact partial checkout cleanup, physical authority/production cleanup, remaining bound-Agent
-      attachment/release and other structural cases remain. Configured signing and Git approval loaders, local
+      non-exact partial checkout cleanup, physical authority/production cleanup, bound-Agent
+      first/final-source transitions and broader structural cases remain. Configured signing and Git approval loaders, local
       shell minimum, single-link native policy, redacted read/list and history/empty-Auto create +
       empty-baseline task-less restore, logical checkpoint retirement and configured signing
       activation/local binding RPCs, provider-authorized Vault entry metadata,
@@ -1965,8 +1985,9 @@ Current implementation: quiescent held-Agent managed source replacement (this ch
       retention reconciliation, standalone Git derivation and retained-version
       baseline construction/recovery/abandonment and unused-Sandbox
       attachment/recovery/abandonment, replacement/recovery/continuation
-      and exact named/final-source release, plus authenticated unused-Sandbox
-      Git source setter are landed; do not repeat.
+      and exact named/final-source release, plus authenticated Git source setter
+      and isolated held-Agent managed attachment/replacement/partial release
+      are landed; do not repeat.
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.

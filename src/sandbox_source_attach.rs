@@ -22,7 +22,7 @@ pub(crate) struct Args {
     state_dir: PathBuf,
     /// Private approval covering the entire named layout and incoming anchor.
     approval: PathBuf,
-    /// Exact canonical Sandbox (unused, or one isolated held Agent for replacement).
+    /// Exact canonical Sandbox (unused, or already managed with one isolated held Agent).
     sandbox: String,
     /// Stable original invocation identity.
     request_id: String,

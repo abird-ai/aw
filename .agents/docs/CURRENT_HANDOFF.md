@@ -35,7 +35,97 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: quiescent held-Agent managed source replacement
+## Latest local implementation delta — 2026-11-27: held-Agent managed attachment and partial source release
+
+Parent `5d879ab4a6721eb332de567567427732723c1a0f` (held isolated
+Agent managed replacement), independently signature/parent verified.
+Non-reserved paths clean on entry; no outstanding durable jobs.
+Last independently verified published AW main `0f9807f4` (local
+origin/main unchanged), dotlink `85ceccc1`, frozen `576d0a1a`.
+L5 only. Store v60, product 0.15.0, Git recovery v4 unchanged.
+
+- Extend the original Project-owned managed mutation observation with
+  a typed Materialize/Release distinction. Bound mutation is available
+  only when the exact already-managed layout stays source-bearing:
+  materialization requires at least one existing binding; release
+  requires more than one. Attach/replace still select the absent/
+  occupied name independently. Reuse the existing isolated exact
+  Session/Agent, held admission, other-branch/alias/shared-custody
+  exclusion, Run/hazard/Input/Control/queue quiescence and writer
+  checks. No ambient root reinterpretation or Agent rebind. The
+  first-source and final-source transitions remain unused-only.
+- Original attachment/replacement Prepared receipt, exact old+incoming
+  complete source mutation barrier, driver inspection, abandonment,
+  continuation and atomic publication are unchanged; every observation
+  now uses the same managed-source gate. Partial release retains the
+  original whole old source set and exact release fact/claim through
+  actual independently authorized removal and atomic binding
+  publication. Reconcile Unknown only against the original descriptor
+  and revision. The same held Agent/closure semantics permit factual
+  settlement without opening admission. No new durable state, grant,
+  schema, replay ledger or lifetime owner.
+- The existing configured offline Git and authenticated source setter
+  owners consume these operations with their original complete
+  physical approval fences. The RPC controller's own layout stays
+  excluded; it can target a separate approved held Agent's Sandbox.
+  CLI help reflects the expanded scope. Other source/layout/credential
+  authority is not inferred.
+- Preserve exact unaffected source pins, Agent/history, Pending Inputs
+  and sibling filesystem edits. An attachment does not expand a grant
+  over the old bindings; that subset remains independently meaningful,
+  while the original source-aware runtime still requires the complete
+  approved set. A grant pinning a removed source is unusable, and a new
+  same-name binding revision never inherits the prior pin. No automatic
+  grant revocation/reissue, opening or live remount.
+- Extend the existing configured real Git lifecycle fixture, not a
+  parallel fixture family. A real Pending Input survives. An active
+  incoming-source claim refuses attachment; execute the original
+  prepared attachment then explicitly mark Unknown and reopen the
+  Store. Ordinary RPC retry refuses and exact offline recovery uses
+  the original RPC invocation. Original code-only grant remains a
+  one-source subset; explicit new complete-set grant pins both.
+  Partial release of an independently edited checkout refuses and
+  retains the entire old source barrier; restore its exact contents,
+  reopen and reconcile original release via the configured setter.
+  Preserve the edited sibling, original Agent and queue. Final release
+  of the remaining bound source refuses before approval. A fresh
+  configured reattachment has a new revision and exact old removal
+  replay does not touch it or revive the old grant. Restore replay
+  continues to return the current Agent snapshot, including the
+  separately accepted Pending Input revision.
+
+Validation: L5 locked/offline final source: Store Sandbox owner 4/4
+(2.48s), checkpoint owner 4/4 (3.14s); Host real Git lifecycle 1/1
+(170.25s); configured setter 1/1 (19.25s); expanded configured CLI Git
+lifecycle 1/1 (102.04s); Actor lifecycle 3/3 (64.23s); actual native
+executable 1/1 (39.12s). All 15 distinct selected tests passed.
+The initial CLI lifecycle run also passed before extending the same
+fixture with fresh reattachment/release replay. Strict all-feature/
+all-target Clippy for aw-store/aw-host/aw-cli, durable and minimal
+all-target checks (existing profile-specific dead-code warnings),
+actual executable version/help and scoped rustfmt/diff checks passed.
+Previous five historical Store failures, full workspace, pinned Nix
+and other native platforms were not rerun.
+
+Scope/next: held isolated managed named-child Git layout, attachment,
+replacement and partial release only. First/last bound transitions
+need an explicit source-free/ambient admission boundary; no promotion
+from an empty row set or automatic source-unaware fallback. General
+shared/participant, partial/scratch/non-exact physical cleanup and
+broader independent source/provider authority remain held. The L5
+execution environment still has no effective capabilities or writable
+delegated cgroup; production reviewed Process containment/dispatch
+remains the priority when a real backend can be qualified without
+thawing the frozen launcher. Otherwise select the remaining
+source-free transition contract or actual maintenance/constructor
+subprocess gate. Dependency-bearing registry replacement, task/cross-
+Project restore, wider protected Views/manifest transfer and extension
+gates remain open. No new live source-aware activation proof beyond
+existing integration; configured bound mutations use the actual
+setter/owner, not a newly executed full stdio maintenance subprocess.
+Phase 3 remains underway. No push, repin or UX/frozen changes.
+
+## Previous local implementation delta — 2026-11-27: quiescent held-Agent managed source replacement
 
 Parent `e56cd92bed01f75e0f7f4469a8bc2533a7eb6d47` (documentation
 checkpoint over signed registry implementation `3c67319`). Revalidated

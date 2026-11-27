@@ -1237,9 +1237,9 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         )
     }
 
-    /// Attach one independently retained version to an unused managed
-    /// Sandbox. The complete old+incoming layout is protected by one
-    /// live fence, and its exact original restore is Prepared before use.
+    /// Attach one independently retained version to an unused Sandbox or
+    /// existing managed layout with one held, quiescent Agent. One live
+    /// fence protects the old+incoming layout; restore is Prepared before use.
     pub fn attach_sandbox_source<F: GitRestoreFence>(
         &self,
         actor: &PrincipalId,
@@ -1584,8 +1584,9 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         }
     }
 
-    /// Remove one original managed source from an unused open Sandbox.
-    /// The independently protected named parent remains the same layout
+    /// Remove one original managed source from an open Sandbox. A bound
+    /// layout requires one isolated held Agent and at least one remaining
+    /// source. The independently protected named parent remains the same layout
     /// after removal, including final-source removal. The fence covers
     /// every retained source and its backing, never just a target path.
     pub fn release_sandbox_source<F: GitRestoreFence>(

@@ -2804,12 +2804,12 @@ mod tests {
                 &actor,
                 &bound.canonical_ref,
                 bound.rev,
-                "fixture:bound-attach-still-held",
+                "fixture:bound-attach-occupied",
                 replacement_anchor.clone(),
                 |_, _| panic!("bound attachment reached planner"),
             ),
             Err(Error::Conflict(
-                "managed mutation requires an unused isolated Sandbox"
+                "source materialization requires the selected name to match its attach/replace mode"
             ))
         ));
         assert!(matches!(
@@ -2836,7 +2836,8 @@ mod tests {
             .acquire_source_mutation_barrier(&bound_set, "fixture:bound-gap")
             .is_err());
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let bound_replaced = replace(
             &store,
             &bound_path,
@@ -2918,6 +2919,318 @@ mod tests {
             )
             .unwrap(),
             bound_replaced
+        );
+        // Add a second independently retained source to this same held Agent,
+        // then remove it using the existing configured source setter. Neither
+        // operation may consume Pending work or broaden the earlier grant.
+        let writer_epoch = store
+            .workspace_writer(
+                &actor,
+                None,
+                &store
+                    .session(&actor, bound_execution.session_id())
+                    .unwrap()
+                    .workspace_id,
+            )
+            .unwrap()
+            .writer_epoch;
+        let pending = store
+            .actor_queue_enqueue(
+                &actor,
+                aw_store::ActorQueueRequest {
+                    request_id: "fixture-bound-source-mutation".into(),
+                    session_id: bound_execution.session_id().to_owned(),
+                    branch_id: bound_execution.branch_id().to_owned(),
+                    recipient_site: "local".into(),
+                    sender: "fixture-bound".into(),
+                    message_id: 1,
+                    writer_epoch,
+                    target: aw_store::QueueTarget::Auto,
+                    priority: 0,
+                },
+                "Keep this original Pending input",
+            )
+            .unwrap();
+        let bound_agent = store.agent_get(&actor, bound_ref).unwrap();
+        let queue_before = vec![pending];
+        assert_eq!(bound_agent.admission, AgentAdmission::Held);
+        let data_name = SourceName::new("data").unwrap();
+        let data_binding = driver
+            .binding(
+                &repo,
+                data_name.clone(),
+                SourceAccess::ReadWrite,
+                CheckpointPolicy::Required,
+            )
+            .unwrap();
+        let data_capture = driver
+            .plan_capture(
+                &data_binding,
+                "cp_fixture_bound_attachment",
+                "op_fixture_bound_attachment",
+            )
+            .unwrap();
+        let data_version = driver.execute_capture(&data_capture).unwrap();
+        let data_anchor = aw_agent_core::SourceAnchor::try_from(&data_version).unwrap();
+        let data_location = GitSourceLocation {
+            name: data_name.clone(),
+            repository: repo.clone(),
+            repository_identity: location.repository_identity,
+        };
+        let target = bound.tool_root.join("data");
+        let parent_identity = DirectoryIdentity::open(&bound.tool_root)
+            .unwrap()
+            .identity()
+            .unwrap();
+        let setter_path = approvals.join("bound-source-set.json");
+        let setter_config = json!({
+            "version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+            "store_generation":store.local_process_info().unwrap().store_generation,
+            "manager":actor,"sandbox":bound.canonical_ref,"sandbox_rev":bound_replaced.rev,
+            "anchor":data_anchor,"destination_root":bound.tool_root,
+            "destination_identity":parent_identity,"repositories":[replacement_location,data_location]
+        });
+        aw_platform::open_private_new(&setter_path)
+            .unwrap()
+            .write_all(&serde_json::to_vec(&setter_config).unwrap())
+            .unwrap();
+        let apply = |store: &SessionStore, id: &str, params: &serde_json::Value| {
+            crate::sandbox_source_rpc::ApprovalFile::open(
+                &setter_path,
+                store,
+                &actor,
+                project,
+                &layout(&initial),
+            )?
+            .apply(store, &actor, project, id, params.clone())
+        };
+        let add_params = json!({
+            "ref":bound.canonical_ref,"rev":bound_replaced.rev,"name":data_name,
+            "binding":{"source":{"driver":data_anchor.driver,"source_ref":data_anchor.source_ref},
+                "checkpoint":"required","access":"rw"}
+        });
+        let add_id = "fixture-bound-attach";
+        let incoming_set =
+            SourceMutationSet::from_bindings(std::slice::from_ref(&data_binding)).unwrap();
+        let busy = store
+            .acquire_source_mutation_barrier(&incoming_set, "fixture:incoming-busy")
+            .unwrap();
+        assert!(apply(&store, add_id, &add_params).is_err());
+        assert!(!target.exists());
+        busy.settle(SourceMutationOutcome::Settled).unwrap();
+        // Lose the original owner after its real incoming effect, before
+        // publication. Recover precisely that RPC invocation, never replan.
+        let invocation = crate::sandbox_source_attach::rpc_invocation_id(add_id).unwrap();
+        let prepared = store
+            .sandbox_prepare_attachment(
+                &actor,
+                &bound.canonical_ref,
+                bound_replaced.rev,
+                &invocation,
+                data_anchor.clone(),
+                |_, prepare_id| {
+                    driver.plan_restore_approved(
+                        &GitRestoreLocation {
+                            name: data_name.clone(),
+                            repository: repo.clone(),
+                            repository_identity: data_location.repository_identity,
+                            target: target.clone(),
+                            parent_identity,
+                        },
+                        &data_version,
+                        prepare_id,
+                    )
+                },
+            )
+            .unwrap();
+        prepared.revalidate().unwrap();
+        driver.execute_restore(prepared.source()).unwrap();
+        prepared.mark_unknown().unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &bound.canonical_ref).unwrap(),
+            bound_replaced
+        );
+        assert!(apply(&store, add_id, &add_params).is_err());
+        assert!(store
+            .acquire_source_mutation_barrier(&incoming_set, "fixture:add-gap")
+            .is_err());
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        let added = attach(
+            &store,
+            &setter_path,
+            &bound.canonical_ref,
+            &invocation,
+            true,
+        )
+        .unwrap();
+        assert_eq!(added.rev, bound_replaced.rev + 1);
+        assert_eq!(added.sources[0], bound_replaced.sources[0]);
+        assert_eq!(added.sources[1].binding_rev, added.rev);
+        assert_eq!(added.layout_digest, bound.layout_digest);
+        assert_eq!(apply(&store, add_id, &add_params).unwrap(), added);
+        assert_eq!(
+            fs::read(target.join("tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        let mut both_ceilings = ceilings.to_vec();
+        both_ceilings.push(aw_agent_core::NamedSourceAccess {
+            name: data_name.clone(),
+            access: SourceAccess::ReadWrite,
+        });
+        assert_eq!(
+            store
+                .sandbox_grant_preflight(&actor, bound_ref, &renewed, &both_ceilings)
+                .unwrap()
+                .sources
+                .len(),
+            1,
+        );
+        let (_, all_bindings) = store
+            .sandbox_grant_sources(
+                &actor,
+                &actor,
+                bound_ref,
+                added.rev,
+                &[location.name.clone(), data_name.clone()],
+            )
+            .unwrap();
+        let expanded = aw_store::SandboxGrantPolicy {
+            evidence: aw_store::SandboxPolicyEvidence {
+                authority_generation: 3,
+                ..renewed.evidence.clone()
+            },
+            sources: all_bindings
+                .iter()
+                .map(|source| {
+                    aw_store::SandboxSourceGrant::from_binding(source, SourceAccess::ReadWrite)
+                })
+                .collect(),
+            ..renewed.clone()
+        };
+        let expanded_grant = store
+            .sandbox_grant_set(&actor, bound_ref, grant.revision + 1, Some(&expanded))
+            .unwrap();
+        assert_eq!(
+            store
+                .sandbox_grant_preflight(&actor, bound_ref, &expanded, &both_ceilings)
+                .unwrap()
+                .sources
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, bound_execution.session_id())
+                .unwrap(),
+            queue_before
+        );
+
+        // Release only the selected original managed checkout. A modified
+        // selected checkout stays held in Unknown custody; sibling edits
+        // remain intact through the exact original release on restart.
+        let mut remove_config = setter_config.clone();
+        let fields = remove_config.as_object_mut().unwrap();
+        fields.remove("anchor");
+        fields.insert("sandbox_rev".into(), json!(added.rev));
+        fields.insert("source".into(), json!(data_name));
+        fs::write(&setter_path, serde_json::to_vec(&remove_config).unwrap()).unwrap();
+        let remove_params =
+            json!({"ref":bound.canonical_ref,"rev":added.rev,"name":data_name,"binding":null});
+        let retained_file = bound.tool_root.join("code/tracked");
+        fs::write(&retained_file, b"retained sibling edit").unwrap();
+        let data_file = target.join("tracked");
+        fs::write(&data_file, b"independent edit").unwrap();
+        assert!(apply(&store, "fixture-bound-release", &remove_params).is_err());
+        assert_eq!(fs::read(&data_file).unwrap(), b"independent edit");
+        assert_eq!(
+            store.sandbox_get(&actor, &bound.canonical_ref).unwrap(),
+            added
+        );
+        assert!(store
+            .acquire_source_mutation_barrier(
+                &SourceMutationSet::from_bindings(&[all_bindings[0].binding.clone()]).unwrap(),
+                "fixture:partial-release-gap",
+            )
+            .is_err());
+        fs::write(&data_file, b"dirty checkpoint").unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let reduced = apply(&store, "fixture-bound-release-reconcile", &remove_params).unwrap();
+        assert_eq!(reduced.rev, added.rev + 1);
+        assert_eq!(reduced.sources, bound_replaced.sources);
+        assert_eq!(reduced.layout_digest, bound.layout_digest);
+        assert!(!target.exists());
+        assert_eq!(fs::read(&retained_file).unwrap(), b"retained sibling edit");
+        assert_eq!(
+            apply(&store, "fixture-bound-release-replay", &remove_params).unwrap(),
+            reduced
+        );
+        assert_eq!(
+            store.sandbox_grant_status(&actor, bound_ref).unwrap(),
+            expanded_grant
+        );
+        assert!(store
+            .sandbox_grant_preflight(&actor, bound_ref, &expanded, &both_ceilings)
+            .is_err());
+        assert_eq!(store.agent_get(&actor, bound_ref).unwrap(), bound_agent);
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, bound_execution.session_id())
+                .unwrap(),
+            queue_before
+        );
+        assert!(store
+            .agent_admission(
+                &actor,
+                bound_ref,
+                AgentAdmission::Open,
+                Some(bound_agent.rev)
+            )
+            .is_err());
+        assert!(matches!(
+            store.sandbox_release_source(
+                &actor,
+                &bound.canonical_ref,
+                &location.name,
+                reduced.rev,
+                |_| -> Result<()> { panic!("bound final release reached approval") },
+                |_, _| panic!("bound final release reached physical owner"),
+            ),
+            Err(Error::Conflict(
+                "managed mutation requires an unused isolated Sandbox"
+            ))
+        ));
+        // A fresh configured attachment at the same name has a new pin.
+        // Replaying the previous release must not remove the new checkout.
+        let mut readd_config = setter_config;
+        readd_config["sandbox_rev"] = json!(reduced.rev);
+        let mut readd_params = add_params;
+        readd_params["rev"] = json!(reduced.rev);
+        fs::write(&setter_path, serde_json::to_vec(&readd_config).unwrap()).unwrap();
+        let readded = apply(&store, "fixture-bound-reattach", &readd_params).unwrap();
+        assert_eq!(readded.rev, reduced.rev + 1);
+        assert_eq!(readded.sources[0], reduced.sources[0]);
+        assert_eq!(readded.sources[1].binding_rev, readded.rev);
+        fs::write(&setter_path, serde_json::to_vec(&remove_config).unwrap()).unwrap();
+        assert_eq!(
+            apply(&store, "fixture-bound-release-old-replay", &remove_params).unwrap(),
+            readded
+        );
+        assert_eq!(
+            fs::read(target.join("tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert!(store
+            .sandbox_grant_preflight(&actor, bound_ref, &expanded, &both_ceilings)
+            .is_err());
+        assert_eq!(store.agent_get(&actor, bound_ref).unwrap(), bound_agent);
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, bound_execution.session_id())
+                .unwrap(),
+            queue_before
         );
         drop(store);
         // Terminal replay uses the tombstone even without installed Git or the checkout.
@@ -3094,7 +3407,10 @@ mod tests {
                 true
             )
             .unwrap(),
-            recovered
+            aw_store::CheckpointRestoreResult {
+                agent: bound_agent,
+                source_coverage: recovered.source_coverage,
+            }
         );
         assert_eq!(
             invoke(
