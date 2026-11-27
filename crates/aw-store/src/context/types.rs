@@ -26,7 +26,22 @@ impl From<&BranchInfo> for TargetHead {
 pub enum Selection {
     Standalone,
     Divergent,
-    Range { start_exclusive: String },
+    Range {
+        start_exclusive: String,
+    },
+    /// Only the exact inherited prefix, not the destination-local tail.
+    Inherited,
+    /// Inclusive committed Turn endpoints in that prefix. Preserve all
+    /// intervening semantic facts and the entire inherited disclosure ceiling.
+    InheritedTurns {
+        first: u64,
+        last: u64,
+    },
+}
+impl Selection {
+    pub(crate) fn is_inherited(&self) -> bool {
+        matches!(self, Self::Inherited | Self::InheritedTurns { .. })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +83,18 @@ pub struct PinnedSource {
     pub revision: u64,
     pub selection: Selection,
     pub common_ancestor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_history: Option<InheritedHistoryPin>,
+}
+
+/// Original immutable HistoryGrant and inherited base content/manifest.
+/// This is provenance, never a new grant or caller-supplied locator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritedHistoryPin {
+    pub grant_id: String,
+    pub content_digest: String,
+    pub manifest_digest: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

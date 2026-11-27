@@ -228,16 +228,253 @@ pub(crate) fn require_session_reader(
     Ok(())
 }
 
-/// The legacy selector identifies local nodes, not inherited base spans.
-/// Build a private manual-transfer manifest only for exact local evidence.
-/// Session-wide ceilings are conservative; at least one selected node in
-/// every protected source Session must actually carry original provenance.
+/// Exact inherited selection is a new private manual transfer, not a
+/// reseal of the backing Agent's current history.
+pub(crate) struct InheritedContext {
+    pub(crate) pin: context::InheritedHistoryPin,
+    pub(crate) nodes: Vec<(String, crate::Node)>,
+}
+
+fn private_context_scope(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source_session: &str,
+    target_session: &str,
+) -> Result<String> {
+    let user = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("context transfer actor unavailable"))?;
+    require_private_audience(connection, source_session, &user)?;
+    require_private_audience(connection, target_session, &user)?;
+    let source = session_in(connection, source_session)?;
+    let target = session_in(connection, target_session)?;
+    if source.workspace_id.is_empty() || source.workspace_id != target.workspace_id {
+        return Err(Error::Denied(
+            "protected context requires the same private actor and Workspace",
+        ));
+    }
+    Ok(user)
+}
+
+/// Resolve the existing exact branch's inherited prefix and immutable
+/// grant. A local audience seal is not an extra inherited span.
+fn inherited_context_base(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: agent_owner::AgentKey<'_>,
+    user: &str,
+    retained_grant: Option<&str>,
+) -> Result<(HistoryBaseRef, String)> {
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        agent,
+        agent_owner::AgentPermission::Derive,
+    )?;
+    let reference = agent_owner::canonical_ref(connection, agent)?;
+    let (current, grant): (Option<String>, Option<String>) = db(connection.query_row(
+        "SELECT history_base_id,history_grant_id FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![agent.session, agent.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    let current = current.ok_or(Error::Denied("Agent has no inherited HistoryBase"))?;
+    let grant = retained_grant.or(grant.as_deref()).ok_or(Error::Denied(
+        "inherited context lacks an original HistoryGrant",
+    ))?;
+    let (granted_base, destination, manifest): (String, String, String) = db(connection.query_row(
+        "SELECT base_id,destination_agent_ref,manifest_digest FROM history_grants WHERE grant_id=?1",
+        [grant],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ))?;
+    if destination != reference
+        || base_row(connection, &granted_base)?.manifest_digest != manifest
+        || !grant_covers(connection, grant, "user", user)?
+        || (retained_grant.is_none() && granted_base != current)
+    {
+        return Err(Error::Denied(
+            "inherited context HistoryGrant identity differs",
+        ));
+    }
+    let inherited =
+        inherited_base_for_branch(connection, Some(&current), agent.session, agent.branch)?
+            .ok_or(Error::Denied("Agent has no inherited history prefix"))?;
+    if inherited_base_for_branch(connection, Some(&granted_base), agent.session, agent.branch)?
+        .as_deref()
+        != Some(inherited.as_str())
+    {
+        return Err(Error::Denied(
+            "original HistoryGrant no longer matches inherited prefix",
+        ));
+    }
+    let base = base_row(connection, &inherited)?;
+    if !manifest_authority_roots(connection, &base.manifest_digest)?
+        .iter()
+        .any(|(_, kind, _, _)| kind == KIND)
+    {
+        return Err(Error::Denied(
+            "inherited selection requires an original protected source manifest",
+        ));
+    }
+    validate_manifest_expansion(connection, actor, &base.manifest_digest, "user", user)?;
+    Ok((base, grant.to_owned()))
+}
+
+pub(crate) fn select_inherited_context(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: agent_owner::AgentKey<'_>,
+    selection: &context::Selection,
+    target_session: &str,
+) -> Result<InheritedContext> {
+    let user = private_context_scope(connection, actor, agent.session, target_session)?;
+    let (base, grant_id) = inherited_context_base(connection, actor, agent, &user, None)?;
+    let mut nodes = Vec::new();
+    let mut bytes = 0usize;
+    for span in inherited_span_chain(connection, &base.id)? {
+        let (_, session, span_nodes) = verified_span_nodes(connection, &span)?;
+        if nodes.len().saturating_add(span_nodes.len()) > crate::MAX_SESSION_NODES {
+            return Err(Error::Limit("inherited context exceeds history bound"));
+        }
+        for node in span_nodes {
+            bytes = bytes.saturating_add(json(&node.payload)?.len());
+            if bytes > crate::MAX_EXPORT_BYTES {
+                return Err(Error::Limit("inherited context scan exceeds byte bound"));
+            }
+            nodes.push((session.clone(), node));
+        }
+    }
+    if let context::Selection::InheritedTurns { first, last } = selection {
+        if *first == 0 || first > last {
+            return Err(Error::Config("invalid inherited Turn range".into()));
+        }
+        let mut start = None;
+        let mut end = None;
+        let mut previous = 0;
+        for (index, (_, node)) in nodes.iter().enumerate() {
+            if node.kind != "turn" {
+                continue;
+            }
+            let turn = node
+                .payload
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(Error::Storage("inherited Turn lacks original identity"))?;
+            if turn <= previous {
+                return Err(Error::Storage("inherited Turn order is ambiguous"));
+            }
+            previous = turn;
+            if turn == *first {
+                start = Some(index);
+            }
+            if turn == *last {
+                end = Some(index);
+            }
+        }
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(Error::Denied(
+                "inherited Turn endpoints must exist in the sealed prefix",
+            ));
+        };
+        nodes.truncate(end + 1);
+        nodes.drain(..start);
+    } else if !matches!(selection, context::Selection::Inherited) {
+        return Err(Error::Denied("exact inherited selector required"));
+    }
+    Ok(InheritedContext {
+        pin: context::InheritedHistoryPin {
+            grant_id,
+            content_digest: base.content_digest,
+            manifest_digest: base.manifest_digest,
+        },
+        nodes,
+    })
+}
+
+/// Retain the exact original grant/base pin and DAG edge at plan/artifact
+/// reuse. Never recreate a missing link from a newly selected current base.
+pub(crate) fn validate_inherited_context_pins(
+    connection: &Connection,
+    actor: &PrincipalId,
+    sources: &[context::PinnedSource],
+    refs: &[aw_agent_core::EvidenceRef],
+    target_session: &str,
+    manifest: Option<&str>,
+) -> Result<()> {
+    let mut required = BTreeSet::new();
+    for source in sources {
+        match (source.selection.is_inherited(), &source.inherited_history) {
+            (false, None) => continue,
+            (true, Some(pin)) => {
+                let user =
+                    private_context_scope(connection, actor, &source.session_id, target_session)?;
+                let (base, _) = inherited_context_base(
+                    connection,
+                    actor,
+                    agent_owner::AgentKey::new(&source.session_id, &source.branch_id),
+                    &user,
+                    Some(&pin.grant_id),
+                )?;
+                if base.content_digest != pin.content_digest
+                    || base.manifest_digest != pin.manifest_digest
+                {
+                    return Err(Error::Storage(
+                        "inherited context pin differs from original base",
+                    ));
+                }
+                required.insert(pin.manifest_digest.clone());
+            }
+            _ => {
+                return Err(Error::Storage(
+                    "inherited context selection lacks exact provenance",
+                ))
+            }
+        }
+    }
+    if !required.is_empty() {
+        let manifest = manifest.ok_or(Error::Denied(
+            "inherited context requires original disclosure manifest",
+        ))?;
+        let user = user_for_principal(connection, actor)?
+            .ok_or(Error::Denied("context transfer actor unavailable"))?;
+        let workspace = session_in(connection, target_session)?.workspace_id;
+        // Retain the same backing-owner/Workspace boundary on reuse.
+        // Current read grants alone cannot substitute for that scope.
+        for session in refs
+            .iter()
+            .map(|reference| reference.session_id.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            if crate::session_owner_user(connection, session)? != user
+                || session_in(connection, session)?.workspace_id != workspace
+            {
+                return Err(Error::Denied("inherited context backing scope changed"));
+            }
+        }
+        manifest_authority_roots_requiring(connection, vec![manifest.to_owned()], &required)?;
+    }
+    Ok(())
+}
+
+/// Private manual-transfer manifest for exact local or explicitly
+/// selected inherited evidence. A sealed inherited base contributes its
+/// entire original closure, even when only a smaller span is selected.
 pub(crate) fn context_manifest(
     connection: &Connection,
     actor: &PrincipalId,
     refs: &[aw_agent_core::EvidenceRef],
     target_session: &str,
+    sources: &[context::PinnedSource],
 ) -> Result<Option<String>> {
+    let inherited = sources.iter().any(|source| source.selection.is_inherited());
+    if inherited
+        && sources
+            .iter()
+            .any(|source| !source.selection.is_inherited())
+    {
+        return Err(Error::Denied(
+            "mixed local and inherited context selection is not qualified",
+        ));
+    }
     let mut sessions = BTreeMap::new();
     for reference in refs {
         if !sessions.contains_key(reference.session_id.as_str()) {
@@ -247,7 +484,7 @@ pub(crate) fn context_manifest(
             );
         }
     }
-    if sessions.values().all(Option::is_none) {
+    if !inherited && sessions.values().all(Option::is_none) {
         return Ok(None);
     }
     let user = user_for_principal(connection, actor)?
@@ -266,27 +503,44 @@ pub(crate) fn context_manifest(
         // The legacy selection only names local nodes. A restored
         // history base with no disclosure dependencies is fine; a
         // protected inherited prefix needs its own exact selector.
-        let inherited: bool = db(connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_state_current a
-             JOIN history_bases b ON b.base_id=a.history_base_id
-             JOIN disclosure_manifest_nodes m ON m.node_digest=b.manifest_digest
-             WHERE a.session_id=?1 AND m.item_count<>0)",
-            [session],
-            |row| row.get(0),
-        ))?;
-        if inherited {
-            return Err(Error::Denied(
-                "protected inherited context requires exact history transfer",
-            ));
+        if !inherited {
+            let has_inherited: bool = db(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_state_current a
+                 JOIN history_bases b ON b.base_id=a.history_base_id
+                 JOIN disclosure_manifest_nodes m ON m.node_digest=b.manifest_digest
+                 WHERE a.session_id=?1 AND m.item_count<>0)",
+                [session],
+                |row| row.get(0),
+            ))?;
+            if has_inherited {
+                return Err(Error::Denied(
+                    "protected inherited context requires exact history transfer",
+                ));
+            }
         }
     }
     let mut observed = BTreeSet::new();
     let mut selected = BTreeSet::new();
     let mut entries = BTreeSet::new();
+    for source in sources {
+        if let Some(pin) = &source.inherited_history {
+            selected.insert(pin.manifest_digest.clone());
+            entries.insert(ManifestEntry {
+                kind: "fact",
+                reference: format!(
+                    "inherited-history:{}:{}:{}",
+                    pin.grant_id, pin.content_digest, pin.manifest_digest
+                ),
+            });
+        }
+    }
     for reference in refs {
         let manifest = dependency_manifest(connection, &reference.node_id)?;
-        let roots = manifest_authority_roots(connection, &manifest)?;
-        if roots.iter().any(|(_, kind, _, _)| kind == KIND) {
+        if !inherited
+            && manifest_authority_roots(connection, &manifest)?
+                .iter()
+                .any(|(_, kind, _, _)| kind == KIND)
+        {
             observed.insert(reference.session_id.as_str());
         }
         selected.insert(manifest);
@@ -300,9 +554,10 @@ pub(crate) fn context_manifest(
             ),
         });
     }
-    if sessions
-        .iter()
-        .any(|(session, ceiling)| ceiling.is_some() && !observed.contains(session))
+    if !inherited
+        && sessions
+            .iter()
+            .any(|(session, ceiling)| ceiling.is_some() && !observed.contains(session))
     {
         return Err(Error::Denied(
             "selected context lacks exact protected provenance",
@@ -323,6 +578,14 @@ pub(crate) fn context_manifest(
         manifest = union_manifests(connection, &manifest, &next)?;
     }
     validate_manifest_expansion(connection, actor, &manifest, "user", &user)?;
+    validate_inherited_context_pins(
+        connection,
+        actor,
+        sources,
+        refs,
+        target_session,
+        Some(&manifest),
+    )?;
     Ok(Some(manifest))
 }
 

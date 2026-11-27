@@ -628,39 +628,62 @@ fn inherited_span_chain(connection: &Connection, base_id: &str) -> Result<Vec<St
     Ok(chain)
 }
 
-fn verified_span_nodes(connection: &Connection, span: &str) -> Result<(String, Vec<crate::Node>)> {
-    let (source_agent, backing_session): (String, String) = db(connection.query_row(
-        "SELECT source_agent_ref,backing_session_id FROM history_spans WHERE span_id=?1",
+fn verified_span_nodes(
+    connection: &Connection,
+    span: &str,
+) -> Result<(String, String, Vec<crate::Node>)> {
+    let (source_agent, backing_session, content_digest): (String, String, String) = db(connection.query_row(
+        "SELECT source_agent_ref,backing_session_id,content_digest FROM history_spans WHERE span_id=?1",
         [span],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ))?;
     let mut query = db(connection.prepare(
-        "SELECT node_id,node_digest FROM history_span_nodes
+        "SELECT ordinal,node_id,node_digest FROM history_span_nodes
          WHERE span_id=?1 ORDER BY ordinal LIMIT ?2",
     ))?;
     let rows = db(query.query_map(
         params![span, (crate::MAX_SESSION_NODES + 1) as i64],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, usize>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     ))?;
     let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
     if rows.len() > crate::MAX_SESSION_NODES {
         return Err(Error::Limit("HistorySpan exceeds projection bound"));
     }
+    if rows
+        .iter()
+        .enumerate()
+        .any(|(i, (ordinal, _, _))| i != *ordinal)
+        || hash_strings(
+            b"aw-history-span-content-v1\0",
+            rows.iter()
+                .flat_map(|(_, node, digest)| [node.as_str(), digest.as_str()]),
+        ) != content_digest
+    {
+        return Err(Error::Storage(
+            "HistorySpan ordered membership digest changed",
+        ));
+    }
     let mut nodes = Vec::with_capacity(rows.len());
-    for (node_id, expected_digest) in rows {
+    for (_, node_id, expected_digest) in rows {
         let actual_digest = raw_node_digest(connection, &backing_session, &node_id)?;
         if actual_digest != expected_digest {
             return Err(Error::Storage("HistorySpan backing node digest changed"));
         }
         nodes.push(crate::node_in(connection, &backing_session, &node_id)?);
     }
-    Ok((source_agent, nodes))
+    Ok((source_agent, backing_session, nodes))
 }
 
 fn inherited_projected_nodes(connection: &Connection, base_id: &str) -> Result<Vec<crate::Node>> {
     let mut nodes = Vec::new();
     for span in inherited_span_chain(connection, base_id)? {
-        let (_, span_nodes) = verified_span_nodes(connection, &span)?;
+        let (_, _, span_nodes) = verified_span_nodes(connection, &span)?;
         if nodes.len().saturating_add(span_nodes.len()) > crate::MAX_SESSION_NODES {
             return Err(Error::Limit("inherited history exceeds projection bound"));
         }
@@ -777,7 +800,7 @@ impl SessionStore {
             inherited_base_for_branch(&connection, base_id.as_deref(), session_id, &branch.id)?
         {
             for span in inherited_span_chain(&connection, &base_id)? {
-                let (source_agent, nodes) = verified_span_nodes(&connection, &span)?;
+                let (source_agent, _, nodes) = verified_span_nodes(&connection, &span)?;
                 collect_turn_provenance(&mut out, &wanted, &source_agent, nodes)?;
             }
         }
@@ -1266,7 +1289,15 @@ fn manifest_authority_roots(
 
 fn manifest_authority_roots_from(
     connection: &Connection,
+    stack: Vec<String>,
+) -> Result<Vec<(String, String, String, String)>> {
+    manifest_authority_roots_requiring(connection, stack, &BTreeSet::new())
+}
+
+fn manifest_authority_roots_requiring(
+    connection: &Connection,
     mut stack: Vec<String>,
+    required: &BTreeSet<String>,
 ) -> Result<Vec<(String, String, String, String)>> {
     let mut visited = BTreeSet::new();
     let mut roots = BTreeSet::new();
@@ -1318,6 +1349,11 @@ fn manifest_authority_roots_from(
             }
             _ => return Err(Error::Storage("unknown disclosure manifest node kind")),
         }
+    }
+    if !required.is_subset(&visited) {
+        return Err(Error::Storage(
+            "context manifest lost its original inherited closure",
+        ));
     }
     roots
         .into_iter()

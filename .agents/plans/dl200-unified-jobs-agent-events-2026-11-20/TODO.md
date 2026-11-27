@@ -2123,6 +2123,25 @@ Current implementation: manifest-preserving private manual context transfer (thi
       optional participant evidence boxed without serde shape change.
       Existing profile warnings/historical Store failures separate.
       No schema bump, broader execution or full workspace claim.
+      **Protected inherited context selection:** explicit whole sealed
+      inherited prefix or exact inclusive Turn range, original HistoryGrant
+      and Agent Derive, no local head override or divergent tail, private
+      same actor/Workspace and exact backing evidence. Sealed span aggregate
+      membership and individual node digests verified. Immutable optional
+      grant/content/manifest pin and original v62 disclosure link retain
+      entire inherited closure plus selected original facts and manual-only
+      ceiling. Revalidate original scope, base/grant, backing refs and
+      manifest reachability on plan/artifact reuse; consistent reads.
+      Actual native-source fixture covers whole/range/nested prefix,
+      unchanged pin despite local tail, carried context import, duplicate
+      and invalid selection, cross-Workspace/shared target refusal, manual
+      edit/replay and provider/export denial. Validation: locked/offline
+      history 5, context unit 2, context flow 29, Actor owner 47,
+      native executable 2: all 85 selected passed (+1 ignored).
+      Strict affected Clippy, durable/minimal all-target, scoped
+      fmt/diff passed. Prior Actor authority revalidated. Existing
+      warnings/historical broad Store failures separate.
+      No mixed local/inherited selection, broad provider release or schema bump.
       **Next:** production reviewed physical Process containment/dispatch,
       never-managed ambient first-source authority retirement and other
       independent host gates. Both physical/ambient cases remain held.

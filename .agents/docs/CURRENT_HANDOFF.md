@@ -39,7 +39,80 @@ change or broader phase qualification in this documentation cut.
 
 November 27 late documentation refresh: all nine first-parent implementation signatures, parent links and exact trees after e56cd92 verified on L5; implementation tip 38c4775, Store v62. The new comprehensive handoff preserves all nine exact deltas, the complete previous comprehensive handoff byte-for-byte and the exact signed active TODO. Non-reserved entry clean; no source change or product test rerun in this documentation cut. Next: semantic dependency-bearing registry compatibility; physical containment/ambient authority remain held.
 
-## Latest local implementation delta — 2026-11-27: exact participant Agent ACL execution generation
+## Latest local implementation delta — 2026-11-27: protected inherited context selection
+
+Parent `bf6792a81ff747633162ed11b9b9999c32d820cf` (participant ACL
+execution), independently signature-verified at entry. Interrupted
+previous turn had completed inspection only: non-reserved tree clean,
+no interrupted owned edits or running owned jobs. L5 only. Product
+0.15.0, Store v62, Git derive recovery v4 unchanged. SPEC §§19.3,
+23.1–23.2: structural history and immutable disclosure propagation.
+
+- Original context planner adds explicit `Selection::Inherited` and
+  `Selection::InheritedTurns { first, last }` (inclusive exact settled
+  Turn endpoints). Exact source Agent branch ID, no local-head override
+  and no active Run. Resolve existing inherited base through original
+  HistoryGrant and Derive permission; exclude own local audience seals
+  and divergent tail. Same stable private actor/Workspace across source,
+  backing refs and target. Whole-prefix selection retains semantic
+  context blocks; range selects ordered facts between exact endpoints.
+  Combined bytes, nodes, source count and dependency budgets unchanged.
+- Original verified span reader now checks contiguous ordinal membership
+  against the sealed aggregate content digest as well as individual raw
+  node digests. Resolve original backing Session/node and author, never
+  copy or relabel a fact to the fork. No resealing, public revision
+  change, or selection of later source history. Existing node and
+  dependency dedup retained.
+- Optional immutable `PinnedSource::inherited_history` (original
+  grant ID, inherited content/manifest digests) stored in original plan;
+  absent on historical/local plans, unchanged serialized old shape.
+  Original v62 plan/node disclosure links and artifact-plan FK preserve
+  the entire sealed inherited manifest as a reachable DAG child, even
+  for a narrow Turn range. Record exact selected fact refs and original
+  grant/base identity; union their existing dependencies and the
+  original manual-only ceiling. Reuse verifies current exact private
+  scope, same original grant/base, backing owner/Workspace, existing
+  evidence hashes and release gates and required original manifest DAG
+  reachability. Plan/artifact reads use consistent read transactions.
+  No recomputation of a missing disclosure link or new release grant.
+- Actual configured native source RPC regression exercises six original
+  protected Turns, whole/range evidence identity, duplicate selection,
+  invalid ranges/branch/head, absent or unrelated base, old local and
+  mixed selectors, nested inherited spans with a later divergent manual
+  tail, inherited context-import provenance, cross-Workspace and shared
+  target refusal, manual edit/exact append replay, post-append sharing,
+  export and provider admission refusal. Original prefix/pin remain
+  unchanged as fork-local head advances. Previous source claims and
+  native recovery owner still execute in the same original fixture.
+  Existing local protected manual transfer remains unchanged.
+
+Validation: L5 locked/offline final implementation: History owner 5/5
+(2.23s), context unit 2/2 (0.96s), context flow 29/29 (16.50s),
+Actor owner 47/47 (38.55s; revalidates prior participant checkpoint),
+native-source executable 2/2 (47.04s, one opt-in SQLite fault fixture
+ignored). **85 distinct selected tests passed, zero failures, one
+ignored.** Initial compile found a Workspace ID type mismatch; fixed
+before native qualification. Earlier targeted native success not
+double-counted. Strict Store/CLI all-feature/all-target Clippy
+`-D warnings`, durable/minimal all-target checks and scoped fmt/diff
+passed. Existing profile-specific dead-code warnings remain. Five
+historical broad Store failures, full workspace/other-platform/pinned
+Nix suites not rerun.
+
+Scope/next: explicit inherited-only protected same-user/same-Workspace
+manual import; no mixed local/inherited selection, ordinary unprotected
+inherited selector promotion, cross-Workspace transfer, new provider
+release, paid summary, next-prompt, portable export or broader audience.
+No new schema or grant; original retained grants/spans and v62 manifest
+FKs remain the authority/provenance owners. Future history retention
+must preserve reachable grant/base pins. Physical Process containment
+and never-managed ambient first-source authority retirement remain
+held. Next independent gate: protected resource/View metadata or
+broader independently authorized source/provider disclosure, only with
+a reviewed actual policy; final atomic ExtensionRegistry remains
+Phase 5. No UX/frozen changes, push or repin. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: exact participant Agent ACL execution generation
 
 Parent `d511720c446023a362a1a15613d5a1150a4f24ff` (semantic
 SourceDriver replacement), independently verified signed at entry.

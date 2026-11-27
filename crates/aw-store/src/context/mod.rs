@@ -326,6 +326,14 @@ pub(crate) fn check_artifact(
     }
     let refs = artifact_refs(c, id)?;
     let manifest = artifact_manifest(c, id)?;
+    crate::history_owner::source::validate_inherited_context_pins(
+        c,
+        actor,
+        &a.plan.sources,
+        &refs,
+        &a.plan.target.session_id,
+        manifest.as_deref(),
+    )?;
     disclosure(
         c,
         &refs,
@@ -597,6 +605,41 @@ impl SessionStore {
                 for input in request.sources {
                     authorize(&tx, &input.session_id, actor, false)?;
                     let b = branch_in(&tx, &input.session_id, &input.branch)?;
+                    if input.selection.is_inherited() {
+                        if input.head.is_some() || input.branch != b.id || b.active_run.is_some() {
+                            return Err(Error::Denied("inherited context requires an exact settled Agent branch and no local head override"));
+                        }
+                        // The local tail is not selected; resolve and authorize
+                        // the immutable inherited base and its backing facts.
+                        let inherited = crate::history_owner::source::select_inherited_context(
+                            &tx,
+                            actor,
+                            crate::agent_owner::AgentKey::new(&input.session_id, &b.id),
+                            &input.selection,
+                            &request.target.session_id,
+                        )?;
+                        for (session, node) in inherited.nodes {
+                            selected_bytes =
+                                selected_bytes.saturating_add(json(&node.payload)?.len());
+                            if selected_bytes > MAX_EXPORT_BYTES {
+                                return Err(Error::Limit(
+                                    "combined source scan exceeds bound; select narrower ranges",
+                                ));
+                            }
+                            selected.push((session, node));
+                        }
+                        sources.push(PinnedSource {
+                            session_id: input.session_id,
+                            branch_id: b.id,
+                            branch_name: b.name,
+                            head: b.head,
+                            revision: b.revision,
+                            selection: input.selection,
+                            common_ancestor: None,
+                            inherited_history: Some(inherited.pin),
+                        });
+                        continue;
+                    }
                     let mut p = path(&tx, &input.session_id, &b.head)?;
                     if let Some(head) = input.head {
                         let at = p
@@ -630,6 +673,9 @@ impl SessionStore {
                     };
                     let start = match &input.selection {
                         Selection::Standalone => 0,
+                        Selection::Inherited | Selection::InheritedTurns { .. } => {
+                            unreachable!("handled inherited selection")
+                        }
                         Selection::Divergent => {
                             let common = common.as_ref().ok_or(Error::Config(
                                 "different sessions need standalone or explicit range".into(),
@@ -676,6 +722,7 @@ impl SessionStore {
                         revision: b.revision,
                         selection: input.selection,
                         common_ancestor: common,
+                        inherited_history: None,
                     });
                 }
             }
@@ -708,6 +755,7 @@ impl SessionStore {
             actor,
             &dependencies,
             &request.target.session_id,
+            &sources,
         )?;
         if manifest.is_some() && !matches!(request.kind, PlanKind::Import) {
             return Err(Error::Denied(
@@ -776,12 +824,18 @@ impl SessionStore {
         Ok(plan)
     }
     pub fn context_plan(&self, actor: &PrincipalId, id: &str) -> Result<ContextPlan> {
-        let c = self.connection()?;
-        plan_in(&c, actor, id)
+        let mut c = self.connection()?;
+        let tx = db(c.transaction())?;
+        let plan = plan_in(&tx, actor, id)?;
+        db(tx.commit())?;
+        Ok(plan)
     }
     pub fn context_artifact(&self, actor: &PrincipalId, id: &str) -> Result<SummaryArtifact> {
-        let c = self.connection()?;
-        check_artifact(&c, actor, id, true)
+        let mut c = self.connection()?;
+        let tx = db(c.transaction())?;
+        let artifact = check_artifact(&tx, actor, id, true)?;
+        db(tx.commit())?;
+        Ok(artifact)
     }
     pub fn context_target(
         &self,
@@ -812,6 +866,14 @@ pub(crate) fn plan_in(c: &Connection, actor: &PrincipalId, id: &str) -> Result<C
     check_release_versions(c, actor, &plan.release_versions)?;
     target(c, actor, &plan.target, false)?;
     let manifest = plan_manifest(c, id)?;
+    crate::history_owner::source::validate_inherited_context_pins(
+        c,
+        actor,
+        &plan.sources,
+        &plan.dependencies,
+        &plan.target.session_id,
+        manifest.as_deref(),
+    )?;
     if manifest.is_some() {
         require_private_transfer(c, actor, &plan.target.session_id)?;
     }
