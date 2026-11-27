@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: actual construction and maintenance stdio executable gate (this checkpoint; local parent `26e1d8ed010095adde4318a853fa722db20e45fd`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: configured task-bearing captured-source restore (this checkpoint; local parent `1f5ff72ebd61361218a2459a54ff57790500296f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -1999,9 +1999,25 @@ Current implementation: actual construction and maintenance stdio executable gat
       executable 2: all 12 selected tests passed. Strict aw-cli
       Clippy, durable/minimal all-target, scoped fmt/diff passed.
       Five historical Store failures not rerun.
+      **Configured task-bearing captured-source restore:** promote optional
+      initial task through the existing same-Project/private Git restore
+      and authenticated stdio port. Original InitialTask/encrypted custody,
+      semantic digest, Prepared/physical barrier and atomic held Agent/
+      Sandbox/history/ACL/Pending/Applied reused; no new owner or schema.
+      Bounded exact UTF-8 `--agent-task-stdin` before Store lock; original
+      bytes required for recovery/abandonment, no task in argv/result.
+      Actual stdio restore, wrong/missing task refusal, terminal replay,
+      original Prepared real Git task recovery and abandonment; preserve
+      Pending across protected empty and reattachment; no implicit activation.
+      Explicit independent native grant/open and actual restored read +
+      task delivery/settlement once; next Actor step idle.
+      Locked/offline stdin 1, namespace 1, Store checkpoint 4,
+      Host Git 1, executable 2: all nine selected tests passed.
+      Strict aw-cli Clippy, durable/minimal all-target and scoped
+      fmt/diff/help checks passed. Historical Store failures not rerun.
       **Next:** production reviewed physical Process containment/dispatch,
-      never-managed ambient first-source authority retirement, task-bearing
-      captured restore or other remaining independent host gates.
+      never-managed ambient first-source authority retirement, cross-Project
+      restore or other remaining independent host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
@@ -2028,7 +2044,7 @@ Current implementation: actual construction and maintenance stdio executable gat
       and isolated held-Agent managed attachment/replacement/partial/final release
       and protected empty-layout reattachment are landed; do not repeat.
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
-      task-bearing/cross-Project restore, broader source capture/restore authority,
+      cross-Project and task-bearing empty-baseline host restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md) §5 for next cuts, limitations and acceptance. Schema v60.
       Last independently verified published AW main `0f9807f4`, dotlink main

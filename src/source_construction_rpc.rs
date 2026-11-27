@@ -66,7 +66,8 @@ pub(crate) struct Approvals {
     /// Private git-native.json directory independently authorizing Git capture.
     #[arg(long = "checkpoint-capture-root", requires = "rpc_actor_owner")]
     pub checkpoint_capture_root: Option<PathBuf>,
-    /// Private exact captured-source restore approval (taskless, private).
+    /// Private exact captured-source restore approval. Optional initial task
+    /// is held until independently authorized source execution is opened.
     #[arg(
         long = "checkpoint-restore-approval",
         requires = "rpc_actor_owner",
@@ -197,12 +198,9 @@ pub(super) struct RestorePort {
 impl CheckpointRestorePort for RestorePort {
     fn restore(&self, request_id: &str, params: Value) -> Result<Value> {
         let request = checkpoint_restore_request(&params)?;
-        if request.project.is_some()
-            || request.task.is_some()
-            || request.access != AgentHistoryForkAccess::Private
-        {
+        if request.project.is_some() || request.access != AgentHistoryForkAccess::Private {
             return Err(Error::Denied(
-                "captured restore requires default Project, private access and no task",
+                "captured restore requires default Project and private access",
             ));
         }
         let id = Operation::CheckpointRestore.rpc_id(request_id);

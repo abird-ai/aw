@@ -35,7 +35,81 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: actual construction and maintenance stdio executable gate
+## Latest local implementation delta — 2026-11-27: configured task-bearing captured-source restore
+
+Parent `1f5ff72ebd61361218a2459a54ff57790500296f` (actual
+maintenance/constructor executable gate); independently verified signature
+and clean non-reserved entry. Last published AW main `0f9807f4`
+(origin/main unchanged), dotlink `85ceccc1`, frozen `576d0a1a`.
+L5 only. Store v61, product 0.15.0 and Git recovery v4 unchanged.
+
+- Promote optional initial task on the existing independently approved
+  captured-source restore CLI and authenticated stdio port. The original
+  Store/host restore constructor already supports task digest, encrypted
+  InitialTask custody, Prepared-before-effect, atomic fresh Agent/Sandbox/
+  history/ACL/Pending/Applied publication, exact inspection and abandonment.
+  Remove only the taskless host restriction; same default source Project
+  and private access remain required, no implicit grants, activation,
+  task execution or new authority/receipt. No new schema or owner.
+- `aw checkpoint-restore --agent-task-stdin` reads 1..65536 exact UTF-8
+  bytes without NUL from stdin before taking the exclusive Store lock;
+  preserves whitespace/newlines and does not expose task text in argv.
+  Omitting the flag preserves the original taskless request fingerprint.
+  Recovery/abandonment of task-bearing original RPC/CLI invocations must
+  supply the exact original task bytes; changed/missing task refuses
+  before physical work. No task text or encrypted payload reference
+  added to the public restore result.
+- Extend the actual maintenance executable fixture: fresh task-bearing
+  RPC restore, reject empty task and unsupported destination/access
+  selection, same-ID changed-task refusal and terminal CLI replay without
+  approval. Original Prepared task+captured Git restore performed through
+  Store/driver then marked Unknown; fresh retry refused, wrong/missing
+  task recovery denied, exact offline recovery publishes original
+  candidate with one held Pending Input. Original task-bearing
+  abandonment removes only unpublished materialization; exact Rejected
+  replay inert and fresh retry refuses. No fabricated recovery owner or
+  claimed subprocess-kill proof.
+- Preserve the original fresh RPC restore's Pending Input and held
+  Agent through final release, protected empty layout, reattachment,
+  original grant status and retention maintenance. Ordinary admission,
+  activation and queue claim refuse; original task is not sent to the
+  provider during construction, inspection or maintenance. Separately
+  qualify independently authorized native source activation with exact
+  current Sandbox/Agent/grant pins: the actual
+  source-aware stdio owner opens only after explicit grant revision
+  zero and exact held Agent revision approval. The loopback provider
+  receives the original UTF-8 task including its newline, issues only
+  the approved read tool over the restored named checkout, and sees
+  the captured contents. The original queue fact settles with the same
+  request/payload digest, exactly one recorded Turn, and the next step
+  is idle. No task or grant inherited from the checkpoint.
+
+Validation: L5 locked/offline: bounded task stdin 1/1 (0.01s),
+original namespace 1/1, Store checkpoint owner 4/4 (2.61s),
+Host Git lifecycle 1/1 (185.23s), actual executable integration
+2/2 (39.52s). All nine distinct selected tests passed. Initial
+integration reached the final native activation but failed on the
+fixture's invalid `--tools-mode ro` spelling; corrected to
+`read-only`, reran both executable integrations successfully.
+Strict aw-cli all-feature/all-target Clippy, durable/minimal
+all-target checks (existing profile-specific warnings), scoped
+rustfmt/diff and executable help checks passed. Five historical
+Store failures, full workspace, pinned Nix and other platforms
+were not rerun.
+
+Scope/next: configured isolated same-Project/private captured-source
+restore with optional task; general cross-Project restore, inherit/custom
+host ACLs, empty baseline task-bearing host route, shared/participant
+execution and other physical authority/cleanup gates remain held.
+No production physical Process containment promotion: L5 has no effective
+capabilities or writable delegated cgroup. Next select never-managed
+ambient first-source authority retirement or another substantive
+independent gate (e.g. cross-Project source/history authority).
+Dependency-bearing registry replacement, protected Views/manifest
+transfer and extension gates remain. Phase 3 underway; no push, repin,
+UX or frozen Sandbox changes.
+
+## Previous local implementation delta — 2026-11-27: actual construction and maintenance stdio executable gate
 
 Parent `26e1d8ed010095adde4318a853fa722db20e45fd` (held
 source-only empty Sandbox); independently verified signature and

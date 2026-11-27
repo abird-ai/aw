@@ -15,6 +15,7 @@ use aw_store::{
 use serde::Deserialize;
 use std::{
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -33,6 +34,11 @@ pub(crate) struct Args {
     /// Optional destination Agent title, part of the original request.
     #[arg(long = "session-title")]
     title: Option<String>,
+    /// Read the optional exact initial task from stdin (UTF-8, up to 64 KiB).
+    /// For recovery/abandonment supply the original task bytes, not a new task.
+    /// A restored source-bearing Agent remains held; this never runs the task.
+    #[arg(long = "agent-task-stdin")]
+    task_stdin: bool,
     /// Inspect/publish the original prepared restore; never rematerialize.
     #[arg(long = "agent-recover", conflicts_with = "abandon")]
     recover: bool,
@@ -144,12 +150,9 @@ impl Approval {
 }
 
 fn require_offline_request(request: &CheckpointRestoreRequest) -> Result<()> {
-    if request.task.is_some()
-        || request.project.is_some()
-        || request.access != AgentHistoryForkAccess::Private
-    {
+    if request.project.is_some() || request.access != AgentHistoryForkAccess::Private {
         return Err(Error::Denied(
-            "offline captured restore requires same-Project private taskless construction",
+            "offline captured restore requires same-Project private construction",
         ));
     }
     Ok(())
@@ -220,6 +223,22 @@ pub(crate) fn abandon(
     )
 }
 
+// Preserve exact task bytes for the original semantic fingerprint. Do not
+// trim newlines, accept an unbounded stream, or put task text in argv.
+fn read_task(input: impl Read) -> Result<String> {
+    const MAX_TASK_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    input
+        .take((MAX_TASK_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_TASK_BYTES || bytes.contains(&0) {
+        return Err(Error::Limit(
+            "initial task must contain 1..65536 safe bytes",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::Protocol("initial task must be UTF-8"))
+}
+
 pub(crate) fn run(args: Args) -> Result<u8> {
     let request_id = crate::source_construction_rpc::Operation::CheckpointRestore.offline_id(
         &args.request_id,
@@ -228,13 +247,18 @@ pub(crate) fn run(args: Args) -> Result<u8> {
     )?;
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
+    // Do not hold the exclusive Store owner lock while waiting for input.
+    let task = args
+        .task_stdin
+        .then(|| read_task(std::io::stdin().lock()))
+        .transpose()?;
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
     let request = CheckpointRestoreRequest {
         checkpoint: args.checkpoint,
         project: None,
         title: args.title,
         access: AgentHistoryForkAccess::Private,
-        task: None,
+        task,
     };
 
     if args.abandon {
@@ -254,4 +278,23 @@ pub(crate) fn run(args: Args) -> Result<u8> {
         "sandbox_ref":result.agent.sandbox_ref,"admission":result.agent.admission,
         "source_coverage":result.source_coverage}))?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_task;
+
+    #[test]
+    fn task_stdin_is_bounded_and_preserves_exact_utf8() {
+        let task = "Read the captured source — fixture task.\n";
+        assert_eq!(read_task(task.as_bytes()).unwrap(), task);
+        assert!(read_task(&[][..]).is_err());
+        assert!(read_task(&[0][..]).is_err());
+        assert!(read_task(&[0xff][..]).is_err());
+        assert!(read_task(&vec![b'x'; 64 * 1024 + 1][..]).is_err());
+        assert_eq!(
+            read_task(&vec![b'x'; 64 * 1024][..]).unwrap().len(),
+            64 * 1024
+        );
+    }
 }
