@@ -1,12 +1,14 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27-LATE.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-27-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-27-LATE.md).
 
 Previous Phase-3, Phase-1 and R6 comprehensive handoffs remain historical design/implementation provenance:
+- [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md)
+- [November 27 earlier next-agent prompt](AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-26.md)
 - [November 26 next-agent prompt](AW-DL200-PHASE3-NEXT-AGENT-2026-11-26.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md)
@@ -34,6 +36,8 @@ The comprehensive handoff preserves all 16 subsequent signed implementation
 records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
+
+November 27 late documentation refresh: all nine first-parent implementation signatures, parent links and exact trees after e56cd92 verified on L5; implementation tip 38c4775, Store v62. The new comprehensive handoff preserves all nine exact deltas, the complete previous comprehensive handoff byte-for-byte and the exact signed active TODO. Non-reserved entry clean; no source change or product test rerun in this documentation cut. Next: semantic dependency-bearing registry compatibility; physical containment/ambient authority remain held.
 
 ## Latest local implementation delta — 2026-11-27: manifest-preserving private manual context transfer
 
