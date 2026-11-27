@@ -141,7 +141,7 @@ enum TopCommand {
         #[command(flatten)]
         args: checkpoint_capture::Args,
     },
-    /// Restore an exact captured Git checkpoint into a fresh private layout.
+    /// Restore captured Git sources, or inspect an interrupted empty-baseline task restore.
     #[cfg(feature = "workspace")]
     CheckpointRestore {
         #[command(flatten)]
@@ -1000,8 +1000,9 @@ struct RpcCommandCliArgs {
     #[arg(long = "checkpoint-create", requires = "rpc_actor_owner")]
     rpc_checkpoint_create: bool,
     /// Independently approved existing empty private directory for a fresh
-    /// source-free, task-less restore in the current Project. No path from
-    /// the RPC caller is accepted; the host must exclude other writers and
+    /// source-free restore in the current Project. Optional initial task
+    /// requires the saved controller template. No RPC path is accepted;
+    /// the host must exclude other writers and
     /// aliases to this layout.
     #[arg(long = "checkpoint-restore-root", requires = "rpc_actor_owner")]
     rpc_checkpoint_restore_root: Option<PathBuf>,
@@ -7221,6 +7222,15 @@ impl aw::headless::Driver for Host {
         }
         let root = self.checkpoint_restore_root.as_ref()?;
         let creator = self.agent_create_owner.as_ref()?;
+        // Offline task recovery must reconstruct the exact template from
+        // durable Session metadata. Do not create a task receipt from a
+        // live context-transfer or unsaved provider/model selection.
+        let recoverable_template = cfg!(feature = "workspace")
+            && state
+                .store
+                .agent_execution_binding(&state.caller, &state.current_agent_ref)
+                .and_then(|execution| state.store.session(&state.caller, execution.session_id()))
+                .is_ok_and(|session| session.binding == creator.binding);
         Some(std::sync::Arc::new(StdioCheckpointRestorePort {
             baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
                 state.store.clone(),
@@ -7228,7 +7238,8 @@ impl aw::headless::Driver for Host {
                 state.current_project_ref.clone(),
                 creator.binding.clone(),
                 root.clone(),
-            ),
+            )
+            .with_initial_task_allowed(recoverable_template),
         }))
     }
     fn checkpoint_delete_port(
@@ -9270,10 +9281,7 @@ mod phase54_cli_tests {
                 .restore("overlap", restore_request.clone())
                 .is_err());
             assert!(restore
-                .restore(
-                    "task-restore",
-                    json!({"id":created["id"],"task":"must not queue"})
-                )
+                .restore("task-restore", json!({"id":created["id"],"task":""}))
                 .is_err());
             assert!(restore
                 .restore(

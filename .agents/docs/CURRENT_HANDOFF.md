@@ -35,7 +35,85 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: explicit cross-Project captured-source restore
+## Latest local implementation delta — 2026-11-27: configured task-only empty-baseline restore
+
+Parent `1135f256fac232552ea241431b9bcbc8c79d7461` (explicit cross-Project
+captured restore); independently verified signature and exact non-reserved
+entry with four retained interrupted owned files. Completed that slice,
+rather than replacing its owner or restarting previously qualified work.
+Published AW main `0f9807f4`, dotlink `85ceccc1`, frozen `576d0a1a`
+unchanged. L5 only; Store v61, product 0.15.0, Git recovery v4 unchanged.
+
+- Original task-only baseline receipt owner handles an explicitly
+  selected existing empty private root for a live history-only or
+  empty Auto checkpoint. One original InitialTask encrypted custody,
+  Prepared before task write, exact baseline digest, atomic history/ACL/
+  Agent/Sandbox/Pending/Applied. Source-free ordinary admission (Open),
+  never activation, model dispatch or implicit source grants. No new
+  schema, receipt, layout creation or operation-owned directory.
+- Add exact configured receipt entry points for empty-baseline task
+  inspection, publication and abandonment. Reuse existing task-only
+  owner and transition logic; require original request fingerprint,
+  same original source/destination Project and empty selected binding
+  digest, not an independently selected nonempty baseline or captured
+  source effect. Recovery requires exact current binding digest and
+  original ciphertext, never rewrites missing custody. Applied replay
+  returns current authorized original Agent without probing the root.
+  Abandon discards only unpublished task; Rejected replay inert.
+- Existing authenticated stdio `--agent-checkpoint-restore-root` admits
+  optional private initial task only on workspace builds with a
+  reconstructable saved controller SessionBinding. Compare the entire
+  configured binding to saved metadata; unsaved context/profile changes
+  and unsupported feature profile refuse new task work. Taskless
+  behavior unchanged. The existing host pin/empty/layout authority
+  check is retained through Store publication; physical aliases and
+  non-cooperating access remain independent trusted host exclusions.
+- Offline `checkpoint-restore --agent-baseline-controller <canonical Agent>
+  --agent-rpc-request --agent-task-stdin --agent-recover|--agent-abandon`
+  selects the original controller's durable template and the original
+  empty-baseline root (positional, instead of Git approval file).
+  Original task, title, checkpoint and optional Project literal match
+  exact receipt. Recovery-only namespace; no new operation on missing
+  receipt. Abandon does not inspect or remove the supplied root.
+- Lower grouped checkpoint regression covers wrong task/Project/layout,
+  exact replay/recovery, preserved encrypted custody and nonempty
+  baseline receipt refusal. Correct prior stale taskless assertion in
+  configured metadata/restore test.
+- Add dedicated actual executable regression in
+  `tests/native_source_rpc/empty_baseline.rs`. Fixture-only SQLite CLI
+  trigger fails final Applied receipt after real task write, without a
+  production fault hook. Explicitly run this test with `--ignored`
+  because it needs the SQLite CLI. The fixture is private/disposable and
+  changes SQL only while the AW owner is stopped. Verify exact original
+  task delivery to Pending custody, empty Auto Unknown recovery,
+  changed task/layout refusal, original encrypted identity, and
+  abandonment preserving unrelated file/directory and prior Input.
+
+Validation: L5 locked/offline final revision: explicit empty-baseline
+executable fault fixture 1/1 (10.34s), Store checkpoint owner 4/4
+(8.86s), CLI source metadata/restore 1/1 (0.99s), native-source
+executable pair 2/2 (48.34s). All eight distinct selected tests passed;
+the fault fixture is normally ignored only because it requires
+`sqlite3`, and was executed explicitly. The initial integration
+compile caught a missing SessionBackend import and unused imports;
+corrected and cancelled only that superseded build, then reran.
+Strict all-feature/all-target Clippy for aw-cli/aw-store/aw-host,
+durable and minimal all-target checks (existing profile-specific
+dead-code warnings), scoped rustfmt/diff and executable help passed.
+No full workspace, pinned Nix or other platform claim; five historical
+Store failures not rerun.
+
+Scope/next: private same-Project empty baseline task host route only,
+workspace-enabled offline recovery. Cross-Project empty baseline,
+inherit/custom task ACL and other source effects remain independently
+gated. No physical containment or ambient first-source retirement
+promotion. L5 lacks effective capabilities and writable delegated
+cgroup. Next substantial independent gap: protected Views and
+manifest-preserving transfer/export; retain current independent source
+and provider disclosure ceilings. No push, repin, UX or frozen Sandbox
+changes. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: explicit cross-Project captured-source restore
 
 Parent `933398622c9b17b12e32bf6db53c09a2d1576257` (configured
 task-bearing captured restore), verified clean non-reserved entry.

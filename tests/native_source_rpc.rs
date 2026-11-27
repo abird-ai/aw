@@ -1257,5 +1257,7 @@ fn exercise_native_root_stdio(linked: bool) {
     }
 }
 
+#[path = "native_source_rpc/empty_baseline.rs"]
+mod empty_baseline;
 #[path = "native_source_rpc/maintenance.rs"]
 mod maintenance;

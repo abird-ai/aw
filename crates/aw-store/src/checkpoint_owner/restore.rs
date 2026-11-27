@@ -1019,6 +1019,33 @@ fn task_baseline_receipt(
     Ok(receipt)
 }
 
+// Configured empty-baseline recovery accepts only the original semantic
+// request, Project and source-free task claim. The trusted lower APIs
+// retain their existing receipt-ID-only contract for embedded owners.
+fn require_exact_empty_task_baseline(
+    receipt: &ConstructionPreparation,
+    request: &CheckpointRestoreRequest,
+    project: &str,
+) -> Result<()> {
+    let digest = baseline_digest(&[])?;
+    if receipt.fingerprint != restore_fingerprint(request, &receipt.request_id)?
+        || !receipt.restore_boundary.as_ref().is_some_and(|boundary| {
+            boundary.destination_project == project
+                && boundary
+                    .source_agent_ref
+                    .rsplit_once("/a:")
+                    .is_some_and(|(source, _)| source == project)
+                && boundary.baseline_sources.is_none()
+                && boundary.baseline_digest.as_deref() == Some(digest.as_str())
+        })
+    {
+        return Err(Error::Denied(
+            "empty baseline restore differs from original request or Project",
+        ));
+    }
+    Ok(())
+}
+
 fn publish_task_baseline(
     store: &SessionStore,
     connection: &mut Connection,
@@ -1222,6 +1249,45 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// Inspect the exact original empty-baseline task receipt before
+    /// opening any current host layout. None means unresolved, not absent.
+    pub fn checkpoint_replay_empty_baseline_task(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        project: &str,
+        request_id: &str,
+    ) -> Result<Option<CheckpointRestoreResult>> {
+        require_baseline_owner(self)?;
+        let connection = self.connection()?;
+        let receipt = task_baseline_receipt(&connection, actor, request_id)?;
+        require_exact_empty_task_baseline(&receipt, request, project)?;
+        match receipt.state {
+            PreparationState::Applied => replay_restore_in(
+                &connection,
+                actor,
+                &receipt.creator,
+                request_id,
+                &receipt.fingerprint,
+            ),
+            state if state.unresolved() => Ok(None),
+            _ => Err(Error::Conflict("task-only baseline already rejected")),
+        }
+    }
+
+    /// Exact configured recovery. The original task bytes authorize
+    /// inspection, never rewriting missing encrypted custody.
+    pub fn checkpoint_resume_empty_baseline_task(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        project: &str,
+        request_id: &str,
+        binding: &SessionBinding,
+    ) -> Result<CheckpointRestoreResult> {
+        self.resume_task_baseline(actor, request_id, binding, &[], Some((request, project)))
+    }
+
     /// Inspect the original encrypted input and publish the exact
     /// previously chosen baseline under current independent authority.
     /// Never rewrite missing ciphertext, rematerialize, or replan.
@@ -1232,9 +1298,23 @@ impl SessionStore {
         binding: &SessionBinding,
         baseline_sources: &[SourceBinding],
     ) -> Result<CheckpointRestoreResult> {
+        self.resume_task_baseline(actor, request_id, binding, baseline_sources, None)
+    }
+
+    fn resume_task_baseline(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        binding: &SessionBinding,
+        baseline_sources: &[SourceBinding],
+        exact: Option<(&CheckpointRestoreRequest, &str)>,
+    ) -> Result<CheckpointRestoreResult> {
         require_baseline_owner(self)?;
         let mut connection = self.connection()?;
         let receipt = task_baseline_receipt(&connection, actor, request_id)?;
+        if let Some((request, project)) = exact {
+            require_exact_empty_task_baseline(&receipt, request, project)?;
+        }
         if receipt.state == PreparationState::Applied {
             return replay_restore_in(
                 &connection,
@@ -1266,9 +1346,33 @@ impl SessionStore {
     /// No baseline materialization was owned by this operation. Never
     /// delete an Applied queue item or reopen a Rejected request.
     pub fn checkpoint_abandon_baseline(&self, actor: &PrincipalId, request_id: &str) -> Result<()> {
+        self.abandon_task_baseline(actor, request_id, None)
+    }
+
+    /// Exact configured abandonment, with no filesystem cleanup. A
+    /// terminal Rejected replay remains inert under the original identity.
+    pub fn checkpoint_abandon_empty_baseline_task(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        project: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        self.abandon_task_baseline(actor, request_id, Some((request, project)))
+    }
+
+    fn abandon_task_baseline(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        exact: Option<(&CheckpointRestoreRequest, &str)>,
+    ) -> Result<()> {
         require_baseline_owner(self)?;
         let mut connection = self.connection()?;
         let receipt = task_baseline_receipt(&connection, actor, request_id)?;
+        if let Some((request, project)) = exact {
+            require_exact_empty_task_baseline(&receipt, request, project)?;
+        }
         if receipt.state == PreparationState::Applied {
             return Err(Error::Conflict("published baseline cannot be abandoned"));
         }
@@ -2049,12 +2153,49 @@ mod tests {
         assert!(store
             .checkpoint_abandon_baseline(&viewer, "host:abandoned-baseline")
             .is_err());
+        let project = store.agent_get(&actor, &reference).unwrap().project_ref;
+        let changed_task = CheckpointRestoreRequest {
+            task: Some("changed".into()),
+            ..task_baseline.clone()
+        };
+        assert!(store
+            .checkpoint_replay_empty_baseline_task(
+                &actor,
+                &task_baseline,
+                &project,
+                "host:abandoned-baseline",
+            )
+            .unwrap()
+            .is_none());
+        assert!(store
+            .checkpoint_abandon_empty_baseline_task(
+                &actor,
+                &changed_task,
+                &project,
+                "host:abandoned-baseline",
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_abandon_empty_baseline_task(
+                &actor,
+                &task_baseline,
+                "/d:other/i:other/p:other",
+                "host:abandoned-baseline",
+            )
+            .is_err());
         store
-            .checkpoint_abandon_baseline(&actor, "host:abandoned-baseline")
+            .verify_prepared_queue_custody(&abandoned_task.custody())
             .unwrap();
-        store
-            .checkpoint_abandon_baseline(&actor, "host:abandoned-baseline")
-            .unwrap();
+        for _ in 0..2 {
+            store
+                .checkpoint_abandon_empty_baseline_task(
+                    &actor,
+                    &task_baseline,
+                    &project,
+                    "host:abandoned-baseline",
+                )
+                .unwrap();
+        }
         assert!(store
             .verify_prepared_queue_custody(&abandoned_task.custody())
             .is_err());
@@ -2078,7 +2219,8 @@ mod tests {
             tool_root: task_root,
             ..layout.clone()
         };
-        let task_restored = store
+        fail_publication(&store);
+        assert!(store
             .checkpoint_restore_baseline(
                 &actor,
                 &task_baseline,
@@ -2087,7 +2229,50 @@ mod tests {
                 "host:task-baseline",
                 "fixture:baseline-site",
             )
+            .is_err());
+        clear_failure(&store);
+        let original_task =
+            task_baseline_receipt(&store.connection().unwrap(), &actor, "host:task-baseline")
+                .unwrap();
+        assert_eq!(original_task.state, PreparationState::Unknown);
+        assert!(store
+            .checkpoint_resume_empty_baseline_task(
+                &actor,
+                &changed_task,
+                &project,
+                "host:task-baseline",
+                &task_layout,
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_resume_empty_baseline_task(
+                &actor,
+                &task_baseline,
+                &project,
+                "host:task-baseline",
+                &abandoned_layout,
+            )
+            .is_err());
+        let task_restored = store
+            .checkpoint_resume_empty_baseline_task(
+                &actor,
+                &task_baseline,
+                &project,
+                "host:task-baseline",
+                &task_layout,
+            )
             .unwrap();
+        assert_eq!(
+            store
+                .checkpoint_replay_empty_baseline_task(
+                    &actor,
+                    &task_baseline,
+                    &project,
+                    "host:task-baseline",
+                )
+                .unwrap(),
+            Some(task_restored.clone())
+        );
         assert_eq!(task_restored.agent.admission, crate::AgentAdmission::Open);
         let (task_session, task_branch) = agent_owner::key_for_ref(
             &store.connection().unwrap(),
@@ -2268,6 +2453,25 @@ mod tests {
             task_baseline_receipt(&store.connection().unwrap(), &actor, "host:auto-baseline")
                 .unwrap();
         assert_eq!(original_auto.state, PreparationState::Unknown);
+        // A configured empty recovery cannot reinterpret even an exact
+        // request for a previously selected nonempty baseline.
+        assert!(store
+            .checkpoint_resume_empty_baseline_task(
+                &actor,
+                &auto_request,
+                &project,
+                "host:auto-baseline",
+                &auto_layout,
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_abandon_empty_baseline_task(
+                &actor,
+                &auto_request,
+                &project,
+                "host:auto-baseline",
+            )
+            .is_err());
         let auto_task = original_auto.initial_task().unwrap().clone();
         assert!(store.checkpoint_delete(&actor, &empty_auto.id).is_err());
         drop(store);

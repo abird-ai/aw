@@ -24,10 +24,11 @@ pub(crate) struct Args {
     /// Existing private Store directory.
     #[arg(long = "state-dir")]
     state_dir: PathBuf,
-    /// Private host approval file. The operator independently excludes all
+    /// Private Git approval file, or the original empty baseline directory
+    /// when --agent-baseline-controller is selected. The operator excludes
     /// other writers, aliases, retention users and destination access.
     approval: PathBuf,
-    /// Exact captured checkpoint ID.
+    /// Exact checkpoint ID.
     checkpoint: String,
     /// Stable original invocation identity (retain for recovery).
     request_id: String,
@@ -43,6 +44,11 @@ pub(crate) struct Args {
     /// A restored source-bearing Agent remains held; this never runs the task.
     #[arg(long = "agent-task-stdin")]
     task_stdin: bool,
+    /// Exact canonical controller Agent for empty-baseline RPC recovery or
+    /// abandonment. Use its saved Session template and original baseline root.
+    /// Requires the original task from stdin; never starts a new restore.
+    #[arg(long = "agent-baseline-controller", requires_all = ["task_stdin", "rpc_request"])]
+    baseline_controller: Option<String>,
     /// Inspect/publish the original prepared restore; never rematerialize.
     #[arg(long = "agent-recover", conflicts_with = "abandon")]
     recover: bool,
@@ -287,19 +293,41 @@ pub(crate) fn run(args: Args) -> Result<u8> {
         task,
     };
 
-    if args.abandon {
-        abandon(&store, &actor, &args.approval, &request, &request_id)?;
-        super::print_json(&serde_json::json!({"status":"rejected"}))?;
-        return Ok(0);
-    }
-    let result = restore(
-        &store,
-        &actor,
-        &args.approval,
-        &request,
-        &request_id,
-        args.recover,
-    )?;
+    let result = if let Some(controller) = args.baseline_controller {
+        // The RPC constructor selected its template from the current saved
+        // Session. Recover from that durable binding, not today's provider
+        // configuration or a caller-supplied layout template.
+        let snapshot = store.agent_get(&actor, &controller)?;
+        let execution = store.agent_execution_binding(&actor, &controller)?;
+        let template = store.session(&actor, execution.session_id())?.binding;
+        let baseline = aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
+            store,
+            actor,
+            snapshot.project_ref,
+            template,
+            args.approval,
+        );
+        if args.abandon {
+            baseline.abandon(&request, &request_id)?;
+            super::print_json(&serde_json::json!({"status":"rejected"}))?;
+            return Ok(0);
+        }
+        baseline.resume(&request, &request_id)?
+    } else {
+        if args.abandon {
+            abandon(&store, &actor, &args.approval, &request, &request_id)?;
+            super::print_json(&serde_json::json!({"status":"rejected"}))?;
+            return Ok(0);
+        }
+        restore(
+            &store,
+            &actor,
+            &args.approval,
+            &request,
+            &request_id,
+            args.recover,
+        )?
+    };
     super::print_json(&serde_json::json!({"ref":result.agent.canonical_ref,
         "sandbox_ref":result.agent.sandbox_ref,"admission":result.agent.admission,
         "source_coverage":result.source_coverage}))?;

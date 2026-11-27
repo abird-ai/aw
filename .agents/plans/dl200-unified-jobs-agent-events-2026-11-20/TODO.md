@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: explicit cross-Project captured-source restore (this checkpoint; local parent `933398622c9b17b12e32bf6db53c09a2d1576257`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: configured task-only empty-baseline restore (this checkpoint; local parent `1135f256fac232552ea241431b9bcbc8c79d7461`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -2033,9 +2033,22 @@ Current implementation: explicit cross-Project captured-source restore (this che
       Store checkpoint 4/history 5, executable 2: all 14 selected
       tests passed. Strict aw-cli Clippy, durable/minimal all-target,
       scoped fmt/diff/help passed; historical Store failures not rerun.
+      **Configured task-bearing empty-baseline restore:** original
+      task-only receipt, exact request/Project/empty source digest,
+      encrypted custody and original atomic source-free Agent/Pending
+      publication. Workspace-enabled configured stdio with saved
+      controller template; offline exact RPC recovery/abandon via
+      --agent-baseline-controller and original stdin task. No layout
+      effects, grant or activation. Abandon original task only.
+      Dedicated executable lifecycle with explicit fixture-only SQLite
+      publication failure plus grouped Store recovery regression.
+      Locked/offline explicit executable fault 1, checkpoint owner 4,
+      CLI metadata/restore 1, native executable pair 2: all eight passed.
+      Strict aw-cli/aw-store/aw-host Clippy, durable/minimal all-target,
+      scoped fmt/diff/help passed. Historical Store failures not rerun.
       **Next:** production reviewed physical Process containment/dispatch,
-      never-managed ambient first-source authority retirement, task-bearing
-      configured empty-baseline restore or other independent host gates.
+      never-managed ambient first-source authority retirement, protected
+      Views/manifest transfer or other independent host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
@@ -2062,7 +2075,7 @@ Current implementation: explicit cross-Project captured-source restore (this che
       and isolated held-Agent managed attachment/replacement/partial/final release
       and protected empty-layout reattachment are landed; do not repeat.
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
-      cross-Domain and task-bearing empty-baseline host restore, broader source capture/restore authority,
+      cross-Domain and cross-Project empty-baseline restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md) §5 for next cuts, limitations and acceptance. Schema v60.
       Last independently verified published AW main `0f9807f4`, dotlink main
