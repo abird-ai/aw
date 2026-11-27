@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: configured task-bearing captured-source restore (this checkpoint; local parent `1f5ff72ebd61361218a2459a54ff57790500296f`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
+Current implementation: explicit cross-Project captured-source restore (this checkpoint; local parent `933398622c9b17b12e32bf6db53c09a2d1576257`). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v61 (authority-compatibility epoch), Git recovery v4. Independently verified published AW remote main `0f9807f4` before this local slice. The signed chronology through `3c67319`, current owner map and historical design lineage are in the [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-27.md); CURRENT_HANDOFF supersedes historical next steps.
 
 ## Committed
 
@@ -2015,9 +2015,27 @@ Current implementation: configured task-bearing captured-source restore (this ch
       Host Git 1, executable 2: all nine selected tests passed.
       Strict aw-cli Clippy, durable/minimal all-target and scoped
       fmt/diff/help checks passed. Historical Store failures not rerun.
+      **Explicit cross-Project captured restore:** same Store/Domain,
+      private destination; exact optional destination_project in private
+      approval and original request, default source Project unchanged.
+      RPC controller must be current destination. Original history
+      View/Derive/Share, destination writer/owner, complete captured
+      physical Git fence and exact receipt/held task publication reused.
+      Actual two-Project executable restore, old approval/implicit/
+      wrong-controller refusals, exact replay, original task-bearing
+      Prepared recovery with missing/changed Project refusal, no grant
+      or implicit activation. No schema or new owner. Correct previous
+      stale taskless fixture assertion. Never-managed ambient first
+      attach remains held: legacy external authority retirement is not
+      proven by Store lock, held admission or ToolBinding revocation.
+      Actual separate Domain with matching valid destination approval
+      refused. Locked/offline configured CLI Git 1, stdin 1, namespace 1,
+      Store checkpoint 4/history 5, executable 2: all 14 selected
+      tests passed. Strict aw-cli Clippy, durable/minimal all-target,
+      scoped fmt/diff/help passed; historical Store failures not rerun.
       **Next:** production reviewed physical Process containment/dispatch,
-      never-managed ambient first-source authority retirement, cross-Project
-      restore or other remaining independent host gates.
+      never-managed ambient first-source authority retirement, task-bearing
+      configured empty-baseline restore or other independent host gates.
       Explicit dependency-bearing replacement compatibility, final atomic
       ExtensionRegistry and protected broader metadata/Views, manifest-
       preserving transfer/export and independent source/provider share policy remain. Raw file/env and arbitrary secret exposure
@@ -2044,7 +2062,7 @@ Current implementation: configured task-bearing captured-source restore (this ch
       and isolated held-Agent managed attachment/replacement/partial/final release
       and protected empty-layout reattachment are landed; do not repeat.
       Remaining Vault production Process dispatch, raw credential projection and broader/interactive broker contracts, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
-      cross-Project and task-bearing empty-baseline host restore, broader source capture/restore authority,
+      cross-Domain and task-bearing empty-baseline host restore, broader source capture/restore authority,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.
       See [November 27 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-27.md) §5 for next cuts, limitations and acceptance. Schema v60.
       Last independently verified published AW main `0f9807f4`, dotlink main

@@ -132,6 +132,31 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
     );
     let controller_before = store.agent_get(&actor, &controller_ref).unwrap();
     let project = &controller_before.project_ref;
+    let destination_controller_root = root.join("destination-controller");
+    aw_platform::ensure_private_dir(&destination_controller_root).unwrap();
+    let destination_workspace = store
+        .create_workspace(&actor, None, "restore-destination")
+        .unwrap();
+    let (destination_session, destination_branch) = store
+        .create_in_workspace(
+            &actor,
+            "destination controller",
+            layout(&destination_controller_root),
+            Some(&destination_workspace.domain_id),
+            Some(&destination_workspace.id),
+            None,
+        )
+        .unwrap();
+    let destination_binding = store
+        .agent_binding(&actor, &destination_session.id, &destination_branch.id)
+        .unwrap();
+    let destination_project = format!(
+        "/d:{}/i:{}/p:{}",
+        destination_binding.domain_handle,
+        destination_binding.identity_handle,
+        destination_binding.project_handle
+    );
+    assert_ne!(&destination_project, project);
     let history = store
         .checkpoint_create_history_only(&actor, &controller_ref, None, "fixture:history")
         .unwrap();
@@ -376,27 +401,36 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
     };
     // The exact task is supplied as stdin, never argv or an approval-file
     // field. Recovery/abandonment use the same original semantic identity.
+    let offline_task_in_project =
+        |path: &Path, id: &str, title: &str, mode: &str, payload: &[u8], project: Option<&str>| {
+            let mut command = command();
+            command.arg("checkpoint-restore");
+            if let Some(project) = project {
+                command.args(["--agent-project", project]);
+            }
+            let mut child = command
+                .arg("--state-dir")
+                .arg(&state)
+                .arg(path)
+                .args([
+                    checkpoint,
+                    id,
+                    "--session-title",
+                    title,
+                    "--agent-rpc-request",
+                    mode,
+                    "--agent-task-stdin",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            child.wait_with_output().unwrap()
+        };
     let offline_task = |path: &Path, id: &str, title: &str, mode: &str, payload: &[u8]| {
-        let mut child = command()
-            .args(["checkpoint-restore", "--state-dir"])
-            .arg(&state)
-            .arg(path)
-            .args([
-                checkpoint,
-                id,
-                "--session-title",
-                title,
-                "--agent-rpc-request",
-                mode,
-                "--agent-task-stdin",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(payload).unwrap();
-        child.wait_with_output().unwrap()
+        offline_task_in_project(path, id, title, mode, payload, None)
     };
     assert!(!offline(
         "checkpoint-capture",
@@ -614,12 +648,12 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
     let abandoned_root = root.join("abandoned-task");
     let interrupted_path = approvals.join("interrupted-task.json");
     let abandoned_path = approvals.join("abandoned-task.json");
-    let interrupt_restore = |target: &Path, path: &Path, id: &str| {
+    let interrupt_restore = |target: &Path, path: &Path, id: &str, destination: Option<&str>| {
         aw_platform::ensure_private_dir(target).unwrap();
         write_private(
             path,
             &approval(json!({
-                "checkpoint":checkpoint,"binding":layout(target),
+                "checkpoint":checkpoint,"destination_project":destination,"binding":layout(target),
                 "destination_identity":identity(target),"repositories":[location]
             })),
         );
@@ -627,7 +661,7 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
         let driver = store.source_driver(&handle).unwrap();
         let request = CheckpointRestoreRequest {
             checkpoint: checkpoint.to_owned(),
-            project: None,
+            project: destination.map(str::to_owned),
             title: Some(id.to_owned()),
             access: AgentHistoryForkAccess::Private,
             task: Some(task.to_owned()),
@@ -675,7 +709,7 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
         assert!(store.session(&actor, &candidate.0).is_err());
         candidate
     };
-    let candidate = interrupt_restore(&interrupted_root, &interrupted_path, "task-recovery");
+    let candidate = interrupt_restore(&interrupted_root, &interrupted_path, "task-recovery", None);
     let interrupted = frame(
         "task-recovery",
         "checkpoint_restore",
@@ -747,7 +781,7 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
     );
     drop(store);
 
-    let candidate = interrupt_restore(&abandoned_root, &abandoned_path, "task-abandon");
+    let candidate = interrupt_restore(&abandoned_root, &abandoned_path, "task-abandon", None);
     assert!(!offline_task(
         &abandoned_path,
         "task-abandon",
@@ -796,6 +830,238 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
     let store = open();
     assert!(store.session(&actor, &candidate.0).is_err());
     assert!(store.sandbox_get(&actor, &candidate.1).is_err());
+    drop(store);
+
+    // Explicit cross-Project private restore: the controller is bound
+    // to the destination Project, while the immutable source checkpoint
+    // stays in its original Project. Old/default approvals cannot move it.
+    let cross_root = root.join("cross-project");
+    aw_platform::ensure_private_dir(&cross_root).unwrap();
+    let cross_path = approvals.join("cross-project.json");
+    let legacy_approval = approval(json!({
+        "checkpoint":checkpoint,"binding":layout(&cross_root),
+        "destination_identity":identity(&cross_root),"repositories":[location]
+    }));
+    write_private(&cross_path, &legacy_approval);
+    let cross_request = frame(
+        "cross-restore",
+        "checkpoint_restore",
+        json!({"id":checkpoint,"project":destination_project,"title":"cross restored"}),
+    );
+    let cross_rpc = |path: &Path, requests: &[Value]| {
+        let mut command = rpc_command(&destination_session.id, &destination_branch.id, "off");
+        command.current_dir(&destination_controller_root);
+        command.arg("--agent-checkpoint-restore-approval").arg(path);
+        frames(&run_frames(command, requests))
+    };
+    let denied = cross_rpc(&cross_path, std::slice::from_ref(&cross_request));
+    reply(&denied, "cross-restore", "error");
+    assert_eq!(fs::read_dir(&cross_root).unwrap().count(), 0);
+    let mut cross_approval = legacy_approval;
+    // Even an otherwise valid destination owned by this actor in another
+    // Domain is not part of this first host promotion.
+    let store = open();
+    let other_domain = store
+        .create_domain(
+            &actor,
+            "other-restore-domain",
+            Some(&destination_binding.domain_handle),
+        )
+        .unwrap();
+    let other_root = root.join("other-domain-controller");
+    aw_platform::ensure_private_dir(&other_root).unwrap();
+    let (other_session, other_branch) = store
+        .create_in_workspace(
+            &actor,
+            "other controller",
+            layout(&other_root),
+            Some(&other_domain.id),
+            None,
+            None,
+        )
+        .unwrap();
+    let other_binding = store
+        .agent_binding(&actor, &other_session.id, &other_branch.id)
+        .unwrap();
+    let other_project = format!(
+        "/d:{}/i:{}/p:{}",
+        other_binding.domain_handle, other_binding.identity_handle, other_binding.project_handle
+    );
+    assert_ne!(
+        other_binding.domain_handle,
+        destination_binding.domain_handle
+    );
+    drop(store);
+    cross_approval["destination_project"] = json!(other_project);
+    fs::write(&cross_path, serde_json::to_vec(&cross_approval).unwrap()).unwrap();
+    let denied = offline(
+        "checkpoint-restore",
+        &cross_path,
+        checkpoint,
+        "cross-domain",
+        &["--agent-project", &other_project],
+    );
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr)
+        .contains("cross-Domain captured restore unavailable"));
+    assert_eq!(fs::read_dir(&cross_root).unwrap().count(), 0);
+    cross_approval["destination_project"] = json!(destination_project);
+    fs::write(&cross_path, serde_json::to_vec(&cross_approval).unwrap()).unwrap();
+    let denied = invoke(
+        &[("--agent-checkpoint-restore-approval", &cross_path)],
+        &[],
+        std::slice::from_ref(&cross_request),
+    );
+    reply(&denied, "cross-restore", "error");
+    assert_eq!(fs::read_dir(&cross_root).unwrap().count(), 0);
+    let denied = cross_rpc(
+        &cross_path,
+        &[
+            frame("implicit", "checkpoint_restore", json!({"id":checkpoint})),
+            frame(
+                "foreign",
+                "checkpoint_restore",
+                json!({"id":checkpoint,"project":project}),
+            ),
+            frame(
+                "inherit",
+                "checkpoint_restore",
+                json!({"id":checkpoint,"project":destination_project,"access":"inherit"}),
+            ),
+        ],
+    );
+    for id in ["implicit", "foreign", "inherit"] {
+        reply(&denied, id, "error");
+    }
+    assert_eq!(fs::read_dir(&cross_root).unwrap().count(), 0);
+    let result = cross_rpc(&cross_path, std::slice::from_ref(&cross_request));
+    let cross = reply(&result, "cross-restore", "response").clone();
+    assert_eq!(cross["agent"]["project"], destination_project);
+    assert_eq!(cross["agent"]["admission"], "held");
+    require_redacted(&cross);
+    assert_eq!(
+        fs::read(cross_root.join("code/tracked")).unwrap(),
+        b"captured dirty version"
+    );
+    let replay = cross_rpc(&absent, std::slice::from_ref(&cross_request));
+    assert_eq!(reply(&replay, "cross-restore", "response"), &cross);
+    let denied = invoke(
+        &[("--agent-checkpoint-restore-approval", &absent)],
+        &[],
+        std::slice::from_ref(&cross_request),
+    );
+    reply(&denied, "cross-restore", "error");
+    let result = offline(
+        "checkpoint-restore",
+        &absent,
+        checkpoint,
+        "cross-restore",
+        &[
+            "--agent-rpc-request",
+            "--agent-recover",
+            "--session-title",
+            "cross restored",
+            "--agent-project",
+            &destination_project,
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "cross-Project replay: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap()["ref"],
+        cross["agent"]["ref"]
+    );
+    let store = open();
+    let reference = cross["agent"]["ref"].as_str().unwrap();
+    let snapshot = store.agent_get(&actor, reference).unwrap();
+    assert_eq!(snapshot.project_ref, destination_project);
+    assert_eq!(
+        store
+            .sandbox_grant_status(&actor, reference)
+            .unwrap()
+            .revision,
+        0
+    );
+    let execution = store.agent_execution_binding(&actor, reference).unwrap();
+    assert!(store
+        .activate(&actor, execution.session_id(), execution.branch_id())
+        .is_err());
+    assert!(store
+        .actor_queue_list(&actor, execution.session_id())
+        .unwrap()
+        .is_empty());
+    drop(store);
+
+    // Original explicit destination is part of the exact Prepared task
+    // receipt. Missing/changed destination cannot inspect or abandon it.
+    let cross_pending_root = root.join("cross-project-pending");
+    let cross_pending_path = approvals.join("cross-project-pending.json");
+    let candidate = interrupt_restore(
+        &cross_pending_root,
+        &cross_pending_path,
+        "cross-pending",
+        Some(&destination_project),
+    );
+    let pending = frame(
+        "cross-pending",
+        "checkpoint_restore",
+        json!({"id":checkpoint,"project":destination_project,"title":"cross-pending","task":task}),
+    );
+    let retry = cross_rpc(&cross_pending_path, std::slice::from_ref(&pending));
+    assert_eq!(
+        reply(&retry, "cross-pending", "error")["needs_inspection"],
+        true
+    );
+    assert!(!offline_task(
+        &cross_pending_path,
+        "cross-pending",
+        "cross-pending",
+        "--agent-recover",
+        task.as_bytes()
+    )
+    .status
+    .success());
+    assert!(!offline_task_in_project(
+        &cross_pending_path,
+        "cross-pending",
+        "cross-pending",
+        "--agent-abandon",
+        task.as_bytes(),
+        Some(project)
+    )
+    .status
+    .success());
+    let result = offline_task_in_project(
+        &cross_pending_path,
+        "cross-pending",
+        "cross-pending",
+        "--agent-recover",
+        task.as_bytes(),
+        Some(&destination_project),
+    );
+    assert!(
+        result.status.success(),
+        "cross-Project task recovery: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let recovered: Value = serde_json::from_slice::<Value>(&result.stdout).unwrap();
+    assert_eq!(recovered["sandbox_ref"], candidate.1);
+    let replay = cross_rpc(&absent, &[pending]);
+    let snapshot = reply(&replay, "cross-pending", "response");
+    assert_eq!(snapshot["agent"]["ref"], recovered["ref"]);
+    assert_eq!(snapshot["agent"]["project"], destination_project);
+    assert_eq!(snapshot["agent"]["admission"], "held");
+    let store = open();
+    let queue = store.actor_queue_list(&actor, &candidate.0).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].state, aw_store::QueueState::Pending);
+    assert_eq!(
+        fs::read(cross_pending_root.join("code/tracked")).unwrap(),
+        b"captured dirty version"
+    );
     drop(store);
 
     // Qualify actual offline recovery, not only terminal replay. The

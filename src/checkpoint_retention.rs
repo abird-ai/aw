@@ -785,7 +785,7 @@ mod tests {
             )
             .is_err());
         assert!(restore_port(&store, restore_path.clone())
-            .restore("task", json!({"id":fresh.id,"task":"must not activate"}))
+            .restore("task", json!({"id":fresh.id,"task":""}))
             .is_err());
         assert!(restore_port(&store, restore_path.clone())
             .restore("inherit", json!({"id":fresh.id,"access":"inherit"}))

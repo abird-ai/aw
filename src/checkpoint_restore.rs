@@ -34,6 +34,10 @@ pub(crate) struct Args {
     /// Optional destination Agent title, part of the original request.
     #[arg(long = "session-title")]
     title: Option<String>,
+    /// Exact canonical destination Project; must match the private approval.
+    /// Omit for the checkpoint source Project.
+    #[arg(long = "agent-project")]
+    project: Option<String>,
     /// Read the optional exact initial task from stdin (UTF-8, up to 64 KiB).
     /// For recovery/abandonment supply the original task bytes, not a new task.
     /// A restored source-bearing Agent remains held; this never runs the task.
@@ -62,6 +66,10 @@ struct Config {
     store_generation: u64,
     manager: PrincipalId,
     checkpoint: String,
+    // Absence retains the original source-Project-only approval semantics.
+    // An explicit selection authorizes this exact destination and no other.
+    #[serde(default)]
+    destination_project: Option<String>,
     binding: SessionBinding,
     destination_identity: (u64, u64),
     repositories: Vec<GitSourceLocation>,
@@ -77,16 +85,20 @@ impl Approval {
     fn open(
         store: &SessionStore,
         actor: &PrincipalId,
-        checkpoint: &str,
+        request: &CheckpointRestoreRequest,
         path: &Path,
     ) -> Result<Self> {
         let directory = path
             .parent()
             .ok_or(Error::Denied("restore approval directory required"))?;
         let (lease, mut config): (_, Config) = open_private_approval(path)?;
-        if config.version != 1 || &config.manager != actor || config.checkpoint != checkpoint {
+        if config.version != 1
+            || &config.manager != actor
+            || config.checkpoint != request.checkpoint
+            || config.destination_project != request.project
+        {
             return Err(Error::Denied(
-                "restore approval differs from host manager or checkpoint",
+                "restore approval differs from host manager, checkpoint or destination Project",
             ));
         }
         require_store_scope(
@@ -95,6 +107,20 @@ impl Approval {
             &config.store_id,
             config.store_generation,
         )?;
+        // First cross-Project host cut: one Domain and Store, private
+        // destination. History Share, destination writer/owner, and exact
+        // canonical Project validation remain with the original Store
+        // constructor before planning and again at publication.
+        if let Some(project) = &config.destination_project {
+            let checkpoint = store.checkpoint_get_metadata(actor, &request.checkpoint)?;
+            let domain = checkpoint
+                .source_agent_ref
+                .split_once("/i:")
+                .map(|(d, _)| d);
+            if domain.is_none() || project.split_once("/i:").map(|(d, _)| d) != domain {
+                return Err(Error::Denied("cross-Domain captured restore unavailable"));
+            }
+        }
         require_named_destination(
             &config.binding.tool_root,
             &config.binding.working_directory,
@@ -150,9 +176,9 @@ impl Approval {
 }
 
 fn require_offline_request(request: &CheckpointRestoreRequest) -> Result<()> {
-    if request.project.is_some() || request.access != AgentHistoryForkAccess::Private {
+    if request.access != AgentHistoryForkAccess::Private {
         return Err(Error::Denied(
-            "offline captured restore requires same-Project private construction",
+            "offline captured restore requires private construction",
         ));
     }
     Ok(())
@@ -176,7 +202,7 @@ pub(crate) fn restore(
         Err(Error::Conflict(_)) if recover => (), // exact original owner checks again
         Err(error) => return Err(error),
     }
-    let approval = Approval::open(store, actor, &request.checkpoint, path)?;
+    let approval = Approval::open(store, actor, request, path)?;
     let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
     let host = GitCheckpointRestoreHost::new(store, &handle);
     if recover {
@@ -212,7 +238,7 @@ pub(crate) fn abandon(
     if store.checkpoint_replay_abandoned_captured_restore(actor, request, request_id)? {
         return Ok(());
     }
-    let approval = Approval::open(store, actor, &request.checkpoint, path)?;
+    let approval = Approval::open(store, actor, request, path)?;
     let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
     GitCheckpointRestoreHost::new(store, &handle).abandon_captured_exact(
         actor,
@@ -255,7 +281,7 @@ pub(crate) fn run(args: Args) -> Result<u8> {
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
     let request = CheckpointRestoreRequest {
         checkpoint: args.checkpoint,
-        project: None,
+        project: args.project,
         title: args.title,
         access: AgentHistoryForkAccess::Private,
         task,

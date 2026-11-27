@@ -66,8 +66,9 @@ pub(crate) struct Approvals {
     /// Private git-native.json directory independently authorizing Git capture.
     #[arg(long = "checkpoint-capture-root", requires = "rpc_actor_owner")]
     pub checkpoint_capture_root: Option<PathBuf>,
-    /// Private exact captured-source restore approval. Optional initial task
-    /// is held until independently authorized source execution is opened.
+    /// Private exact captured-source restore approval for the current
+    /// destination Project. Optional initial task remains held until
+    /// independently authorized source execution is opened.
     #[arg(
         long = "checkpoint-restore-approval",
         requires = "rpc_actor_owner",
@@ -198,9 +199,14 @@ pub(super) struct RestorePort {
 impl CheckpointRestorePort for RestorePort {
     fn restore(&self, request_id: &str, params: Value) -> Result<Value> {
         let request = checkpoint_restore_request(&params)?;
-        if request.project.is_some() || request.access != AgentHistoryForkAccess::Private {
+        if request.access != AgentHistoryForkAccess::Private
+            || request
+                .project
+                .as_ref()
+                .is_some_and(|project| project != &self.state.current_project_ref)
+        {
             return Err(Error::Denied(
-                "captured restore requires default Project and private access",
+                "captured restore requires current destination Project and private access",
             ));
         }
         let id = Operation::CheckpointRestore.rpc_id(request_id);
@@ -211,16 +217,22 @@ impl CheckpointRestorePort for RestorePort {
         let result = match store.checkpoint_replay_restore(actor, &request, &id)? {
             Some(result) => result,
             None => {
-                let checkpoint = store.checkpoint_get_metadata(actor, &request.checkpoint)?;
-                if checkpoint
-                    .source_agent_ref
-                    .rsplit_once("/a:")
-                    .map(|(project, _)| project)
-                    != Some(self.state.current_project_ref.as_str())
-                {
-                    return Err(Error::Denied(
-                        "cross-Project checkpoint restore unavailable",
-                    ));
+                // An implicit destination still means the checkpoint's
+                // source Project, never the caller's current Project.
+                // Explicit destinations require an exact independent host
+                // approval and the original Store's history/Project checks.
+                if request.project.is_none() {
+                    let checkpoint = store.checkpoint_get_metadata(actor, &request.checkpoint)?;
+                    if checkpoint
+                        .source_agent_ref
+                        .rsplit_once("/a:")
+                        .map(|(project, _)| project)
+                        != Some(self.state.current_project_ref.as_str())
+                    {
+                        return Err(Error::Denied(
+                            "checkpoint source Project differs from current Project; explicit destination required",
+                        ));
+                    }
                 }
                 crate::checkpoint_restore::restore(
                     store,
@@ -234,7 +246,7 @@ impl CheckpointRestorePort for RestorePort {
         };
         if result.agent.project_ref != self.state.current_project_ref {
             return Err(Error::Denied(
-                "cross-Project checkpoint restore unavailable",
+                "checkpoint restore result differs from current destination Project",
             ));
         }
         bounded_source_metadata(serde_json::json!({

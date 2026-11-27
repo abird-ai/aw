@@ -35,7 +35,84 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: configured task-bearing captured-source restore
+## Latest local implementation delta — 2026-11-27: explicit cross-Project captured-source restore
+
+Parent `933398622c9b17b12e32bf6db53c09a2d1576257` (configured
+task-bearing captured restore), verified clean non-reserved entry.
+Published AW main remains `0f9807f4`, dotlink `85ceccc1`, frozen
+`576d0a1a`. L5 only; Store v61, product 0.15.0, Git recovery v4 unchanged.
+
+- The never-managed ambient first-source transition was investigated,
+  not promoted. Legacy activation creates native tools/Process/Job
+  runtime and a journal; the Store owner lock, held admission, Run
+  quiescence and registry ToolBindingAuthority revocation do not prove
+  all previously issued ambient adapter/external descendant handles
+  are permanently retired. Keep `observe_managed_in` refusal intact.
+  No effective capabilities/delegated writable cgroup on L5; no new
+  lifetime tracker or paper-only physical proof. Proceed with the
+  independent explicit cross-Project restore gate instead.
+- Same Store and Domain, private destination, complete original captured
+  SourceSet. Optional `destination_project` in private version-1 restore
+  approval must exactly equal the original literal request Project;
+  absence retains old implicit source-Project semantics. No approval
+  paths or authority supplied by RPC. `aw checkpoint-restore --agent-project`
+  selects an explicit canonical destination; omission keeps existing
+  fingerprint. A previous reader rejects unknown fields rather than
+  silently granting cross-Project access.
+- The explicit destination must be the authenticated RPC controller's
+  current Project, and source checkpoint remains its original immutable
+  owner. Implicit restore still requires source Project=current Project.
+  Reject wrong controller/destination before dispatch; exact Applied
+  replay requires current destination view, no approval reopening or
+  materialization. Original Store requires source View/Derive/Share
+  for cross-Project history, destination owner/Project writer and
+  manifest audience preflight before planning and in final publication;
+  original Git host independently pins actual repositories, retained
+  anchors, destination and complete physical layout through settlement.
+  Explicit cross-Domain restore refused before planning.
+- No new source grants, automatic activation or history/queue owner.
+  Optional task uses original encrypted InitialTask, semantic digest,
+  Prepared receipt and Pending publication. Exact destination remains
+  part of original recovery/abandonment semantics. Changed/missing
+  destination refuses; no context-selected rematerialization.
+- Extend existing actual executable fixture with two real Projects,
+  independent destination controller layout/approval, old-approval and
+  wrong-controller refusal, implicit and inherited-access refusal, exact
+  captured contents, held Agent, no task/grant when omitted, absent-
+  approval terminal RPC and CLI replay. Original cross-Project
+  task-bearing Prepared restore staged through Store/driver, fresh retry
+  refused, changed/missing Project rejected in offline recovery/abandon,
+  exact CLI inspection publishes original Sandbox and one Pending Input.
+  Actual separately created Domain and destination Project with valid
+  matching approval refuses cross-Domain CLI restore before any
+  materialization.
+- Fix stale taskless assertion in previous configured Git lifecycle
+  regression (empty task is invalid; valid initial task is now allowed).
+  No production changes outside the restore host adapter and CLI flags.
+
+Validation: L5 locked/offline configured CLI Git lifecycle 1/1
+(102.18s), stdin 1/1, namespace 1/1, Store checkpoint owner 4/4
+(2.70s), history owner 5/5 (2.33s), executable integration 2/2
+(47.54s final). All 14 distinct selected tests passed. Initial
+expanded executable 1/1 (64.58s), then final added actual cross-Domain
+refusal and reran both integrations. Strict aw-cli all-feature/
+all-target Clippy, durable/minimal all-target checks (existing
+profile dead-code warnings), executable CLI help and scoped
+rustfmt/diff checks passed. No full workspace, pinned Nix or other
+platform validation; five historical Store failures not rerun.
+
+Scope/next: same-Domain cross-Project private captured restore with
+explicit host approval is qualified, not cross-Domain, participant/
+shared source execution, inherit/custom ACL host route or implicit
+destination switching. Physical Process containment/never-managed
+ambient first-source transition still require genuine permanent
+authority retirement. Next independent gate: task-bearing configured
+empty-baseline restore or broader protected Views/manifest transfer.
+Semantic dependency-bearing registry replacement, extension and physical
+cleanup gates remain. No full workspace/other-platform claim. Phase 3
+underway; no push, repin, UX or frozen Sandbox changes.
+
+## Previous local implementation delta — 2026-11-27: configured task-bearing captured-source restore
 
 Parent `1f5ff72ebd61361218a2459a54ff57790500296f` (actual
 maintenance/constructor executable gate); independently verified signature
