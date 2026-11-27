@@ -39,6 +39,7 @@ mod source_metadata;
 mod source_retention_rpc;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
+mod view_projection;
 // Opt-in host-only Actor/child services. 9C gates authenticated stdio
 // owner operations behind an explicit exact durable Session selection.
 #[allow(dead_code)]
@@ -4243,19 +4244,10 @@ impl aw::headless::AgentStatePort for StdioAgentStatePort {
                 }))
             }
             "agent_get" => {
-                if let Some(include) = params.get("include") {
-                    let include = include
-                        .as_array()
-                        .ok_or(Error::Protocol("agent_get include must be an array"))?;
-                    if !include.is_empty() {
-                        return Err(Error::Protocol(
-                            "agent_get extension views are not available on this core state port",
-                        ));
-                    }
-                }
+                let names = view_projection::include(&params, false)?;
                 let reference = self.current_or_canonical_ref(&params, false)?;
                 let snapshot = self.store.agent_get(&self.caller, &reference)?;
-                Ok(agent_snapshot_value(&snapshot))
+                view_projection::append(agent_snapshot_value(&snapshot), &names, &())
             }
             "agent_edit" => {
                 let reference = self.current_or_canonical_ref(&params, true)?;
@@ -4436,12 +4428,7 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
             }
             Ok(())
         };
-        let approval = self
-            .source_metadata
-            .as_ref()
-            .map(|file| file.read(&self.store, &self.caller, &self.current_project_ref))
-            .transpose()?;
-        let value = match method {
+        match method {
             "checkpoint_list" => {
                 let reference = self.current_or_canonical_ref(&params, false)?;
                 require_project(&reference)?;
@@ -4461,69 +4448,73 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
                             .ok_or(Error::Protocol("checkpoint cursor must be a string"))
                     })
                     .transpose()?;
-                let items = if let Some(approval) = &approval {
+                let snapshots =
                     self.store
-                        .checkpoint_list_with_source_metadata(
+                        .checkpoint_list_metadata(&self.caller, &reference, cursor, limit)?;
+                let next_cursor = (snapshots.len() == limit)
+                    .then(|| snapshots.last().map(|item| item.id.as_str()))
+                    .flatten();
+                let core = bounded_source_metadata(serde_json::json!({
+                    "ref": reference,
+                    "items": snapshots.iter().map(checkpoint_snapshot_value).collect::<Vec<_>>(),
+                    "next_cursor": next_cursor,
+                }))?;
+                // The existing optional inline identity projection is best
+                // effort. Never replace the authorized core page with an
+                // approval error or a page read at a different revision.
+                if let Some(file) = &self.source_metadata {
+                    if let Ok(approval) =
+                        file.read(&self.store, &self.caller, &self.current_project_ref)
+                    {
+                        if let Ok(views) = self.store.checkpoint_list_with_source_metadata(
                             &self.caller,
                             &reference,
                             cursor,
                             limit,
                             approval.policy(),
-                        )?
-                        .into_iter()
-                        .map(|view| {
-                            let mut value = checkpoint_snapshot_value(&view.snapshot);
-                            enrich_source_metadata(&mut value, &view.disclosed)?;
-                            Ok(value)
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                } else {
-                    self.store
-                        .checkpoint_list_metadata(&self.caller, &reference, cursor, limit)?
-                        .iter()
-                        .map(checkpoint_snapshot_value)
-                        .collect()
-                };
-                let next_cursor = (items.len() == limit)
-                    .then(|| items.last().and_then(|item| item["id"].as_str()))
-                    .flatten();
-                serde_json::json!({
-                    "ref": reference,
-                    "items": items,
-                    "next_cursor": next_cursor,
-                })
-            }
-            "checkpoint_get" => {
-                if let Some(include) = params.get("include") {
-                    if !include.as_array().is_some_and(Vec::is_empty) {
-                        return Err(Error::Protocol(
-                            "checkpoint extension views unavailable on metadata port",
-                        ));
+                        ) {
+                            if views.iter().map(|view| &view.snapshot).eq(snapshots.iter()) {
+                                let mut enriched = core.clone();
+                                let items = enriched["items"].as_array_mut().expect("core page");
+                                if items.iter_mut().zip(&views).all(|(item, view)| {
+                                    enrich_source_metadata(item, &view.disclosed).is_ok()
+                                }) {
+                                    if let Ok(enriched) = bounded_source_metadata(enriched) {
+                                        return Ok(enriched);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                Ok(core)
+            }
+            "checkpoint_get" => {
+                let names = view_projection::include(&params, false)?;
                 let id = params
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or(Error::Protocol("checkpoint_get id must be a string"))?;
-                if let Some(approval) = &approval {
-                    let view = self.store.checkpoint_get_with_source_metadata(
-                        &self.caller,
-                        id,
-                        approval.policy(),
-                    )?;
-                    require_project(&view.snapshot.source_agent_ref)?;
-                    let mut value = checkpoint_snapshot_value(&view.snapshot);
-                    enrich_source_metadata(&mut value, &view.disclosed)?;
-                    value
-                } else {
-                    let snapshot = self.store.checkpoint_get_metadata(&self.caller, id)?;
-                    require_project(&snapshot.source_agent_ref)?;
-                    checkpoint_snapshot_value(&snapshot)
+                let snapshot = self.store.checkpoint_get_metadata(&self.caller, id)?;
+                require_project(&snapshot.source_agent_ref)?;
+                view_projection::SourceViewContext {
+                    store: &self.store,
+                    actor: &self.caller,
+                    project: &self.current_project_ref,
+                    approval: self.source_metadata.as_deref(),
                 }
+                .render(
+                    &snapshot,
+                    checkpoint_snapshot_value(&snapshot),
+                    &names,
+                    |approval| {
+                        self.store
+                            .checkpoint_get_with_source_metadata(&self.caller, id, approval)
+                    },
+                )
             }
-            _ => return Err(Error::Protocol("unsupported checkpoint metadata operation")),
-        };
-        bounded_source_metadata(value)
+            _ => Err(Error::Protocol("unsupported checkpoint metadata operation")),
+        }
     }
 }
 
@@ -4679,53 +4670,24 @@ impl aw::headless::SandboxPort for StdioSandboxPort {
                     .get("ref")
                     .and_then(serde_json::Value::as_str)
                     .ok_or(Error::Protocol("sandbox_get ref must be a string"))?;
-                match params.get("include") {
-                    None => (),
-                    Some(value) => {
-                        let include = value
-                            .as_array()
-                            .ok_or(Error::Protocol("sandbox_get include must be an array"))?;
-                        let mut sources = false;
-                        for item in include {
-                            match item.as_str() {
-                                Some("sources") if !sources => sources = true,
-                                Some("sources") => {
-                                    return Err(Error::Protocol(
-                                        "sandbox_get include contains duplicate sources",
-                                    ))
-                                }
-                                _ => {
-                                    return Err(Error::Protocol(
-                                        "sandbox_get include supports only sources",
-                                    ))
-                                }
-                            }
-                        }
-                    }
-                };
-                let approval = self
-                    .source_metadata
-                    .as_ref()
-                    .map(|file| file.read(&self.store, &self.caller, &self.current_project_ref))
-                    .transpose()?;
-                let (snapshot, disclosed) = if let Some(approval) = &approval {
-                    let view = self.store.sandbox_get_with_source_metadata(
-                        &self.caller,
-                        reference,
-                        approval.policy(),
-                    )?;
-                    (view.snapshot, view.disclosed)
-                } else {
-                    (self.store.sandbox_get(&self.caller, reference)?, Vec::new())
-                };
+                let names = view_projection::include(&params, true)?;
+                let snapshot = self.store.sandbox_get(&self.caller, reference)?;
                 self.require_current_project(&snapshot)?;
-                let mut value = if method == "sandbox_sources_list" {
+                let value = if method == "sandbox_sources_list" {
                     serde_json::json!({"ref":snapshot.canonical_ref, "rev":snapshot.rev, "sources":sandbox_sources_value(&snapshot)})
                 } else {
                     sandbox_snapshot_value(&snapshot, true)
                 };
-                enrich_source_metadata(&mut value, &disclosed)?;
-                bounded_source_metadata(value)
+                view_projection::SourceViewContext {
+                    store: &self.store,
+                    actor: &self.caller,
+                    project: &self.current_project_ref,
+                    approval: self.source_metadata.as_deref(),
+                }
+                .render(&snapshot, value, &names, |approval| {
+                    self.store
+                        .sandbox_get_with_source_metadata(&self.caller, reference, approval)
+                })
             }
             "sandbox_close" => {
                 let reference = params
@@ -9135,12 +9097,23 @@ mod phase54_cli_tests {
         assert_eq!(read["history_head"], first.history_head);
         assert_eq!(read["source_coverage"], "none");
         assert_eq!(read["sources"], json!([]));
-        assert!(CheckpointReadPort::apply(
+        let included = CheckpointReadPort::apply(
             &port,
             "checkpoint_get",
-            json!({"id":first.id,"include":["raw"]})
+            json!({"id":first.id,"include":["raw","aw.source_metadata"]}),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            included["extensions"]["raw"],
+            json!({"status":"error","code":"unknown"})
+        );
+        assert_eq!(
+            included["extensions"]["aw.source_metadata"],
+            json!({"status":"error","code":"denied"})
+        );
+        let mut core = included;
+        core.as_object_mut().unwrap().remove("extensions");
+        assert_eq!(core, read);
         // Unrelated Store caller and cross-Project redirects remain denied.
         let denied = StdioAgentStatePort {
             store: store.clone(),

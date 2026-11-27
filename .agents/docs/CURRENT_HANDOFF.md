@@ -35,7 +35,79 @@ records since `7ea0980`, the entire preceding handoff verbatim, and the
 exact signed implementation TODO. Current pointers only; no new source
 change or broader phase qualification in this documentation cut.
 
-## Latest local implementation delta — 2026-11-27: configured task-only empty-baseline restore
+## Latest local implementation delta — 2026-11-27: typed protected View leaf and resilient resource reads
+
+Parent `386d8772cc1d42241ca5ad3a222fd8528fbc5821` (configured
+empty-baseline tasks); clean non-reserved entry. Published AW main
+`0f9807f4`, dotlink `85ceccc1`, frozen `576d0a1a` unchanged.
+L5 only; Store v61, product 0.15.0, Git recovery v4 unchanged.
+
+- SPEC §§25.6–25.7: add the first final typed ViewRegistry leaf in
+  aw-agent-core, reusing StagedRegistry, NativeDefinition and the
+  existing immutable publication reader. Typed View<Resource, Query,
+  Output> registration/lookup, optional wire codec, exact registry
+  and revision handle, bounded names/results, CAS publication and
+  quiescent removal. No Store, grant, resource ownership or model
+  admission in the definition registry. Native values need not
+  serialize; wire adaptation occurs only at the presentation boundary.
+- Configured stdio agent_get, sandbox_get and checkpoint_get accept
+  bounded unique include names. Valid unknown names produce per-View
+  `extensions[name]={status:"error",code:"unknown"}`, not a failed
+  resource read. Preserve old Sandbox `sources` core selector.
+  Malformed/duplicate include remains a protocol error. Preserve
+  core frame bound and reserve bounded errors for all requested Views
+  before admitting results; oversized View output fails independently.
+- First actual typed consumer `aw.source_metadata` on Sandbox and
+  Checkpoint get: authorized core read first, then existing independent
+  private metadata approval and Store exact source identity projection.
+  Recheck exact snapshot equality, current actor/Project/Store and
+  retained anchor/binding decision; hold original approval lease
+  through result encoding. Only explicitly approved opaque source
+  identity/version values; no raw path, retention/recovery descriptor,
+  materialization, provider secret or grant. Missing/stale selection
+  denied, unavailable lease/read or changed snapshot isolated. No
+  independent approval => denied. Agent has no such source View.
+- Preserve existing configured legacy inline identity output when the
+  explicit source View is not requested; the requested View returns
+  identities only under extensions, never duplicates the core. Legacy
+  optional source enrichment failure falls back to redacted core;
+  checkpoint_list also reads authorized core page first and requires
+  exact same page before enrichment. Explicit initial invalid host
+  approval configuration still fails startup, not a weaker trust input.
+- Test staged typed/native/wire lifecycle, cross-registry/stale handles,
+  quiescent removal, bounded individual and total frame failure,
+  actual core ACL and configured protected View success/missing/denied/
+  stale/locked cases in Store-backed host regression and actual
+  compiled stdio subprocess. No new runtime/source authority, schema,
+  history or effect path.
+
+Validation: L5 locked/offline: typed View registry 1/1, bounded host
+projection 1/1 (0.25s), CLI metadata/restore 1/1 (0.68s),
+configured Git lifecycle 1/1 (101.51s), actual native-source
+executable pair 2/2 (46.96s). All six distinct selected tests
+passed. The initial CLI unit compile caught a moved fixture value
+and an unused import; corrected and reran. Strict all-feature/
+all-target Clippy for aw-agent-core and aw-cli passed; durable
+and minimal all-target checks passed with existing profile-specific
+dead-code warnings. Scoped rustfmt/diff checks passed. Previously
+qualified opt-in empty-baseline SQLite fault fixture and five
+historical Store failures not rerun.
+
+Scope/next: fixed trusted host definition installation, first read-only
+protected metadata consumer. Full root ExtensionRegistry composition,
+additional typed Resource kinds/product Views, arbitrary extension
+loading, schema-pinned wire queries and any View admission into model
+or durable context remain independent work. No View output admitted to
+history/model context here. Legacy protected archive/workspace export
+and context transfer retain existing fail-closed gates; next implement
+manifest-preserving same-authority transfer using the original
+DisclosureManifest and history/share owners, not portable authority
+inference. Physical Process containment and never-managed ambient
+first-source authority retirement still blocked by L5. No full
+workspace/other-platform claim, no push/repin/UX/frozen changes.
+Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: configured task-only empty-baseline restore
 
 Parent `1135f256fac232552ea241431b9bcbc8c79d7461` (explicit cross-Project
 captured restore); independently verified signature and exact non-reserved

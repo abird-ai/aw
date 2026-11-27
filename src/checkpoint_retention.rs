@@ -464,14 +464,14 @@ mod tests {
             )
             .unwrap(),
         );
+        let sandbox_port = |store: &SessionStore, approval: bool| crate::StdioSandboxPort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_project_ref: project.clone(),
+            source_metadata: approval.then(|| metadata.clone()),
+        };
         let metadata_sandbox = |store: &SessionStore, approval: bool, method: &str| {
-            crate::StdioSandboxPort {
-                store: store.clone(),
-                caller: actor.clone(),
-                current_project_ref: project.clone(),
-                source_metadata: approval.then(|| metadata.clone()),
-            }
-            .apply(method, json!({"ref":sandbox.canonical_ref}))
+            sandbox_port(store, approval).apply(method, json!({"ref":sandbox.canonical_ref}))
         };
         let metadata_checkpoint =
             |store: &SessionStore, approval: bool, method: &str, params: serde_json::Value| {
@@ -524,6 +524,49 @@ mod tests {
             assert!(!encoded.contains("refs/aw/checkpoints/"));
             assert!(!encoded.contains("layout_digest"));
         }
+        let included = || json!(["aw.source_metadata", "fixture.missing"]);
+        let view_checkpoint = |store: &SessionStore, approval: bool| {
+            metadata_checkpoint(
+                store,
+                approval,
+                "checkpoint_get",
+                json!({"id":fresh.id,"include":included()}),
+            )
+        };
+        let view_sandbox = |store: &SessionStore, approval: bool| {
+            sandbox_port(store, approval).apply(
+                "sandbox_get",
+                json!({"ref":sandbox.canonical_ref,"include":included()}),
+            )
+        };
+        let core = |mut value: serde_json::Value| {
+            value.as_object_mut().unwrap().remove("extensions");
+            value
+        };
+        let protected_view =
+            |value: &serde_json::Value| value["extensions"]["aw.source_metadata"].clone();
+        for (value, expected, baseline) in [
+            (
+                view_sandbox(&store, true).unwrap(),
+                binding_identity,
+                redacted.clone(),
+            ),
+            (
+                view_checkpoint(&store, true).unwrap(),
+                anchor_identity.clone(),
+                get_checkpoint(&store, false, &fresh.id).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                protected_view(&value),
+                json!({"status":"ok","value":[expected]})
+            );
+            assert_eq!(
+                value["extensions"]["fixture.missing"],
+                json!({"status":"error","code":"unknown"})
+            );
+            assert_eq!(core(value), baseline);
+        }
         let mut wrong = metadata_config.clone();
         wrong["policy"]["sources"][0]["binding_rev"] = json!(sandbox.sources[0].binding_rev + 1);
         wrong["policy"]["sources"][1]["source"]["version"] = json!(head);
@@ -541,14 +584,39 @@ mod tests {
         let mut wrong = metadata_config.clone();
         wrong["policy"]["actor_user_id"] = json!("another-user");
         fs::write(&metadata_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
-        assert!(get_checkpoint(&store, true, &fresh.id).is_err());
+        assert_eq!(
+            get_checkpoint(&store, true, &fresh.id).unwrap(),
+            get_checkpoint(&store, false, &fresh.id).unwrap()
+        );
+        let denied = view_checkpoint(&store, true).unwrap();
+        assert_eq!(
+            protected_view(&denied),
+            json!({"status":"error","code":"denied"})
+        );
+        assert_eq!(
+            core(denied),
+            get_checkpoint(&store, false, &fresh.id).unwrap()
+        );
+        assert_eq!(
+            metadata_checkpoint(&store, true, "checkpoint_list", json!({"limit":16})).unwrap(),
+            metadata_checkpoint(&store, false, "checkpoint_list", json!({"limit":16})).unwrap()
+        );
         fs::write(
             &metadata_path,
             serde_json::to_vec(&metadata_config).unwrap(),
         )
         .unwrap();
         let held = lock_private_approval(&metadata_path).unwrap();
-        assert!(metadata_sandbox(&store, true, "sandbox_get").is_err());
+        assert_eq!(
+            metadata_sandbox(&store, true, "sandbox_get").unwrap(),
+            redacted
+        );
+        let locked = view_sandbox(&store, true).unwrap();
+        assert_eq!(
+            protected_view(&locked),
+            json!({"status":"error","code":"unavailable"})
+        );
+        assert_eq!(core(locked), redacted);
         drop(held);
         assert_eq!(
             store.sandbox_grant_status(&actor, agent_ref).unwrap(),

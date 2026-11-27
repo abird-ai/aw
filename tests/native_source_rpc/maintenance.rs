@@ -481,7 +481,88 @@ fn configured_construction_and_retention_stdio_use_original_owners() {
         store.agent_get(&actor, &source.canonical_ref).unwrap(),
         source
     );
+
+    // Protected Views use the real current Store snapshot and the
+    // independently selected metadata authority, never raw locators.
+    let metadata_path = approvals.join("metadata.json");
+    let binding_identity = json!({"name":name,"driver":binding.driver,
+        "schema":binding.binding_schema,"source_ref":binding.source_ref});
+    let anchor_identity = json!({"name":name,"driver":anchor.driver,
+        "schema":anchor.anchor_schema,"source_ref":anchor.source_ref,"version":anchor.identity});
+    let metadata_config = json!({"version":1,"store_directory":state,"policy":{
+        "store_id":store.store_id().unwrap(),
+        "store_generation":store.local_process_info().unwrap().store_generation,
+        "actor":actor,"actor_user_id":store.current_user(&actor).unwrap().user_id,
+        "project":project,"sources":[
+            {"kind":"binding","sandbox":parent.canonical_ref,"sandbox_rev":parent.rev,
+             "binding_rev":parent.sources[0].binding_rev,"source":binding_identity},
+            {"kind":"anchor","checkpoint":checkpoint,"source":anchor_identity}
+        ]
+    }});
+    write_private(&metadata_path, &metadata_config);
     drop(store);
+    let requested_views = json!(["aw.source_metadata", "fixture.unknown"]);
+    let view_requests = [
+        frame(
+            "view-sandbox",
+            "sandbox_get",
+            json!({"ref":parent.canonical_ref,"include":requested_views}),
+        ),
+        frame(
+            "view-checkpoint",
+            "checkpoint_get",
+            json!({"id":checkpoint,"include":requested_views}),
+        ),
+        frame(
+            "view-agent",
+            "agent_get",
+            json!({"ref":controller_ref,"include":["fixture.unknown"]}),
+        ),
+        frame(
+            "unreadable",
+            "checkpoint_get",
+            json!({"id":"cp_unavailable","include":requested_views}),
+        ),
+    ];
+    let redacted_views = invoke(&[], &[], &view_requests);
+    let visible_views = invoke(
+        &[("--agent-source-metadata-approval", &metadata_path)],
+        &[],
+        &view_requests,
+    );
+    let core = |mut value: Value| {
+        value.as_object_mut().unwrap().remove("extensions");
+        value
+    };
+    for (id, expected) in [
+        ("view-sandbox", binding_identity),
+        ("view-checkpoint", anchor_identity),
+    ] {
+        let redacted = reply(&redacted_views, id, "response");
+        let visible = reply(&visible_views, id, "response");
+        assert_eq!(
+            redacted["extensions"]["aw.source_metadata"],
+            json!({"status":"error","code":"denied"})
+        );
+        assert_eq!(
+            visible["extensions"]["aw.source_metadata"],
+            json!({"status":"ok","value":[expected]})
+        );
+        assert_eq!(
+            visible["extensions"]["fixture.unknown"],
+            json!({"status":"error","code":"unknown"})
+        );
+        assert_eq!(core(visible.clone()), core(redacted.clone()));
+        require_redacted(&core(visible.clone()));
+        assert!(!visible.to_string().contains(&binding.materialization));
+        assert!(!visible.to_string().contains(&retention_ref));
+    }
+    assert_eq!(
+        reply(&visible_views, "view-agent", "response")["extensions"]["fixture.unknown"],
+        json!({"status":"error","code":"unknown"})
+    );
+    reply(&redacted_views, "unreadable", "error");
+    reply(&visible_views, "unreadable", "error");
     let baseline = SourceSet {
         coverage: SourceCoverage::Selected,
         anchors: vec![anchor.clone()],

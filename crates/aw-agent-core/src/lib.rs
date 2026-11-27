@@ -38,6 +38,7 @@ pub mod sandbox_driver;
 pub mod source_driver;
 pub mod tool;
 pub mod vault_provider;
+pub mod view;
 
 pub use accounts::{
     AccountDescriptor, AccountOwner, BillingOwner, CredentialCustody, InvocationIdentity,
@@ -104,6 +105,9 @@ pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,
     ToolFuture, ToolOutput, ToolParallelism, ToolPolicy, ToolPolicyLifecycle, ToolRecord,
     ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
+};
+pub use view::{
+    View, ViewDescriptor, ViewFailure, ViewHandle, ViewOutcome, ViewRegistry, ViewRegistryReader,
 };
 
 pub use vault_provider::{
