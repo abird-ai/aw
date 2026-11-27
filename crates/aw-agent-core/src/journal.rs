@@ -97,6 +97,9 @@ pub struct AuthoritySegmentEvidence {
     pub causal_root: String,
     pub membership_epoch: u64,
     pub audience_epoch: u64,
+    /// Historical segments lack this pin; readable, never fresh authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_generation: Option<[u8; 32]>,
     pub provider_model_ceiling_ref: String,
     pub tool_envelope_ref: String,
     pub disclosure_projection_ref: String,
@@ -151,6 +154,7 @@ impl AuthoritySegmentEvidence {
             || !bounded(&self.disclosure_projection_ref, 512)
             || self.membership_epoch == 0
             || self.audience_epoch == 0
+            || self.access_generation == Some([0; 32])
             || self.context_fingerprint == [0; 32]
         {
             return Err(crate::Error::Denied(
@@ -172,7 +176,8 @@ pub struct AuthoritySegment {
     pub boundary_id: String,
     pub fingerprint: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<AuthoritySegmentEvidence>,
+    // Participant-only evidence stays off the common owner-only segment.
+    pub evidence: Option<Box<AuthoritySegmentEvidence>>,
 }
 
 impl AuthoritySegment {

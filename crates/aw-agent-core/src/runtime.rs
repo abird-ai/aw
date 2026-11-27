@@ -1183,6 +1183,10 @@ impl HostRuntime {
             }
             hash.update(evidence.membership_epoch.to_be_bytes());
             hash.update(evidence.audience_epoch.to_be_bytes());
+            if let Some(generation) = evidence.access_generation {
+                hash.update(b"agent-access-generation\0");
+                hash.update(generation);
+            }
             hash.update(evidence.context_fingerprint);
         }
         let payload = message.payload.as_bytes();
@@ -1193,7 +1197,7 @@ impl HostRuntime {
             boundary: crate::AuthorityBoundaryKind::Input,
             boundary_id: format!("input:{}:{}", message.id, message.source_sequence),
             fingerprint: hash.finalize().into(),
-            evidence,
+            evidence: evidence.map(Box::new),
         };
         segment.validate()?;
         Ok(segment)
@@ -1300,6 +1304,17 @@ impl HostRuntime {
         &mut self,
         request: AuthorityUpdateRequest<'_>,
     ) -> Result<crate::AuthoritySegment> {
+        self.admit_authority_update_committed(request, |segment| Ok(segment.clone()))
+    }
+
+    /// The caller owns the same exclusive Runtime lock through durable
+    /// acceptance and the pending-segment publication. On rejection no
+    /// pending update is visible, even to a concurrent Step consumer.
+    pub(crate) fn admit_authority_update_committed<R>(
+        &mut self,
+        request: AuthorityUpdateRequest<'_>,
+        commit: impl FnOnce(&crate::AuthoritySegment) -> Result<R>,
+    ) -> Result<R> {
         let AuthorityUpdateRequest {
             principal,
             key,
@@ -1343,7 +1358,7 @@ impl HostRuntime {
         let segment_evidence = match replacement_evidence {
             Some(evidence) => {
                 evidence.validate()?;
-                Some(evidence)
+                Some(Box::new(evidence))
             }
             None => active.authority_segment.evidence.clone(),
         };
@@ -1402,14 +1417,15 @@ impl HostRuntime {
             evidence: segment_evidence,
         };
         segment.validate()?;
-
+        let update = crate::control::AuthorityUpdate {
+            segment,
+            input: input.to_owned(),
+        };
+        let accepted = commit(&update.segment)?;
         let record = self.agents.get_mut(&key).expect("verified Actor");
         let active = record.active.as_mut().expect("checked active Turn");
-        active.pending_authority_update = Some(crate::control::AuthorityUpdate {
-            segment: segment.clone(),
-            input: input.to_owned(),
-        });
-        Ok(segment)
+        active.pending_authority_update = Some(update);
+        Ok(accepted)
     }
 
     pub(crate) fn admit_authority_steer(

@@ -569,7 +569,7 @@ impl Service {
                 "participant action requires exact current collaboration/provider authority",
             ));
         }
-        self.store.authorize_participant_model_context(
+        let access_generation = self.store.authorize_participant_model_context(
             participant,
             &self.session,
             &branch.id,
@@ -589,7 +589,7 @@ impl Service {
         let identity_json = serde_json::to_vec(selected.identity())
             .map_err(|_| Error::Protocol("cannot fingerprint participant provider identity"))?;
         let mut context = Sha256::new();
-        context.update(b"aw-shared-session-context-v1\0");
+        context.update(b"aw-shared-session-context-v2\0");
         for part in [
             self.session.as_bytes(),
             self.branch.as_bytes(),
@@ -609,6 +609,7 @@ impl Service {
         context.update(turn_id.to_be_bytes());
         context.update(participation.membership_epoch.to_be_bytes());
         context.update(participation.audience_epoch.to_be_bytes());
+        context.update(access_generation);
         let context_fingerprint: [u8; 32] = context.finalize().into();
 
         let mut causal = Sha256::new();
@@ -648,6 +649,7 @@ impl Service {
             identity: selected.identity().clone(),
             membership_epoch: participation.membership_epoch,
             audience_epoch: participation.audience_epoch,
+            access_generation: Some(access_generation),
             causal_root,
             payer_ref,
             provider_model_ceiling_ref,
@@ -938,52 +940,42 @@ impl Service {
             text,
         )?;
         let evidence = participant.authority_segment_evidence()?;
-        let staged = match boundary {
-            aw_agent_core::AuthorityBoundaryKind::Steer => self
-                .controller
-                .admit_authority_steer_with_evidence(turn_id, request_id, text, evidence),
-            aw_agent_core::AuthorityBoundaryKind::Interrupt => self
-                .controller
-                .admit_authority_interrupt_with_evidence(turn_id, request_id, text, evidence),
-            aw_agent_core::AuthorityBoundaryKind::Input => unreachable!("checked above"),
-        };
-        let segment = match staged {
-            Ok(segment) => segment,
-            Err(error) => {
-                let _ = self.store.authority_steer_reject_prepared(
-                    &self.owner,
-                    &prepared,
-                    "live Runtime rejected participant Control before admission",
-                );
-                return Err(error);
-            }
-        };
-        match self
-            .store
-            .authority_steer_accept(&self.owner, &prepared, &segment)
-        {
+        match self.controller.admit_committed_authority_update(
+            turn_id,
+            boundary,
+            request_id,
+            text,
+            evidence,
+            |segment| {
+                self.store
+                    .authority_steer_accept(&self.owner, &prepared, segment)
+            },
+        ) {
             Ok(accepted) => Ok(accepted),
             Err(error) => {
-                let withdrawn = self.controller.discard_authority_steer(
-                    turn_id,
-                    request_id,
-                    segment.fingerprint,
-                );
-                if withdrawn.is_ok() {
-                    let _ = self.store.authority_steer_reject_prepared(
+                // The Runtime did not publish this update. If the original
+                // acceptance transaction itself had an ambiguous outcome,
+                // keep the factual receipt for explicit inspection.
+                if self
+                    .store
+                    .authority_steer_reject_prepared(
                         &self.owner,
                         &prepared,
-                        "durable participant Control accept failed; Runtime update withdrawn",
-                    );
-                } else {
-                    if let Ok(mut state) = self.state.lock() {
-                        state.poisoned = true;
+                        "participant Control failed before Runtime publication",
+                    )
+                    .is_err()
+                {
+                    if let Ok(current) =
+                        self.store
+                            .authority_steer_fact(&self.owner, &self.session, request_id)
+                    {
+                        if current.state == AuthoritySteerState::Accepted {
+                            let _ = self.store.authority_steer_mark_unknown(
+                                &self.owner, &current,
+                                "participant Control acceptance outcome uncertain; Runtime update not published",
+                            );
+                        }
                     }
-                    let _ = self.store.authority_steer_mark_unknown(
-                        &self.owner,
-                        &prepared,
-                        "durable participant Control accept failed and withdrawal was uncertain",
-                    );
                 }
                 Err(error)
             }
@@ -3402,19 +3394,7 @@ impl Service {
                         "participant Input provider is fixed by its durable admission",
                     ));
                 }
-                let current_participation = self.store.authorize_session_participation(
-                    &participant.actor,
-                    &self.session,
-                    SessionParticipationAction::Submit,
-                )?;
-                if current_participation.owner
-                    || current_participation.membership_epoch != participant.membership_epoch
-                    || current_participation.audience_epoch != participant.audience_epoch
-                {
-                    return Err(Error::Denied(
-                        "participant Submit/audience authority changed before Turn claim",
-                    ));
-                }
+                self.store.revalidate_participant_input(&admission)?;
                 Ok(Some(
                     agent
                         .provider_accounts()
@@ -3656,12 +3636,125 @@ mod tests {
             .select(&bob, "revoked-bob-account", "model")
             .unwrap();
 
+        assert!(f
+            .owner
+            .submit_participant_text(&f.agent, &bob, &selected, "legacy Session permission alone")
+            .is_err());
+        let permissions = aw_store::SessionParticipationPermissions {
+            view: true,
+            submit: true,
+            ..Default::default()
+        };
+        let branch = f.owner.branch.clone();
+        let group = f
+            .store
+            .create_principal_group(
+                &alice,
+                None,
+                "Participant reviewers",
+                std::slice::from_ref(&bob),
+            )
+            .unwrap();
+        let rev = f
+            .store
+            .agent_public_revision(&alice, &session_id, &branch)
+            .unwrap();
+        f.store
+            .set_agent_group_collaboration_access(
+                &alice,
+                &session_id,
+                &branch,
+                &group.principal_handle,
+                permissions,
+                rev,
+            )
+            .unwrap();
         let accepted = f
             .owner
             .submit_participant_text(&f.agent, &bob, &selected, "accepted then revoked")
             .unwrap();
         assert_eq!(accepted.state, InputAdmissionState::Accepted);
         let request_id = accepted.admission.request_id.clone();
+        let generation = accepted
+            .admission
+            .participant
+            .as_ref()
+            .unwrap()
+            .access_generation
+            .unwrap();
+        assert_eq!(
+            generation,
+            f.store
+                .authorize_agent_access(
+                    &bob,
+                    &session_id,
+                    &branch,
+                    SessionParticipationAction::Submit,
+                )
+                .unwrap()
+                .access_generation
+        );
+        let legacy = f.store.session_participation(&bob, &session_id).unwrap();
+        let rev = f
+            .store
+            .agent_public_revision(&alice, &session_id, &branch)
+            .unwrap();
+        let group = f
+            .store
+            .edit_principal_group(
+                &alice,
+                None,
+                &group.principal_handle,
+                None,
+                Some(&[]),
+                group.rev,
+            )
+            .unwrap();
+        assert!(f.owner.run_once(&mut f.agent, |_| Ok(())).await.is_err());
+        let _group = f
+            .store
+            .edit_principal_group(
+                &alice,
+                None,
+                &group.principal_handle,
+                None,
+                Some(std::slice::from_ref(&bob)),
+                group.rev,
+            )
+            .unwrap();
+        assert_eq!(
+            rev,
+            f.store
+                .agent_public_revision(&alice, &session_id, &branch)
+                .unwrap()
+        );
+        assert_eq!(
+            legacy,
+            f.store.session_participation(&bob, &session_id).unwrap()
+        );
+        assert_ne!(
+            generation,
+            f.store
+                .authorize_agent_access(
+                    &bob,
+                    &session_id,
+                    &branch,
+                    SessionParticipationAction::Submit,
+                )
+                .unwrap()
+                .access_generation
+        );
+        assert!(f.owner.run_once(&mut f.agent, |_| Ok(())).await.is_err());
+        // Original receipt is not re-pinned by a new matching group grant.
+        assert_eq!(f.owner.fact(&request_id).unwrap(), accepted);
+        assert_eq!(bob_calls.load(Ordering::SeqCst), 0);
+        // Historical facts still decode but cannot dispatch under a new grant.
+        let mut historical = accepted.admission.clone();
+        historical.participant.as_mut().unwrap().access_generation = None;
+        let encoded = serde_json::to_string(&historical).unwrap();
+        assert!(!encoded.contains("access_generation"));
+        let historical: ActorInputAdmission = serde_json::from_str(&encoded).unwrap();
+        assert!(f.store.revalidate_participant_input(&historical).is_err());
 
         f.store
             .revoke_session_participation(&alice, &session_id, &bob)
@@ -4295,6 +4388,23 @@ mod tests {
             )
             .unwrap();
 
+        let rev = store
+            .agent_public_revision(&alice, &target_session.id, &applied.branch.id)
+            .unwrap();
+        store
+            .set_agent_collaboration_access(
+                &alice,
+                &target_session.id,
+                &applied.branch.id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    control: true,
+                    ..Default::default()
+                },
+                rev,
+            )
+            .unwrap();
         let target = setup_bound(
             None,
             store.clone(),
@@ -4324,6 +4434,12 @@ mod tests {
             .select(&bob, "bob-disclosure-account", "model")
             .unwrap();
 
+        // Prove the initial ACL/provider/context combination is actually
+        // admitted, so a later denial cannot pass merely for missing ACL.
+        target
+            .owner
+            .prepare_participant_control(&target.agent, &bob, &selected, 1, "safe-bob-control")
+            .unwrap();
         store
             .context_grant_read(&alice, &source_session.id, &bob, false, vec![])
             .unwrap();
@@ -4354,6 +4470,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn participant_control_segments_persist_across_steps_and_change_actor_on_later_steer() {
+        exercise_participant_control(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn participant_control_acl_revocation_preserves_paid_receipts_and_fences_next_effect() {
+        exercise_participant_control(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_participant_control(revoke: bool) {
         let temp = PrivateTemp::new();
         let store = SessionStore::open(&temp.0).unwrap();
         let alice = PrincipalId::new("local").unwrap();
@@ -4423,6 +4550,20 @@ mod tests {
                 !granted.permissions.submit,
                 "Control must remain independent from Submit"
             );
+            let rev = f
+                .store
+                .agent_public_revision(&alice, &session_id, &f.owner.branch)
+                .unwrap();
+            f.store
+                .set_agent_collaboration_access(
+                    &alice,
+                    &session_id,
+                    &f.owner.branch,
+                    participant,
+                    granted.permissions,
+                    rev,
+                )
+                .unwrap();
         }
 
         let phase_calls = Arc::new(AtomicUsize::new(0));
@@ -4503,6 +4644,78 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), alice_entered.notified())
             .await
             .unwrap();
+        if !revoke {
+            // Exercise the real Prepared -> Accepted boundary, not just a
+            // stale preflight. No pending Runtime segment may be published
+            // when the original Store acceptance rejects its generation.
+            let request_id = "stale-prepared-bob-control";
+            let stale = owner
+                .prepare_participant_control_live(&live_control, &bob, &bob_selected, 1, request_id)
+                .unwrap();
+            let prepared = store
+                .authority_steer_prepare(
+                    &alice,
+                    AuthoritySteerRequest {
+                        request_id: request_id.into(),
+                        session_id: session_id.clone(),
+                        branch_id: owner.branch.clone(),
+                        writer_epoch: owner.epoch.get(),
+                        turn_id: 1,
+                        canonical_target: canonical_turn.clone(),
+                        participant: Some(stale.clone()),
+                    },
+                    "stale control",
+                )
+                .unwrap();
+            let old = store.session_participation(&bob, &session_id).unwrap();
+            let rev = store
+                .agent_public_revision(&alice, &session_id, &owner.branch)
+                .unwrap();
+            store
+                .set_agent_collaboration_access(
+                    &alice,
+                    &session_id,
+                    &owner.branch,
+                    &bob,
+                    aw_store::SessionParticipationPermissions::VIEW_ONLY,
+                    rev,
+                )
+                .unwrap();
+            let rev = store
+                .agent_public_revision(&alice, &session_id, &owner.branch)
+                .unwrap();
+            store
+                .set_agent_collaboration_access(
+                    &alice,
+                    &session_id,
+                    &owner.branch,
+                    &bob,
+                    old.permissions,
+                    rev,
+                )
+                .unwrap();
+            assert!(owner
+                .controller
+                .admit_committed_authority_update(
+                    1,
+                    aw_agent_core::AuthorityBoundaryKind::Steer,
+                    request_id,
+                    "stale control",
+                    stale.authority_segment_evidence().unwrap(),
+                    |segment| store.authority_steer_accept(&alice, &prepared, segment),
+                )
+                .is_err());
+            let rejected = store
+                .authority_steer_reject_prepared(
+                    &alice,
+                    &prepared,
+                    "Agent access changed before acceptance",
+                )
+                .unwrap();
+            assert_eq!(rejected.state, AuthoritySteerState::Rejected);
+            assert_eq!(rejected.segment_ordinal, None);
+            // The following valid Control must still take ordinal 2.
+        }
         let bob_evidence = owner
             .prepare_participant_control_live(
                 &live_control,
@@ -4548,6 +4761,115 @@ mod tests {
             std::slice::from_ref(&bob)
         );
 
+        if revoke {
+            let rev = store
+                .agent_public_revision(&alice, &session_id, &owner.branch)
+                .unwrap();
+            let old = store.session_participation(&bob, &session_id).unwrap();
+            store
+                .set_agent_collaboration_access(
+                    &alice,
+                    &session_id,
+                    &owner.branch,
+                    &bob,
+                    aw_store::SessionParticipationPermissions::VIEW_ONLY,
+                    rev,
+                )
+                .unwrap();
+            assert_eq!(store.session_participation(&bob, &session_id).unwrap(), old);
+            bob_second_release.notify_waiters();
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+            // The original paid second invocation must be recorded even
+            // though its proposed next Tool cannot start.
+            let paid = store.usage(&bob, &session_id).unwrap();
+            assert_eq!(paid.model_calls, 2);
+            assert_eq!(paid.input_tokens, Some(7));
+            assert_eq!(paid.output_tokens, Some(2));
+            let turn = store
+                .read_branch_view(&alice, &session_id, &owner.branch)
+                .unwrap_or_else(|error| {
+                    panic!("factual Turn unavailable: {error}; dispatch result: {result:?}")
+                })
+                .history
+                .turns
+                .into_iter()
+                .last()
+                .expect("factual settled Turn");
+            assert_ne!(turn.outcome, aw_agent_core::Outcome::Completed);
+            assert_eq!(turn.invocations.len(), 3);
+            assert_eq!(turn.invocations[2].identity.actor, bob);
+            assert!(turn.invocations[2].meta.is_some());
+            assert_eq!(bob_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(phase_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(carol_calls.load(Ordering::SeqCst), 0);
+            assert!(!turn.tool_records.iter().any(|record| {
+                record.call.id == "bob-superseded-tool"
+                    && record.status == aw_agent_core::ToolStatus::Succeeded
+            }));
+            // Runtime/receipt may conservatively report a failure, but
+            // never pretend the paid effect did not happen.
+            if let Ok(Some(actual)) = result {
+                assert_eq!(actual.id, turn.id);
+            }
+            return;
+        }
+
+        let stale = owner
+            .prepare_participant_control_live(
+                &live_control,
+                &carol,
+                &carol_selected,
+                1,
+                "stale-carol-control",
+            )
+            .unwrap();
+        let old = store.session_participation(&carol, &session_id).unwrap();
+        let rev = store
+            .agent_public_revision(&alice, &session_id, &owner.branch)
+            .unwrap();
+        store
+            .set_agent_collaboration_access(
+                &alice,
+                &session_id,
+                &owner.branch,
+                &carol,
+                aw_store::SessionParticipationPermissions::VIEW_ONLY,
+                rev,
+            )
+            .unwrap();
+        let rev = store
+            .agent_public_revision(&alice, &session_id, &owner.branch)
+            .unwrap();
+        store
+            .set_agent_collaboration_access(
+                &alice,
+                &session_id,
+                &owner.branch,
+                &carol,
+                old.permissions,
+                rev,
+            )
+            .unwrap();
+        assert_eq!(
+            store.session_participation(&carol, &session_id).unwrap(),
+            old
+        );
+        assert!(owner
+            .submit_participant_control(
+                stale,
+                aw_agent_core::AuthorityBoundaryKind::Steer,
+                1,
+                "stale-carol-control",
+                &canonical_turn,
+                "stale control",
+            )
+            .is_err());
+        assert!(store
+            .authority_steer_fact(&alice, &session_id, "stale-carol-control")
+            .is_err());
         let carol_evidence = owner
             .prepare_participant_control_live(
                 &live_control,

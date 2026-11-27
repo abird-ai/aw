@@ -136,6 +136,49 @@ fn authorize_append_or_shared_run(
         Err(error) => Err(error),
     }
 }
+fn segment_action_in(
+    c: &Connection,
+    owner: &PrincipalId,
+    session: &str,
+    branch: &str,
+    identity: &aw_agent_core::InvocationIdentity,
+    segment: Option<&AuthoritySegment>,
+) -> Result<crate::SessionParticipationAction> {
+    if let Some(segment) = segment.filter(|segment| segment.evidence.is_some()) {
+        return crate::session_participation::require_segment_in(
+            c,
+            crate::agent_owner::AgentKey::new(session, branch),
+            segment,
+            identity,
+        );
+    }
+    if &identity.actor != owner {
+        return Err(Error::Denied(
+            "shared participant provider/effect requires an AuthoritySegment",
+        ));
+    }
+    Ok(crate::SessionParticipationAction::Submit)
+}
+
+/// Exact journal segment at the current effect boundary; the original
+/// run_events index bounds this lookup to the active Run.
+fn latest_segment_in(c: &Connection, run: &str) -> Result<Option<AuthoritySegment>> {
+    let encoded: Option<String> = db(c
+        .query_row(
+            "SELECT payload FROM run_events WHERE run_id=?1 AND kind='authority_segment_started'
+         ORDER BY seq DESC LIMIT 1",
+            [run],
+            |row| row.get(0),
+        )
+        .optional())?;
+    encoded
+        .map(|encoded| match decode::<JournalEntry>(&encoded)? {
+            JournalEntry::AuthoritySegmentStarted { segment } => Ok(segment),
+            _ => Err(Error::Storage("invalid stored AuthoritySegment")),
+        })
+        .transpose()
+}
+
 fn same_retry_destination(
     previous: &aw_agent_core::InvocationIdentity,
     current: &aw_agent_core::InvocationIdentity,
@@ -405,6 +448,19 @@ impl SessionHandle {
         let b = branch_in(&tx, &self.session, &cursor.id)?;
         let writer =
             crate::workspace_writer::require_workspace_writer_for_session(&tx, &self.session)?;
+        if start.identity.actor != self.actor && receipt.is_none() {
+            crate::actor_admission::participant_dispatch_in(
+                &tx,
+                &self.session,
+                &b.id,
+                &b.head,
+                b.revision,
+                start.turn_id,
+                writer.writer_epoch,
+                &start.prompt,
+                &start.identity,
+            )?;
+        }
         context::authorize_node(&tx, &self.session, &b.head, &start.identity.actor)?;
         #[cfg(feature = "routing")]
         if let Some(operation) = routing_operation.as_deref() {
@@ -775,6 +831,102 @@ impl SessionHandle {
                 |row| row.get(0),
             ))?;
             workspace_writer::verify_writer_epoch_for_session(&tx, &self.session, admitted_epoch)?;
+            let prior_segment = latest_segment_in(&tx, &run)?;
+            let segment = match &entry {
+                JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                _ => prior_segment.as_ref(),
+            };
+            if let Some(segment) = segment.filter(|segment| segment.evidence.is_some()) {
+                let evidence = segment
+                    .evidence
+                    .as_ref()
+                    .expect("checked participant evidence");
+                let identity = evidence.identity.as_ref().ok_or(Error::Denied(
+                    "participant journal segment lacks exact provider identity",
+                ))?;
+                let action = crate::session_participation::require_segment_in(
+                    &tx,
+                    crate::agent_owner::AgentKey::new(&self.session, &branch.id),
+                    segment,
+                    identity,
+                )?;
+                if !matches!(
+                    &entry,
+                    JournalEntry::ModelInvocationAdmitted { .. }
+                        | JournalEntry::InvocationStarted { .. }
+                ) {
+                    context::authorize_model_context_with_source(
+                        &tx,
+                        &self.session,
+                        &branch,
+                        identity,
+                        action,
+                        source.as_ref(),
+                    )?;
+                }
+                if matches!(&entry, JournalEntry::AuthoritySegmentStarted { .. }) {
+                    match segment.boundary {
+                        AuthorityBoundaryKind::Input => {
+                            let (head, revision, prompt_node, encoded): (String, u64, String, String) =
+                                db(tx.query_row(
+                                    "SELECT produced_from_head,produced_from_revision,prompt_node,identity_json
+                                     FROM runs WHERE id=?1",
+                                    [&run],
+                                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                                ))?;
+                            let original: aw_agent_core::InvocationIdentity = decode(&encoded)?;
+                            let prompt = node_in(&tx, &self.session, &prompt_node)?;
+                            let text = prompt
+                                .payload
+                                .get("prompt")
+                                .and_then(|value| value.as_str())
+                                .ok_or(Error::Storage("original participant prompt missing"))?;
+                            let admission = crate::actor_admission::participant_dispatch_in(
+                                &tx,
+                                &self.session,
+                                &branch.id,
+                                &head,
+                                revision,
+                                turn_id,
+                                admitted_epoch,
+                                text,
+                                &original,
+                            )?;
+                            let admitted = admission.participant.as_ref().ok_or(Error::Denied(
+                                "original participant dispatch evidence missing",
+                            ))?;
+                            if segment.evidence.as_deref()
+                                != Some(&admitted.authority_segment_evidence()?)
+                                || segment.boundary_id
+                                    != format!(
+                                        "input:{}:{}",
+                                        admission.message_id, admission.message_id
+                                    )
+                            {
+                                return Err(Error::Denied(
+                                    "participant segment differs from original dispatch",
+                                ));
+                            }
+                        }
+                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                            crate::actor_authority_steer::require_accepted_segment_in(
+                                &tx,
+                                &self.session,
+                                &branch.id,
+                                turn_id,
+                                segment,
+                            )?;
+                        }
+                    }
+                }
+            } else if actor != self.actor {
+                // The owner-bound participant path must never fall back to
+                // an unpinned legacy segment. Separate same-actor legacy
+                // journal routes retain their existing contract.
+                return Err(Error::Denied(
+                    "participant journal effect requires exact Agent access evidence",
+                ));
+            }
             if let Some(source) = source.as_ref() {
                 source.require_in(&tx, &actor, &self.session, &branch.id, false)?;
                 match &mut entry {
@@ -1507,72 +1659,32 @@ impl TurnJournal for SessionHandle {
                     this.source_execution.as_ref(),
                     &this.store,
                 )?;
-                let c = this.store.connection()?;
-                if identity.actor != this.actor {
-                    let segment = segment.as_ref().ok_or(Error::Denied(
-                        "shared participant provider/effect requires an AuthoritySegment",
-                    ))?;
-                    let evidence = segment.evidence.as_ref().ok_or(Error::Denied(
-                        "shared participant AuthoritySegment lacks immutable evidence",
-                    ))?;
-                    evidence.validate()?;
-                    evidence.validate_identity(&identity)?;
-                    let action = match segment.boundary {
-                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
-                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
-                            crate::SessionParticipationAction::Control
-                        }
-                    };
-                    let current = crate::session_participation::authorize_in(
-                        &c,
-                        &identity.actor,
-                        &this.session,
-                        action,
-                    )?;
-                    if current.membership_epoch != evidence.membership_epoch
-                        || current.audience_epoch != evidence.audience_epoch
-                        || current.owner
-                    {
-                        return Err(Error::Denied(
-                            "shared participant authority/audience changed after segment admission",
-                        ));
-                    }
-                }
                 let expected = this.branch()?;
-                let b = branch_in(&c, &this.session, &expected.id)?;
+                let mut c = this.store.connection()?;
+                let tx = db(c.transaction())?;
+                let b = branch_in(&tx, &this.session, &expected.id)?;
                 if b.head != expected.head || b.revision != expected.revision {
                     return Err(Error::Conflict(
                         "stored context changed; reload before inference",
                     ));
                 }
-                if identity.actor != this.actor {
-                    let segment = segment.as_ref().ok_or(Error::Denied(
-                        "shared participant provider/effect requires an AuthoritySegment",
-                    ))?;
-                    let action = match segment.boundary {
-                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
-                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
-                            crate::SessionParticipationAction::Control
-                        }
-                    };
-                    context::authorize_model_context_with_source(
-                        &c,
-                        &this.session,
-                        &b,
-                        &identity,
-                        action,
-                        source.as_ref(),
-                    )
-                } else {
-                    context::authorize_model_context_with_source(
-                        &c,
-                        &this.session,
-                        &b,
-                        &identity,
-                        crate::SessionParticipationAction::Submit,
-                        source.as_ref(),
-                    )
-                }
+                let action = segment_action_in(
+                    &tx,
+                    &this.actor,
+                    &this.session,
+                    &b.id,
+                    &identity,
+                    segment.as_ref(),
+                )?;
+                context::authorize_model_context_with_source(
+                    &tx,
+                    &this.session,
+                    &b,
+                    &identity,
+                    action,
+                    source.as_ref(),
+                )?;
+                db(tx.commit())
             })
             .await
             .map_err(|_| Error::Storage("segment context gate worker failed"))?
@@ -1637,63 +1749,41 @@ impl TurnJournal for SessionHandle {
         let this = self.clone();
         let identity = identity.clone();
         let segment = segment.cloned();
-        let actor = identity.actor.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let source = crate::sandbox_owner::execution::read(
                     this.source_execution.as_ref(),
                     &this.store,
                 )?;
-                let c = this.store.connection()?;
-                let b = branch_in(&c, &this.session, &this.branch()?.id)?;
-                if identity.actor != this.actor {
-                    let segment = segment.as_ref().ok_or(Error::Denied(
-                        "shared participant attachment projection requires an AuthoritySegment",
-                    ))?;
-                    let evidence = segment.evidence.as_ref().ok_or(Error::Denied(
-                        "shared participant attachment projection lacks segment evidence",
-                    ))?;
-                    evidence.validate()?;
-                    evidence.validate_identity(&identity)?;
-                    let action = match segment.boundary {
-                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
-                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
-                            crate::SessionParticipationAction::Control
-                        }
-                    };
-                    let current = crate::session_participation::authorize_in(
-                        &c,
-                        &identity.actor,
-                        &this.session,
-                        action,
-                    )?;
-                    if current.membership_epoch != evidence.membership_epoch
-                        || current.audience_epoch != evidence.audience_epoch
-                        || current.owner
-                    {
-                        return Err(Error::Denied(
-                            "shared participant attachment authority/audience changed",
-                        ));
-                    }
-                    context::authorize_model_context_with_source(
-                        &c,
-                        &this.session,
-                        &b,
-                        &identity,
-                        action,
-                        source.as_ref(),
-                    )?;
-                } else {
-                    context::authorize_model_context_with_source(
-                        &c,
-                        &this.session,
-                        &b,
-                        &identity,
-                        crate::SessionParticipationAction::Submit,
-                        source.as_ref(),
-                    )?;
+                let expected = this.branch()?;
+                let mut c = this.store.connection()?;
+                let tx = db(c.transaction())?;
+                let b = branch_in(&tx, &this.session, &expected.id)?;
+                if b.head != expected.head || b.revision != expected.revision {
+                    return Err(Error::Conflict(
+                        "stored context changed; reload before attachment projection",
+                    ));
                 }
-                context::apply::pending_context(&c, &actor, &this.session, &b)
+                let action = segment_action_in(
+                    &tx,
+                    &this.actor,
+                    &this.session,
+                    &b.id,
+                    &identity,
+                    segment.as_ref(),
+                )?;
+                context::authorize_model_context_with_source(
+                    &tx,
+                    &this.session,
+                    &b,
+                    &identity,
+                    action,
+                    source.as_ref(),
+                )?;
+                let context =
+                    context::apply::pending_context(&tx, &identity.actor, &this.session, &b)?;
+                db(tx.commit())?;
+                Ok(context)
             })
             .await
             .map_err(|_| Error::Storage("segment-aware attachment worker failed"))?

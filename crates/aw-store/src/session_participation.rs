@@ -4,11 +4,14 @@
 //! filesystem/process/model/provider/payer capability. Legacy members.can_append
 //! remains a separate compatibility authority for legacy append APIs.
 
+use crate::agent_owner::{self, AgentKey};
 use crate::{
     audit, db, durability, ensure_user_for_principal, now, principal_is_session_owner, session_in,
     session_owner_user, user_for_principal, SessionStore,
 };
-use aw_agent_core::{Error, PrincipalId, Result};
+use aw_agent_core::{
+    AuthorityBoundaryKind, AuthoritySegment, Error, InvocationIdentity, PrincipalId, Result,
+};
 use aw_store_api::{BranchInfo, SessionBinding, SessionInfo};
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -192,6 +195,80 @@ pub(crate) fn authorize_in(
     Ok(evidence)
 }
 
+/// Explicit legacy participant execution is the intersection of current
+/// Session collaboration/disclosure and exact Agent ACL authority. Neither
+/// permission substitutes for the other or authorizes provider/source tools.
+fn execution_access_in(
+    c: &rusqlite::Connection,
+    actor: &PrincipalId,
+    agent: AgentKey<'_>,
+    action: SessionParticipationAction,
+) -> Result<(SessionParticipationEvidence, [u8; 32])> {
+    let current = authorize_in(c, actor, agent.session, action)?;
+    if current.owner {
+        return Err(Error::Denied(
+            "participant execution requires non-owner Session authority",
+        ));
+    }
+    let access = agent_owner::authorize_access(c, actor, agent, action)?;
+    Ok((current, access.access_generation))
+}
+
+pub(crate) fn require_execution_in(
+    c: &rusqlite::Connection,
+    actor: &PrincipalId,
+    agent: AgentKey<'_>,
+    action: SessionParticipationAction,
+    membership_epoch: u64,
+    audience_epoch: u64,
+    generation: Option<[u8; 32]>,
+) -> Result<()> {
+    let expected = generation.ok_or(Error::Denied(
+        "historical participant evidence lacks exact Agent access generation",
+    ))?;
+    let (current, access) = execution_access_in(c, actor, agent, action)?;
+    if current.membership_epoch != membership_epoch
+        || current.audience_epoch != audience_epoch
+        || access != expected
+    {
+        return Err(Error::Denied(
+            "participant Session or Agent access generation changed",
+        ));
+    }
+    Ok(())
+}
+
+/// One durable segment check for provider projection, paid admission and
+/// tool intent. Old segments remain factual but cannot authorize new effects.
+pub(crate) fn require_segment_in(
+    c: &rusqlite::Connection,
+    agent: AgentKey<'_>,
+    segment: &AuthoritySegment,
+    identity: &InvocationIdentity,
+) -> Result<SessionParticipationAction> {
+    let evidence = segment.evidence.as_ref().ok_or(Error::Denied(
+        "participant AuthoritySegment lacks immutable evidence",
+    ))?;
+    evidence.validate()?;
+    evidence.validate_identity(identity)?;
+    let action = match segment.boundary {
+        AuthorityBoundaryKind::Input => SessionParticipationAction::Submit,
+        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+            SessionParticipationAction::Control
+        }
+    };
+    require_execution_in(
+        c,
+        &identity.actor,
+        agent,
+        action,
+        evidence.membership_epoch,
+        evidence.audience_epoch,
+        evidence.access_generation,
+    )?;
+    Ok(action)
+}
+
 impl SessionStore {
     /// Create a privacy-isolated approved-context Session in the source
     /// Session's existing personal Workspace. Only the explicitly approved text
@@ -366,7 +443,7 @@ impl SessionStore {
         branch: &str,
         identity: &aw_agent_core::InvocationIdentity,
         action: SessionParticipationAction,
-    ) -> Result<()> {
+    ) -> Result<[u8; 32]> {
         if identity.actor != *actor
             || !matches!(
                 action,
@@ -377,21 +454,16 @@ impl SessionStore {
                 "participant model context requires exact Submit/Control identity",
             ));
         }
-        let connection = self.connection()?;
-        let current = evidence_in(&connection, session, actor)?;
-        if current.owner || !current.permissions.allows(action) {
-            return Err(Error::Denied(
-                "participant model context action is not currently authorized",
-            ));
-        }
-        let branch = crate::branch_in(&connection, session, branch)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let branch = crate::branch_in(&tx, session, branch)?;
+        let (_, generation) =
+            execution_access_in(&tx, actor, AgentKey::new(session, &branch.id), action)?;
         crate::context::authorize_model_context_for_participation(
-            &connection,
-            session,
-            &branch,
-            identity,
-            action,
-        )
+            &tx, session, &branch, identity, action,
+        )?;
+        db(tx.commit())?;
+        Ok(generation)
     }
 
     pub fn session_participation(

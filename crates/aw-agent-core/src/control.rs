@@ -267,6 +267,39 @@ impl AgentSessionController {
         Ok(segment)
     }
 
+    /// Host participant Control: prepare durable custody before this call.
+    /// Commit the exact staged segment under the original Runtime lock,
+    /// then expose it to the next Step. The callback may perform only the
+    /// original short durable acceptance, never reenter the Runtime.
+    pub fn admit_committed_authority_update<R>(
+        &self,
+        turn_id: u64,
+        boundary: crate::AuthorityBoundaryKind,
+        boundary_id: &str,
+        input: &str,
+        evidence: crate::AuthoritySegmentEvidence,
+        commit: impl FnOnce(&crate::AuthoritySegment) -> Result<R>,
+    ) -> Result<R> {
+        self.verify_writer_fence()?;
+        let result = self.with_runtime(|runtime| {
+            runtime.admit_authority_update_committed(
+                crate::runtime::AuthorityUpdateRequest {
+                    principal: &self.principal,
+                    key: self.actor,
+                    epoch: self.writer_epoch,
+                    turn: turn_id,
+                    boundary_kind: boundary,
+                    boundary_id,
+                    input,
+                    replacement_evidence: Some(evidence),
+                },
+                commit,
+            )
+        })?;
+        self.changed();
+        Ok(result)
+    }
+
     pub fn admit_authority_steer_with_evidence(
         &self,
         turn_id: u64,

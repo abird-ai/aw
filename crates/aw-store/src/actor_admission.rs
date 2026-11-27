@@ -39,6 +39,8 @@ pub struct ParticipantInputAdmission {
     pub identity: InvocationIdentity,
     pub membership_epoch: u64,
     pub audience_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_generation: Option<[u8; 32]>,
     pub causal_root: String,
     pub payer_ref: String,
     pub provider_model_ceiling_ref: String,
@@ -57,11 +59,30 @@ impl ParticipantInputAdmission {
             causal_root: self.causal_root.clone(),
             membership_epoch: self.membership_epoch,
             audience_epoch: self.audience_epoch,
+            access_generation: self.access_generation,
             provider_model_ceiling_ref: self.provider_model_ceiling_ref.clone(),
             tool_envelope_ref: self.tool_envelope_ref.clone(),
             disclosure_projection_ref: self.disclosure_projection_ref.clone(),
             context_fingerprint: self.context_fingerprint,
         })
+    }
+
+    pub(crate) fn require_current_in(
+        &self,
+        c: &rusqlite::Connection,
+        agent: agent_owner::AgentKey<'_>,
+        action: crate::SessionParticipationAction,
+    ) -> Result<()> {
+        self.validate()?;
+        crate::session_participation::require_execution_in(
+            c,
+            &self.actor,
+            agent,
+            action,
+            self.membership_epoch,
+            self.audience_epoch,
+            self.access_generation,
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -74,6 +95,7 @@ impl ParticipantInputAdmission {
         if self.identity.actor != self.actor
             || self.membership_epoch == 0
             || self.audience_epoch == 0
+            || self.access_generation == Some([0; 32])
             || !bounded(&self.causal_root, 256)
             || !bounded(&self.payer_ref, 256)
             || !bounded(&self.provider_model_ceiling_ref, 512)
@@ -225,20 +247,11 @@ fn writer_guard(
                     "owner Input must use the legacy owner admission path",
                 ));
             }
-            let current = crate::session_participation::authorize_in(
+            participant.require_current_in(
                 c,
-                &participant.actor,
-                &admission.session_id,
+                agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
                 crate::SessionParticipationAction::Submit,
             )?;
-            if current.membership_epoch != participant.membership_epoch
-                || current.audience_epoch != participant.audience_epoch
-                || current.owner
-            {
-                return Err(Error::Denied(
-                    "participant Submit/audience authority changed after admission",
-                ));
-            }
             crate::context::authorize_node(
                 c,
                 &admission.session_id,
@@ -270,6 +283,71 @@ pub(crate) fn source_dispatch_in(
     prompt: &str,
     require_current: bool,
 ) -> Result<ActorInputAdmission> {
+    dispatch_in(
+        c,
+        session,
+        branch,
+        head,
+        revision,
+        turn,
+        writer_epoch,
+        prompt,
+        require_current,
+        None,
+    )
+}
+
+/// The participant Run begins only from the original currently Dispatching
+/// Input, not from an owner-selected provider identity or current ACL alone.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn participant_dispatch_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    head: &str,
+    revision: u64,
+    turn: u64,
+    writer_epoch: u64,
+    prompt: &str,
+    identity: &InvocationIdentity,
+) -> Result<ActorInputAdmission> {
+    let admission = dispatch_in(
+        c,
+        session,
+        branch,
+        head,
+        revision,
+        turn,
+        writer_epoch,
+        prompt,
+        true,
+        Some(identity),
+    )?;
+    admission
+        .participant
+        .as_ref()
+        .ok_or(Error::Denied("participant dispatch evidence missing"))?
+        .require_current_in(
+            c,
+            agent_owner::AgentKey::new(session, branch),
+            crate::SessionParticipationAction::Submit,
+        )?;
+    Ok(admission)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    head: &str,
+    revision: u64,
+    turn: u64,
+    writer_epoch: u64,
+    prompt: &str,
+    require_current: bool,
+    participant: Option<&InvocationIdentity>,
+) -> Result<ActorInputAdmission> {
     use sha2::{Digest, Sha256};
     let digest = format!("{:x}", Sha256::digest(prompt.as_bytes()));
     let all = events(c, session)?;
@@ -281,12 +359,20 @@ pub(crate) fn source_dispatch_in(
             && fact.admission.writer_epoch == writer_epoch
             && fact.admission.turn_id == turn
             && fact.admission.payload_sha256 == digest
-            && fact.admission.participant.is_none()
+            && match (participant, &fact.admission.participant) {
+                (None, None) => true,
+                (Some(identity), Some(evidence)) => identity == &evidence.identity,
+                _ => false,
+            }
     };
     let mut matched = all.iter().filter(matches);
-    let fact = matched.next().ok_or(Error::Denied(
-        "source Turn requires its exact original Actor Input dispatch",
-    ))?;
+    let fact = matched
+        .next()
+        .ok_or(Error::Denied(if participant.is_some() {
+            "participant Turn requires its exact original Actor Input dispatch"
+        } else {
+            "source Turn requires its exact original Actor Input dispatch"
+        }))?;
     if matched.next().is_some()
         || (require_current
             && all
@@ -296,7 +382,7 @@ pub(crate) fn source_dispatch_in(
                 .is_none_or(|latest| latest.state != InputAdmissionState::Dispatching))
     {
         return Err(Error::Denied(
-            "source Turn Actor Input dispatch is ambiguous or no longer current",
+            "Actor Input dispatch is ambiguous or no longer current",
         ));
     }
     Ok(fact.admission.clone())
@@ -354,6 +440,22 @@ fn append(c: &rusqlite::Connection, actor: &PrincipalId, fact: &ActorInputFact) 
     )
 }
 impl SessionStore {
+    /// Preclaim check before consuming the original in-memory Input. The
+    /// durable Dispatching transition repeats it inside the writer fence.
+    pub fn revalidate_participant_input(&self, admission: &ActorInputAdmission) -> Result<()> {
+        let participant = admission.participant.as_ref().ok_or(Error::Denied(
+            "participant Input requires original admission evidence",
+        ))?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction())?;
+        participant.require_current_in(
+            &tx,
+            agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+            crate::SessionParticipationAction::Submit,
+        )?;
+        db(tx.commit())
+    }
+
     /// Existing SQLite owner-and-epoch test exposed as a host-only fence:
     /// every model/tool boundary must consult THIS current Workspace writer.
     pub fn actor_input_writer_fence(

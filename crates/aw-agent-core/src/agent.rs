@@ -2290,13 +2290,13 @@ impl Agent {
                             for (call, _, spec) in wave {
                                 selection_reader.revalidate()?;
                                 let index = turn.tool_records.len();
-                                turn.tool_records.push(ToolRecord {
+                                let record = ToolRecord {
                                     call: call.clone(),
                                     effect: spec.effect.clone(),
                                     execution_site: self.tool_policy.execution_site.clone(),
                                     status: ToolStatus::Running,
                                     output: None,
-                                });
+                                };
                                 portable_trace.push(portable_step(machine.prepare_wave_intent(
                                     &call.id,
                                     portable_effect(&spec.effect),
@@ -2306,7 +2306,7 @@ impl Agent {
                                         j.append(
                                             id,
                                             JournalEntry::ToolStarted {
-                                                record: turn.tool_records[index].clone(),
+                                                record: record.clone(),
                                                 source: Some(crate::ToolSourceEvidence::from_source(
                                                     self.tools.source_of(&call.name).ok_or(
                                                         Error::Denied("Tool source missing before immutable intent"),
@@ -2319,6 +2319,7 @@ impl Agent {
                                     )
                                     .await?;
                                 }
+                                turn.tool_records.push(record);
                                 acknowledged += 1;
                                 portable_trace.push(portable_step(machine.wave_intent_recorded())?);
                                 notify(
@@ -2716,13 +2717,13 @@ impl Agent {
                     cursor += 1;
                     selection_reader.revalidate()?; // account revocation also stops further paid/tool work
                     let index = turn.tool_records.len();
-                    turn.tool_records.push(ToolRecord {
+                    let record = ToolRecord {
                         call: call.clone(),
                         effect: spec.effect.clone(),
                         execution_site: self.tool_policy.execution_site.clone(),
                         status: ToolStatus::Running,
                         output: None,
-                    });
+                    };
                     // Tool intent cannot be executed or skipped out of order.
                     portable_trace.push(portable_step(
                         machine.prepare_tool(&call.id, portable_effect(&spec.effect)),
@@ -2731,7 +2732,7 @@ impl Agent {
                         j.append(
                             id,
                             JournalEntry::ToolStarted {
-                                record: turn.tool_records[index].clone(),
+                                record: record.clone(),
                                 source: Some(crate::ToolSourceEvidence::from_source(
                                     self.tools.source_of(&call.name).ok_or(
                                         Error::Denied("Tool source missing before immutable intent"),
@@ -2741,6 +2742,10 @@ impl Agent {
                         )
                         .await?;
                     }
+                    // An unacknowledged intent is not a factual Tool record.
+                    // An ambiguous journal failure still fences recovery:
+                    // the immutable journal and final projection must agree.
+                    turn.tool_records.push(record);
                     portable_trace.push(portable_step(machine.intent_recorded())?);
                     notify(
                         &sender,

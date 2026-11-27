@@ -6,9 +6,9 @@
 //! prevent replay after ambiguous delivery.
 
 use crate::{
-    audit, branch_in, context, db, principal_is_session_owner, session_participation,
-    workspace_writer, Error, ParticipantInputAdmission, PrincipalId, Result, SecretStore,
-    SessionParticipationAction, SessionStore,
+    audit, branch_in, context, db, principal_is_session_owner, workspace_writer, Error,
+    ParticipantInputAdmission, PrincipalId, Result, SecretStore, SessionParticipationAction,
+    SessionStore,
 };
 use getrandom::fill;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -172,9 +172,28 @@ fn accept_in(
             "AuthoritySteer accept requires exact Prepared fact",
         ));
     }
+    if segment.boundary_id != prepared.request.request_id
+        || !matches!(
+            segment.boundary,
+            aw_agent_core::AuthorityBoundaryKind::Steer
+                | aw_agent_core::AuthorityBoundaryKind::Interrupt
+        )
+    {
+        return Err(Error::Denied(
+            "AuthoritySteer segment targets a different boundary",
+        ));
+    }
     if let Some(participant) = &prepared.request.participant {
+        participant.require_current_in(
+            connection,
+            crate::agent_owner::AgentKey::new(
+                &prepared.request.session_id,
+                &prepared.request.branch_id,
+            ),
+            SessionParticipationAction::Control,
+        )?;
         let expected = participant.authority_segment_evidence()?;
-        if segment.evidence.as_ref() != Some(&expected) {
+        if segment.evidence.as_deref() != Some(&expected) {
             return Err(Error::Denied(
                 "staged AuthoritySegment differs from admitted participant Control evidence",
             ));
@@ -202,6 +221,39 @@ fn accept_in(
     next.segment_fingerprint = Some(segment.fingerprint);
     audit_fact(connection, owner, &next)?;
     Ok(next)
+}
+
+/// A participant Control segment must have been accepted by the existing
+/// encrypted receipt owner before it can enter the original TurnJournal.
+pub(crate) fn require_accepted_segment_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    turn: u64,
+    segment: &aw_agent_core::AuthoritySegment,
+) -> Result<()> {
+    let all = events(c, session)?;
+    let fact = latest(&all, &segment.boundary_id).ok_or(Error::Denied(
+        "participant Control lacks its exact accepted receipt",
+    ))?;
+    if fact.state != AuthoritySteerState::Accepted
+        || fact.request.branch_id != branch
+        || fact.request.turn_id != turn
+        || fact.segment_ordinal != Some(segment.ordinal)
+        || fact.segment_fingerprint != Some(segment.fingerprint)
+    {
+        return Err(Error::Denied(
+            "participant Control receipt differs from journal segment",
+        ));
+    }
+    if let Some(participant) = &fact.request.participant {
+        if segment.evidence.as_deref() != Some(&participant.authority_segment_evidence()?) {
+            return Err(Error::Denied(
+                "participant Control evidence differs from accepted receipt",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl SessionStore {
@@ -246,20 +298,19 @@ impl SessionStore {
                         "Session owner Control uses the owner authority path",
                     ));
                 }
-                let current = session_participation::authorize_in(
-                    &tx,
-                    &participant.actor,
-                    &request.session_id,
-                    SessionParticipationAction::Control,
-                )?;
-                if current.owner
-                    || current.membership_epoch != participant.membership_epoch
-                    || current.audience_epoch != participant.audience_epoch
-                {
+                let key =
+                    crate::agent_owner::AgentKey::new(&request.session_id, &request.branch_id);
+                let target = format!(
+                    "{}/t:{}",
+                    crate::agent_owner::canonical_ref(&tx, key)?,
+                    active_turn
+                );
+                if request.canonical_target != target {
                     return Err(Error::Denied(
-                        "participant Control/audience authority changed before steer admission",
+                        "participant Control targets a different Agent Turn",
                     ));
                 }
+                participant.require_current_in(&tx, key, SessionParticipationAction::Control)?;
                 context::authorize_node(
                     &tx,
                     &request.session_id,

@@ -39,7 +39,95 @@ change or broader phase qualification in this documentation cut.
 
 November 27 late documentation refresh: all nine first-parent implementation signatures, parent links and exact trees after e56cd92 verified on L5; implementation tip 38c4775, Store v62. The new comprehensive handoff preserves all nine exact deltas, the complete previous comprehensive handoff byte-for-byte and the exact signed active TODO. Non-reserved entry clean; no source change or product test rerun in this documentation cut. Next: semantic dependency-bearing registry compatibility; physical containment/ambient authority remain held.
 
-## Latest local implementation delta — 2026-11-27: semantic dependency-bearing SourceDriver replacement
+## Latest local implementation delta — 2026-11-27: exact participant Agent ACL execution generation
+
+Parent `d511720c446023a362a1a15613d5a1150a4f24ff` (semantic
+SourceDriver replacement), independently verified signed at entry.
+Non-reserved worktree clean at entry; L5 only. Product 0.15.0,
+Store v62, Git derive recovery v4 unchanged.
+
+- Explicit source-free Actor participant admission now intersects original
+  Session membership/audience/Submit or Control authority with the
+  canonical Agent ACL permission and exact existing `access_generation`.
+  No new ACL, group fanout, account, tool or source grant. Host admission
+  pins the generation in immutable Input/Control and AuthoritySegment
+  evidence; context fingerprint domain v2 and exact Runtime segment
+  fingerprints cover it. Historical missing-pin facts still decode and
+  remain factual, but cannot authorize new participant dispatch. No
+  migration, rewriting or old-binary compatibility claim. Keep optional
+  participant-only evidence boxed in the segment (identical serde shape)
+  rather than inflate every JournalEntry; no allocation for absent
+  owner-only evidence. Strict Clippy initially exposed this layout
+  regression; corrected all-target Clippy passed.
+- Original SQLite Input Prepared/Accepted/Dispatching and the preclaim
+  check revalidate the exact pin. Owner-bound participant Run admission
+  and its initial journal segment match the current original Dispatching
+  receipt: branch/head/revision, writer epoch, Turn, prompt digest,
+  identity and segment evidence. Reuse original bounded dispatch
+  resolver; no second Input owner. Control checks pin at Prepared and
+  Accepted; exact canonical Agent/Turn target, accepted boundary ID and
+  segment fingerprint match. Runtime stages the candidate privately and
+  holds its original lock through the short Store acceptance callback;
+  only a successful commit exposes pending Control. Rejected acceptance
+  does not publish or consume a segment. Crash/ambiguous custody remains
+  inspectable; no automatic retry.
+- Original journal checks current exact participant segment and Agent
+  generation inside the existing transaction for segment start, model
+  admission, invocation start and tool intent/revision. Projection and
+  dispatch checks use a consistent read transaction with original
+  provider/context/Session disclosure gates. Original account and Tool
+  authorization and independent source ceilings remain separate.
+  Admission does not claim continuous revocation of an effect already
+  dispatched; factual paid/Tool terminal receipts remain journalable
+  after the newly fenced Agent ACL revocation.
+- Actual midflight regression exposed a pre-existing projection bug:
+  singleton/wave Tool records were appended in memory before journal
+  acknowledgement. Publish them only after acknowledgement so a denied
+  intent cannot be invented as an interrupted effect. Ambiguous writes
+  still require exact original receipt reconciliation; no suppression
+  of original receipt mismatch. The initial Actor suite was 46/47
+  because of this bug; corrected targeted rerun and full Actor suite
+  passed. First binary-filter compile matched zero tests, not counted.
+- Real Actor fixtures prove legacy Session-only denial, group ACL
+  revoke/regrant with unchanged Agent public revision/legacy audience,
+  stale accepted Input cannot claim/pay, missing historical generation
+  refusal, private-context independent release gate, same-Turn
+  participant provider attribution and fresh Control takeover. Revoke
+  between Prepared and Accepted denies original generation and leaves
+  no pending Runtime segment; next valid Control keeps the same next
+  ordinal. Revocation during Bob's second paid call prevents the next
+  tool, preserves both paid invocation receipts (7 input, 2 output
+  tokens), original first tool and factual failed Turn.
+
+Validation: L5 locked/offline final representation: Actor owner 47/47
+(39.52s), Core 103/103 (+1 ignored benchmark), Store Actor Input
+2/2, Session participation 3/3, exact group revision 1/1, staged
+Input 1/1, history owner 5/5, Store original receipt integrations
+`aw_p6_10` 26/26 (22.11s), context flow 29/29 (18.33s), actual
+native-source executable 2/2 (46.86s; one opt-in fault fixture
+ignored). **219 distinct selected tests passed, zero failures, two
+ignored.** Targeted regression and prior successful pre-layout
+runs not double-counted. Strict Core/Store/CLI all-feature/all-target
+Clippy `-D warnings` passed after the layout correction. Durable
+and minimal all-target checks passed with existing profile-specific
+dead-code warnings; scoped rustfmt/diff passed. Five historical
+broad Store failures, full workspace, other-platform and pinned
+Nix suites not rerun.
+
+Scope/next: this qualifies the explicit owner-bound, source-free legacy
+participant Actor route, not arbitrary legacy web/direct-append,
+cross-Domain/group-owned execution, broader source-bearing participant
+authority, new provider share policy or continuous revocation/kill of
+started effects. Other legacy Session/audience revocation recovery
+and general shared/provider effects remain independent gates. Physical
+Process containment/never-managed ambient first-source retirement stay
+held; no new environmental proof. Next independent Phase-3 gate:
+protected inherited-span selection or broader independently authorized
+manifest-preserving context transfer, without treating read permission
+as release. Final atomic ExtensionRegistry remains Phase 5. No UX/frozen
+changes, push or repin. Phase 3 underway.
+
+## Previous local implementation delta — 2026-11-27: semantic dependency-bearing SourceDriver replacement
 
 Parent `06d3d99aa9b49b835c3fb4fb1f849e5adf2fe57b` (late
 comprehensive documentation); previous implementation `38c4775`.

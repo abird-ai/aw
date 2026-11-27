@@ -2098,6 +2098,31 @@ Current implementation: manifest-preserving private manual context transfer (thi
       all-target Clippy, durable/minimal all-target and scoped fmt/diff
       passed. Existing profile warnings and historical Store failures
       remain separate; no schema bump or full suite claim.
+      **Exact participant Agent ACL execution generation:** explicit
+      owner-bound source-free participant Actor intersects existing
+      Session Submit/Control and audience with exact canonical Agent
+      ACL generation; immutable Input/Control/segment fingerprints pin
+      it. Historical no-pin facts readable, fresh authority refused.
+      Original Dispatching receipt matches Run and initial segment;
+      Prepared/Accepted Control and exact accepted segment/target checked.
+      Existing Runtime lock publishes pending Control only after Store
+      commit; refused acceptance cannot consume next ordinal. Original
+      journal transaction gates new model/tool intents; consistent
+      projection/dispatch read checks retain all independent disclosure,
+      account and tool constraints. Acknowledge Tool intent before
+      publishing factual record; denied intent cannot fabricate an
+      interrupted effect. Real group revoke/regrant with unchanged Agent
+      revision, stale prepared/accepted controls/input, private source
+      release and midflight ACL revocation preserve original paid/tool
+      receipts and prevent next effect. Validation: final
+      locked/offline Actor 47, Core 103, Store units 12, original
+      receipt integrations 26, context flow 29, native executable 2:
+      all 219 selected tests passed (+2 ignored). Strict affected
+      all-target Clippy, durable/minimal and scoped fmt/diff passed.
+      Initial projection regression and segment-size lint fixed;
+      optional participant evidence boxed without serde shape change.
+      Existing profile warnings/historical Store failures separate.
+      No schema bump, broader execution or full workspace claim.
       **Next:** production reviewed physical Process containment/dispatch,
       never-managed ambient first-source authority retirement and other
       independent host gates. Both physical/ambient cases remain held.
@@ -2108,8 +2133,9 @@ Current implementation: manifest-preserving private manual context transfer (thi
       remain held; live broker is bounded fixed-challenge only. No arbitrary shell CLI
       or strong Unix backend promoted; nonstandard/overlapping linked
       layouts and unmarked legacy native/Process no-start remain held.
-      Separately qualify legacy participant
-      Agent ACL/access_generation dispatch. No generic
+      Broader legacy web/direct-append participant dispatch, general
+      shared/source-bearing participant authority and independent
+      provider/source disclosure policy remain unqualified. No generic
       shared/forked/participant or non-native execution promotion.
       Complete source-aware Job/Process/extension containment/dispatch, broader Run-hazard reconciliation,
       general multi-source Process policy, other baseline effects, unmarked/ambiguous scratch and
