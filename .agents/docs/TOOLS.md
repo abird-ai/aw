@@ -45,6 +45,16 @@ a model grant. DOTLINK ADOPTION IS A LATER SEPARATE PHASE.
 Detailed AW source/verification:
 .agents/plans/dotlink-tool-port/AI-NATIVE-FS-IMPLEMENTATION-2026-10-31.md
 
+## Local shell containment
+
+For the configured local native shell, the trusted host can set
+`AW_LOCAL_SHELL_CONTAINMENT=closed-descendants` at launch to require closed
+Process-descendant containment for direct, finite Job and Graph shell execution.
+The default is `best-available`. Unsupported strict launches fail before starting
+a Process (including current Unix process-group execution); invalid values
+fail startup. This does not grant tools, isolate the filesystem, or apply to
+MCP, extensions, remote tools, independent source routes or human terminals.
+
 ---
 
 # Historical native tool surface — shared toolset follow-up (2026-10-30)

@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1092" viewBox="0 0 1040 1092" role="img" aria-labelledby="aw-architecture-title aw-architecture-desc">
+  <title id="aw-architecture-title">AW live programmable graph-native agent harness</title>
+  <desc id="aw-architecture-desc">CLI, TUI, Web, Rust SDK and MCP clients use one native Service and shared API. Immutable harness revisions compose context, strategy, routing and tools over the original Agent, TurnMachine, Actors and pipelines. AI-native tools share the aw-tools core across native calls and MCP composition. The model-facing batch expression describes fixed dependency graphs with bounded parallel work and per-node results; graph execution uses the original Job and Process owners. State, history and execution receipts remain with their owners. Authorized observations and ordinary bounded evaluation work inform revisions through the same activation API. Inference providers such as ZeroGravity and tool or environment providers such as dotlink remain separate execution boundaries.</desc>
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 17px; fill: #e8e8e8; }
+      .title { font-size: 25px; font-weight: 700; }
+      .heading { font-size: 20px; font-weight: 700; }
+      .client-label { font-size: 18px; font-weight: 600; }
+      .small { font-size: 15px; }
+      .muted { fill: #bebebe; }
+      .canvas { fill: #101010; stroke: #333; }
+      .panel { fill: #161616; stroke: #414141; }
+      .component { fill: #1c1c1c; stroke: #444; }
+      .provider { fill: #222; stroke: #505050; }
+      .arrow { fill: none; stroke: #b6b6b6; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+      .feedback { fill: none; stroke: #929a9f; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 5 5; }
+    </style>
+    <marker id="aw-architecture-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L6 3.5 L0 7" fill="none" stroke="#b6b6b6" stroke-width="1.4"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="12" y="12" width="1016" height="1068" rx="20"/>
+  <text class="title" x="40" y="53">AW</text>
+  <text class="muted" x="1000" y="51" text-anchor="end">Live programmable · graph-native · built in Rust</text>
+
+  <g text-anchor="middle">
+    <rect class="component" x="40" y="88" width="184" height="50" rx="9"/>
+    <rect class="component" x="234" y="88" width="184" height="50" rx="9"/>
+    <rect class="component" x="428" y="88" width="184" height="50" rx="9"/>
+    <rect class="component" x="622" y="88" width="184" height="50" rx="9"/>
+    <rect class="component" x="816" y="88" width="184" height="50" rx="9"/>
+    <text class="client-label" x="132" y="120">CLI</text>
+    <text class="client-label" x="326" y="120">TUI</text>
+    <text class="client-label" x="520" y="120">Web</text>
+    <text class="client-label" x="714" y="120">Rust SDK</text>
+    <text class="client-label" x="908" y="120">MCP</text>
+  </g>
+  <path class="arrow" d="M132 138 V162 H908 V138 M326 138 V162 M520 138 V162 M714 138 V162"/>
+  <path class="arrow" d="M520 162 V188" marker-end="url(#aw-architecture-arrow)"/>
+
+  <rect class="panel" x="40" y="188" width="960" height="100" rx="12"/>
+  <g text-anchor="middle">
+    <text class="heading" x="520" y="222">One native Service · shared API</text>
+    <text x="520" y="251">Definitions · operations · revisions · activation</text>
+    <text class="small muted" x="520" y="274">Embedded Rust, attached clients and MCP share the same contracts</text>
+  </g>
+
+  <path class="arrow" d="M384 288 V324" marker-end="url(#aw-architecture-arrow)"/>
+  <rect class="panel" x="40" y="324" width="688" height="144" rx="12"/>
+  <text class="heading" x="384" y="358" text-anchor="middle">Composable harness</text>
+  <g text-anchor="middle">
+    <rect class="component" x="64" y="380" width="148" height="42" rx="8"/>
+    <rect class="component" x="224" y="380" width="148" height="42" rx="8"/>
+    <rect class="component" x="384" y="380" width="148" height="42" rx="8"/>
+    <rect class="component" x="544" y="380" width="148" height="42" rx="8"/>
+    <text x="138" y="407">Context</text>
+    <text x="298" y="407">Strategy</text>
+    <text x="458" y="407">Routing</text>
+    <text x="618" y="407">Tools</text>
+    <text class="small muted" x="384" y="447">Immutable revisions · typed contributions · retained implementations</text>
+  </g>
+
+  <path class="arrow" d="M384 468 V510" marker-end="url(#aw-architecture-arrow)"/>
+  <rect class="panel" x="40" y="510" width="688" height="316" rx="12"/>
+  <g text-anchor="middle">
+    <text class="heading" x="384" y="546">One agent runtime</text>
+    <text x="384" y="578">Agent / TurnMachine · Actors · pipelines</text>
+
+    <rect class="component" x="64" y="610" width="300" height="132" rx="9"/>
+    <text class="heading" x="214" y="644">AI-native tools</text>
+    <text x="214" y="674">Typed, compact operations</text>
+    <text class="small muted" x="214" y="700">Shared aw-tools core</text>
+    <text class="small muted" x="214" y="725">Native calls · MCP composition</text>
+
+    <rect class="component" x="400" y="610" width="304" height="132" rx="9"/>
+    <text class="heading" x="552" y="644">Graph execution</text>
+    <text x="552" y="674">Compact batch expressions</text>
+    <text class="small muted" x="552" y="700">Dependencies · bounded parallelism</text>
+    <text class="small muted" x="552" y="725">Per-node results</text>
+
+    <text x="384" y="775">Jobs · Processes · state · history · execution receipts</text>
+    <text class="small muted" x="384" y="804">Retained behavior · current authority</text>
+  </g>
+  <path class="arrow" d="M400 674 H364" marker-end="url(#aw-architecture-arrow)"/>
+
+  <rect class="panel" x="764" y="324" width="236" height="144" rx="12"/>
+  <g text-anchor="middle">
+    <text class="heading" x="882" y="359">Observe</text>
+    <text x="882" y="390">Outcomes · usage · timing</text>
+    <text class="small muted" x="882" y="419">Authorized projections</text>
+    <text class="small muted" x="882" y="446">Bounded streams · provenance</text>
+  </g>
+  <path class="feedback" d="M728 775 H746 V396 H764" marker-end="url(#aw-architecture-arrow)"/>
+  <path class="feedback" d="M882 468 V510" marker-end="url(#aw-architecture-arrow)"/>
+
+  <rect class="panel" x="764" y="510" width="236" height="156" rx="12"/>
+  <g text-anchor="middle">
+    <text class="heading" x="882" y="546">Improve</text>
+    <text x="882" y="578">Compare · propose · revise</text>
+    <text class="small muted" x="882" y="608">Ordinary bounded work</text>
+    <text class="small muted" x="882" y="640">Explicit activation policy</text>
+  </g>
+  <path class="feedback" d="M1000 588 H1012 V238 H1000" marker-end="url(#aw-architecture-arrow)"/>
+
+  <path class="arrow" d="M384 826 V856 M276 856 H764"/>
+  <path class="arrow" d="M276 856 V908" marker-end="url(#aw-architecture-arrow)"/>
+  <path class="arrow" d="M764 856 V908" marker-end="url(#aw-architecture-arrow)"/>
+  <text class="small muted" x="520" y="884" text-anchor="middle">Separate provider boundaries</text>
+
+  <g text-anchor="middle">
+    <rect class="provider" x="40" y="908" width="472" height="112" rx="12"/>
+    <rect class="provider" x="528" y="908" width="472" height="112" rx="12"/>
+    <text class="heading" x="276" y="942">Inference</text>
+    <text x="276" y="972">ZeroGravity · other providers</text>
+    <text class="small muted" x="276" y="999">Model execution and inference programs</text>
+    <text class="heading" x="764" y="942">Tools &amp; environments</text>
+    <text x="764" y="972">dotlink · local and remote executors</text>
+    <text class="small muted" x="764" y="999">Source, process and resource effects</text>
+  </g>
+
+  <text class="small muted" x="520" y="1059" text-anchor="middle">AW composes agent behavior. Providers retain their own execution ownership.</text>
+</svg>

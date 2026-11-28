@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="864" viewBox="0 0 1040 864" role="img" aria-labelledby="aw-live-title aw-live-desc">
+  <title id="aw-live-title">Live programming an AW harness</title>
+  <desc id="aw-live-desc">A Turn already admitted under R1 keeps its revision and settles normally. An author forks, edits and prepares candidate R2, optionally compares it against R1, then activates with an expected-binding compare-and-swap. The next eligible Turn is admitted with R2. Comparison is optional unless required by the configured promotion policy. An optional improvement controller observes outcomes and repeats this process as ordinary bounded Agent, Job or pipeline work. Authority remains current, and activation respects dependency and state compatibility boundaries.</desc>
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 17px; fill: #e8e8e8; }
+      .title { font-size: 25px; font-weight: 700; }
+      .heading { font-size: 20px; font-weight: 700; }
+      .small { font-size: 15px; }
+      .muted { fill: #bebebe; }
+      .canvas { fill: #101010; stroke: #333; }
+      .panel { fill: #161616; stroke: #414141; }
+      .revision { fill: #1c1c1c; stroke: #505050; }
+      .arrow { fill: none; stroke: #b6b6b6; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+      .feedback { fill: none; stroke: #929a9f; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 5 5; }
+    </style>
+    <marker id="aw-live-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L6 3.5 L0 7" fill="none" stroke="#b6b6b6" stroke-width="1.4"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="12" y="12" width="1016" height="840" rx="20"/>
+  <text class="title" x="40" y="53">Change the harness. Keep work coherent.</text>
+  <text class="muted" x="40" y="83">A revision is selected when work is admitted; authority remains current.</text>
+
+  <rect class="panel" x="40" y="116" width="960" height="156" rx="12"/>
+  <text class="heading" x="64" y="151">Work already admitted</text>
+  <g text-anchor="middle">
+    <rect class="revision" x="64" y="190" width="232" height="52" rx="9"/>
+    <rect class="revision" x="744" y="190" width="232" height="52" rx="9"/>
+    <text x="180" y="222">Turn running on R1</text>
+    <text x="860" y="222">R1 settles normally</text>
+    <text class="small muted" x="520" y="202">Retains its admitted revision</text>
+  </g>
+  <path class="arrow" d="M296 216 H744" marker-end="url(#aw-live-arrow)"/>
+  <text class="small muted" x="520" y="261" text-anchor="middle">Activation leaves this Turn's selected behavior intact.</text>
+
+  <text class="heading" x="40" y="312">Program future work</text>
+  <g text-anchor="middle">
+    <rect class="panel" x="40" y="340" width="240" height="116" rx="12"/>
+    <rect class="panel" x="400" y="340" width="240" height="116" rx="12"/>
+    <rect class="panel" x="760" y="340" width="240" height="116" rx="12"/>
+    <text class="heading" x="160" y="374">Fork · edit · prepare</text>
+    <text x="160" y="404">Candidate revision R2</text>
+    <text class="small muted" x="160" y="435">Resolve exact dependencies</text>
+    <text class="heading" x="520" y="374">Activate R2</text>
+    <text x="520" y="404">Expected binding · CAS</text>
+    <text class="small muted" x="520" y="435">Select future behavior</text>
+    <text class="heading" x="880" y="374">Next eligible Turn</text>
+    <text x="880" y="404">Admitted with R2</text>
+    <text class="small muted" x="880" y="435">Exact revision recorded</text>
+  </g>
+  <path class="arrow" d="M280 398 H400" marker-end="url(#aw-live-arrow)"/>
+  <path class="arrow" d="M640 398 H760" marker-end="url(#aw-live-arrow)"/>
+
+  <rect class="panel" x="280" y="514" width="480" height="120" rx="12"/>
+  <g text-anchor="middle">
+    <text class="heading" x="520" y="548">Compare R1 and R2</text>
+    <text x="520" y="578">Same cases · isolated state · bounded budget</text>
+    <text class="small muted" x="520" y="609">Optional, or required by the configured promotion policy</text>
+  </g>
+  <path class="arrow" d="M160 456 V574 H280" marker-end="url(#aw-live-arrow)"/>
+  <text class="small muted" x="178" y="499">Evaluate</text>
+  <path class="arrow" d="M520 514 V456" marker-end="url(#aw-live-arrow)"/>
+  <text class="small muted" x="540" y="491">Report</text>
+
+  <path class="feedback" d="M880 456 V682" marker-end="url(#aw-live-arrow)"/>
+  <text class="small muted" x="900" y="576">Outcomes</text>
+  <rect class="panel" x="40" y="682" width="960" height="110" rx="12"/>
+  <text class="heading" x="64" y="716">Optional improvement controller</text>
+  <text x="64" y="746">Observe outcomes → propose a revision → compare → activate within policy</text>
+  <text class="small muted" x="64" y="775">Ordinary Agent / Job / pipeline work</text>
+  <path class="feedback" d="M40 738 H24 V398 H40" marker-end="url(#aw-live-arrow)"/>
+
+  <text class="small muted" x="520" y="831" text-anchor="middle">Permissions are rechecked. Activation respects dependency and state boundaries.</text>
+</svg>
